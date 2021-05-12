@@ -360,10 +360,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce90df4c658c62f12d78f7508cf92f9173e5184a539c10bfe54a3107b3ffd0f2"
 
 [[package]]
-name = "cpuid-bool"
-version = "0.1.2"
+name = "cpufeatures"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aebca1129a03dc6dc2b127edd729435bbc4a37e1d5f4d7513165089ceb02634"
+checksum = "dec1028182c380cc45a2e2c5ec841134f2dfd0f8f5f0a5bcd68004f81b5efdf4"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "crossbeam"
@@ -1850,13 +1853,13 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.9.1"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2933378ddfeda7ea26f48c555bdad8bb446bf8a3d17832dc83e380d444cfb8c1"
+checksum = "b362ae5752fd2137731f9fa25fd4d9058af34666ca1966fb969119cc35719f12"
 dependencies = [
  "block-buffer",
- "cfg-if 0.1.10",
- "cpuid-bool",
+ "cfg-if 1.0.0",
+ "cpufeatures",
  "digest",
  "opaque-debug 0.3.0",
 ]
