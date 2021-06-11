@@ -41,9 +41,9 @@ require (
 	github.com/oasisprotocol/deoxysii v0.0.0-20200527154044-851aec403956
 	github.com/oasisprotocol/ed25519 v0.0.0-20201030211050-cbed0688bd01
 	github.com/opentracing/opentracing-go v1.2.0
-	github.com/prometheus/client_golang v1.8.0
-	github.com/prometheus/common v0.14.0
-	github.com/prometheus/procfs v0.2.0
+	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/common v0.29.0
+	github.com/prometheus/procfs v0.6.0
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/seccomp/libseccomp-golang v0.9.1
 	github.com/spf13/cobra v1.1.1
@@ -58,11 +58,11 @@ require (
 	github.com/whyrusleeping/go-logging v0.0.1
 	gitlab.com/yawning/dynlib.git v0.0.0-20200603163025-35fe007b0761
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
-	golang.org/x/net v0.0.0-20200813134508-3edf25e44fcc
-	google.golang.org/genproto v0.0.0-20200624020401-64a14ca9d1ad
+	golang.org/x/net v0.0.0-20210525063256-abc453219eb5
+	google.golang.org/genproto v0.0.0-20200825200019-8632dd797987
 	google.golang.org/grpc v1.33.1
 	google.golang.org/grpc/security/advancedtls v0.0.0-20200902210233-8630cac324bf
-	google.golang.org/protobuf v1.25.0
+	google.golang.org/protobuf v1.26.0-rc.1
 )
 
 go 1.15
