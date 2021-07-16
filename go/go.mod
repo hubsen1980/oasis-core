@@ -35,8 +35,8 @@ require (
 	github.com/hashicorp/go-plugin v1.3.0
 	github.com/hpcloud/tail v1.0.0
 	github.com/libp2p/go-libp2p v0.11.0
-	github.com/libp2p/go-libp2p-core v0.6.1
-	github.com/libp2p/go-libp2p-pubsub v0.3.6
+	github.com/libp2p/go-libp2p-core v0.8.5
+	github.com/libp2p/go-libp2p-pubsub v0.5.0
 	github.com/multiformats/go-multiaddr v0.3.1
 	github.com/oasisprotocol/deoxysii v0.0.0-20200527154044-851aec403956
 	github.com/oasisprotocol/ed25519 v0.0.0-20201030211050-cbed0688bd01
@@ -57,7 +57,7 @@ require (
 	github.com/uber/jaeger-lib v2.2.0+incompatible // indirect
 	github.com/whyrusleeping/go-logging v0.0.1
 	gitlab.com/yawning/dynlib.git v0.0.0-20200603163025-35fe007b0761
-	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
+	golang.org/x/crypto v0.0.0-20200820211705-5c72a883971a
 	golang.org/x/net v0.0.0-20200813134508-3edf25e44fcc
 	google.golang.org/genproto v0.0.0-20200624020401-64a14ca9d1ad
 	google.golang.org/grpc v1.33.1
