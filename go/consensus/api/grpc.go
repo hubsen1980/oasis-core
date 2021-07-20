@@ -5,11 +5,16 @@ import (
 
 	"google.golang.org/grpc"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
+	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
 
@@ -27,10 +32,6 @@ var (
 	methodEstimateGas = serviceName.NewMethod("EstimateGas", &EstimateGasRequest{})
 	// methodGetSignerNonce is a GetSignerNonce method.
 	methodGetSignerNonce = serviceName.NewMethod("GetSignerNonce", &GetSignerNonceRequest{})
-	// methodGetEpoch is the GetEpoch method.
-	methodGetEpoch = serviceName.NewMethod("GetEpoch", int64(0))
-	// methodWaitEpoch is the WaitEpoch method.
-	methodWaitEpoch = serviceName.NewMethod("WaitEpoch", epochtime.EpochTime(0))
 	// methodGetBlock is the GetBlock method.
 	methodGetBlock = serviceName.NewMethod("GetBlock", int64(0))
 	// methodGetTransactions is the GetTransactions method.
@@ -41,6 +42,8 @@ var (
 	methodGetUnconfirmedTransactions = serviceName.NewMethod("GetUnconfirmedTransactions", nil)
 	// methodGetGenesisDocument is the GetGenesisDocument method.
 	methodGetGenesisDocument = serviceName.NewMethod("GetGenesisDocument", nil)
+	// methodGetChainContext is the GetChainContext method.
+	methodGetChainContext = serviceName.NewMethod("GetChainContext", nil)
 	// methodGetStatus is the GetStatus method.
 	methodGetStatus = serviceName.NewMethod("GetStatus", nil)
 
@@ -84,14 +87,6 @@ var (
 				Handler:    handlerGetSignerNonce,
 			},
 			{
-				MethodName: methodGetEpoch.ShortName(),
-				Handler:    handlerGetEpoch,
-			},
-			{
-				MethodName: methodWaitEpoch.ShortName(),
-				Handler:    handlerWaitEpoch,
-			},
-			{
 				MethodName: methodGetBlock.ShortName(),
 				Handler:    handlerGetBlock,
 			},
@@ -110,6 +105,10 @@ var (
 			{
 				MethodName: methodGetGenesisDocument.ShortName(),
 				Handler:    handlerGetGenesisDocument,
+			},
+			{
+				MethodName: methodGetChainContext.ShortName(),
+				Handler:    handlerGetChainContext,
 			},
 			{
 				MethodName: methodGetStatus.ShortName(),
@@ -254,52 +253,6 @@ func handlerGetSignerNonce( // nolint: golint
 	return interceptor(ctx, rq, info, handler)
 }
 
-func handlerGetEpoch( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var height int64
-	if err := dec(&height); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ClientBackend).GetEpoch(ctx, height)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: methodGetEpoch.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ClientBackend).GetEpoch(ctx, req.(int64))
-	}
-	return interceptor(ctx, height, info, handler)
-}
-
-func handlerWaitEpoch( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var epoch epochtime.EpochTime
-	if err := dec(&epoch); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return nil, srv.(ClientBackend).WaitEpoch(ctx, epoch)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: methodWaitEpoch.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(ClientBackend).WaitEpoch(ctx, req.(epochtime.EpochTime))
-	}
-	return interceptor(ctx, epoch, info, handler)
-}
-
 func handlerGetBlock( // nolint: golint
 	srv interface{},
 	ctx context.Context,
@@ -403,6 +356,25 @@ func handlerGetGenesisDocument( // nolint: golint
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ClientBackend).GetGenesisDocument(ctx)
+	}
+	return interceptor(ctx, nil, info, handler)
+}
+
+func handlerGetChainContext( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	if interceptor == nil {
+		return srv.(ClientBackend).GetChainContext(ctx)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetChainContext.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ClientBackend).GetChainContext(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
@@ -728,18 +700,6 @@ func (c *consensusClient) GetSignerNonce(ctx context.Context, req *GetSignerNonc
 	return nonce, nil
 }
 
-func (c *consensusClient) WaitEpoch(ctx context.Context, epoch epochtime.EpochTime) error {
-	return c.conn.Invoke(ctx, methodWaitEpoch.FullName(), epoch, nil)
-}
-
-func (c *consensusClient) GetEpoch(ctx context.Context, height int64) (epochtime.EpochTime, error) {
-	var epoch epochtime.EpochTime
-	if err := c.conn.Invoke(ctx, methodGetEpoch.FullName(), height, &epoch); err != nil {
-		return epochtime.EpochTime(0), err
-	}
-	return epoch, nil
-}
-
 func (c *consensusClient) GetBlock(ctx context.Context, height int64) (*Block, error) {
 	var rsp Block
 	if err := c.conn.Invoke(ctx, methodGetBlock.FullName(), height, &rsp); err != nil {
@@ -778,6 +738,14 @@ func (c *consensusClient) GetGenesisDocument(ctx context.Context) (*genesis.Docu
 		return nil, err
 	}
 	return &rsp, nil
+}
+
+func (c *consensusClient) GetChainContext(ctx context.Context) (string, error) {
+	var rsp string
+	if err := c.conn.Invoke(ctx, methodGetChainContext.FullName(), nil, &rsp); err != nil {
+		return "", err
+	}
+	return rsp, nil
 }
 
 func (c *consensusClient) GetStatus(ctx context.Context) (*Status, error) {
@@ -821,6 +789,30 @@ func (c *consensusClient) WatchBlocks(ctx context.Context) (<-chan *Block, pubsu
 	}()
 
 	return ch, sub, nil
+}
+
+func (c *consensusClient) Beacon() beacon.Backend {
+	return beacon.NewBeaconClient(c.conn)
+}
+
+func (c *consensusClient) Registry() registry.Backend {
+	return registry.NewRegistryClient(c.conn)
+}
+
+func (c *consensusClient) Staking() staking.Backend {
+	return staking.NewStakingClient(c.conn)
+}
+
+func (c *consensusClient) Scheduler() scheduler.Backend {
+	return scheduler.NewSchedulerClient(c.conn)
+}
+
+func (c *consensusClient) Governance() governance.Backend {
+	return governance.NewGovernanceClient(c.conn)
+}
+
+func (c *consensusClient) RootHash() roothash.Backend {
+	return roothash.NewRootHashClient(c.conn)
 }
 
 // NewConsensusClient creates a new gRPC consensus client service.

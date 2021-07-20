@@ -13,14 +13,23 @@ import (
 )
 
 var (
+	// epochCurrentKeyFmt is the current epoch key format.
+	//
+	// Value is CBOR-serialized epoch time state.
+	epochCurrentKeyFmt = keyformat.New(0x40)
+	// epochFutureKeyFmt is the future epoch key format.
+	//
+	// Value is CBOR-serialized epoch time state.
+	epochFutureKeyFmt = keyformat.New(0x41)
+
 	// beaconKeyFmt is the random beacon key format.
 	//
 	// Value is raw random beacon.
-	beaconKeyFmt = keyformat.New(0x40)
+	beaconKeyFmt = keyformat.New(0x42)
 	// parametersKeyFmt is the key format used for consensus parameters.
 	//
 	// Value is CBOR-serialized beacon.ConsensusParameters.
-	parametersKeyFmt = keyformat.New(0x41)
+	parametersKeyFmt = keyformat.New(0x43)
 )
 
 // ImmutableState is the immutable beacon state wrapper.
@@ -47,6 +56,38 @@ func (s *ImmutableState) Beacon(ctx context.Context) ([]byte, error) {
 		return nil, beacon.ErrBeaconNotAvailable
 	}
 	return data, nil
+}
+
+func (s *ImmutableState) GetEpoch(ctx context.Context) (beacon.EpochTime, int64, error) {
+	data, err := s.is.Get(ctx, epochCurrentKeyFmt.Encode())
+	if err != nil {
+		return beacon.EpochInvalid, 0, abciAPI.UnavailableStateError(err)
+	}
+	if data == nil {
+		return beacon.EpochTime(0), 0, nil
+	}
+
+	var state beacon.EpochTimeState
+	if err = cbor.Unmarshal(data, &state); err != nil {
+		return beacon.EpochInvalid, 0, abciAPI.UnavailableStateError(err)
+	}
+	return state.Epoch, state.Height, nil
+}
+
+func (s *ImmutableState) GetFutureEpoch(ctx context.Context) (*beacon.EpochTimeState, error) {
+	data, err := s.is.Get(ctx, epochFutureKeyFmt.Encode())
+	if err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	if data == nil {
+		return nil, nil
+	}
+
+	var state beacon.EpochTimeState
+	if err := cbor.Unmarshal(data, &state); err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	return &state, nil
 }
 
 func (s *ImmutableState) ConsensusParameters(ctx context.Context) (*beacon.ConsensusParameters, error) {
@@ -81,7 +122,38 @@ func (s *MutableState) SetBeacon(ctx context.Context, newBeacon []byte) error {
 	return abciAPI.UnavailableStateError(err)
 }
 
+func (s *MutableState) SetEpoch(ctx context.Context, epoch beacon.EpochTime, height int64) error {
+	state := beacon.EpochTimeState{Epoch: epoch, Height: height}
+	err := s.ms.Insert(ctx, epochCurrentKeyFmt.Encode(), cbor.Marshal(state))
+	return abciAPI.UnavailableStateError(err)
+}
+
+func (s *MutableState) SetFutureEpoch(ctx context.Context, epoch beacon.EpochTime, height int64) error {
+	future, err := s.GetFutureEpoch(ctx)
+	if err != nil {
+		return err
+	}
+	if future != nil {
+		return fmt.Errorf("tendermint/beacon: future epoch already pending")
+	}
+
+	state := beacon.EpochTimeState{Epoch: epoch, Height: height}
+	err = s.ms.Insert(ctx, epochFutureKeyFmt.Encode(), cbor.Marshal(state))
+	return abciAPI.UnavailableStateError(err)
+}
+
+func (s *MutableState) ClearFutureEpoch(ctx context.Context) error {
+	err := s.ms.Remove(ctx, epochFutureKeyFmt.Encode())
+	return abciAPI.UnavailableStateError(err)
+}
+
+// SetConsensusParameters sets beacon consensus parameters.
+//
+// NOTE: This method must only be called from InitChain/EndBlock contexts.
 func (s *MutableState) SetConsensusParameters(ctx context.Context, params *beacon.ConsensusParameters) error {
+	if err := s.is.CheckContextMode(ctx, []abciAPI.ContextMode{abciAPI.ContextInitChain, abciAPI.ContextEndBlock}); err != nil {
+		return err
+	}
 	err := s.ms.Insert(ctx, parametersKeyFmt.Encode(), cbor.Marshal(params))
 	return abciAPI.UnavailableStateError(err)
 }

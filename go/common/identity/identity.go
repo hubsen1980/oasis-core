@@ -5,9 +5,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/pvss"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	tlsCert "github.com/oasisprotocol/oasis-core/go/common/crypto/tls"
@@ -29,8 +32,16 @@ const (
 	// CommonName is the CommonName to use when generating TLS certificates.
 	CommonName = "oasis-node"
 
+	beaconScalarFilename = "beacon.pem"
+
 	tlsKeyFilename  = "tls_identity.pem"
 	tlsCertFilename = "tls_identity_cert.pem"
+
+	tlsEphemeralKeyBaseFilename = "tls_ephemeral"
+
+	tlsEphemeralGenCurrent     = ""
+	tlsEphemeralGenNext        = "_next"
+	tlsEphemeralGenRotationNew = "_new_next"
 
 	// These are used for the sentry client connection to the sentry node and are never rotated.
 	tlsSentryClientKeyFilename  = "sentry_client_tls_identity.pem"
@@ -53,6 +64,8 @@ type Identity struct {
 	P2PSigner signature.Signer
 	// ConsensusSigner is a node consensus key signer.
 	ConsensusSigner signature.Signer
+	// BeaconScalar is a node beacon scalar.
+	BeaconScalar pvss.Scalar
 
 	// TLSSentryClientCertificate is the client certificate used for
 	// connecting to the sentry node's control connection.  It is never rotated.
@@ -71,6 +84,8 @@ type Identity struct {
 	nextTLSCertificate *tls.Certificate
 	// tlsRotationNotifier is a notifier for certificate rotations.
 	tlsRotationNotifier *pubsub.Broker
+	// dataDir is the directory associated with this identity (for ephemeral key/cert files).
+	dataDir string
 }
 
 // WatchCertificateRotations subscribes to TLS certificate rotation notifications.
@@ -97,19 +112,42 @@ func (i *Identity) RotateCertificates() error {
 	defer i.Unlock()
 
 	if i.tlsCertificate != nil {
+		// Generate a new TLS certificate to be used in the next rotation.
+		newCert, err := tlsCert.Generate(CommonName)
+		if err != nil {
+			return err
+		}
+		newSigner := memory.NewFromRuntime(newCert.PrivateKey.(ed25519.PrivateKey))
+
+		// Save the newly generated ephemeral cert/key.
+		newKeyFile := ephemeralKeyPath(i.dataDir, tlsEphemeralGenRotationNew)
+		err = tlsCert.SaveKey(newKeyFile, newCert)
+		if err != nil {
+			return err
+		}
+
+		// Shuffle files around.
+		for _, names := range []struct {
+			oldGen string
+			newGen string
+		}{
+			{tlsEphemeralGenNext, tlsEphemeralGenCurrent},
+			{tlsEphemeralGenRotationNew, tlsEphemeralGenNext},
+		} {
+			oldKeyPath := ephemeralKeyPath(i.dataDir, names.oldGen)
+			newKeyPath := ephemeralKeyPath(i.dataDir, names.newGen)
+			if err = os.Rename(oldKeyPath, newKeyPath); err != nil {
+				return err
+			}
+		}
+
 		// Use the prepared certificate.
 		if i.nextTLSCertificate != nil {
 			i.tlsCertificate = i.nextTLSCertificate
 			i.tlsSigner = i.nextTLSSigner
 		}
-
-		// Generate a new TLS certificate to be used in the next rotation.
-		var err error
-		i.nextTLSCertificate, err = tlsCert.Generate(CommonName)
-		if err != nil {
-			return err
-		}
-		i.nextTLSSigner = memory.NewFromRuntime(i.nextTLSCertificate.PrivateKey.(ed25519.PrivateKey))
+		i.nextTLSCertificate = newCert
+		i.nextTLSSigner = newSigner
 
 		i.tlsRotationNotifier.Broadcast(struct{}{})
 	}
@@ -229,13 +267,13 @@ func doLoadOrGenerate(dataDir string, signerFactory signature.SignerFactory, sho
 		// Load successful, ensure that we won't ever rotate the certificates.
 		dnr = true
 	} else {
-		// Freshly generate TLS certificates.
-		cert, err = tlsCert.Generate(CommonName)
-		if err != nil {
-			return nil, err
-		}
-
 		if persistTLS {
+			// Freshly generate TLS certificates.
+			cert, err = tlsCert.Generate(CommonName)
+			if err != nil {
+				return nil, err
+			}
+
 			// Save generated TLS certificate to disk.
 			err = tlsCert.Save(tlsCertPath, tlsKeyPath, cert)
 			if err != nil {
@@ -245,13 +283,39 @@ func doLoadOrGenerate(dataDir string, signerFactory signature.SignerFactory, sho
 			// Disable TLS rotation if we're persisting TLS certificates.
 			dnr = true
 		} else {
-			// Not persisting TLS certificate to disk, generate a new
-			// certificate to be used in the next rotation.
-			nextCert, err = tlsCert.Generate(CommonName)
+			// Current key; try loading, else generate, then save.
+			keyPath := ephemeralKeyPath(dataDir, tlsEphemeralGenCurrent)
+			cert, err = tlsCert.LoadFromKey(keyPath, CommonName)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return nil, fmt.Errorf("identity: unable to read ephemeral key from file: %w", err)
+				}
+				cert, err = tlsCert.Generate(CommonName)
+				if err != nil {
+					return nil, err
+				}
+			}
+			err = tlsCert.SaveKey(keyPath, cert)
 			if err != nil {
 				return nil, err
 			}
 
+			// Next key, to be used in the next rotation; load or generate.
+			nextKeyPath := ephemeralKeyPath(dataDir, tlsEphemeralGenNext)
+			nextCert, err = tlsCert.LoadFromKey(nextKeyPath, CommonName)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return nil, fmt.Errorf("identity: unable to read next ephemeral key from file: %w", err)
+				}
+				nextCert, err = tlsCert.Generate(CommonName)
+				if err != nil {
+					return nil, err
+				}
+			}
+			err = tlsCert.SaveKey(nextKeyPath, nextCert)
+			if err != nil {
+				return nil, err
+			}
 			nextSigner = memory.NewFromRuntime(nextCert.PrivateKey.(ed25519.PrivateKey))
 		}
 	}
@@ -272,10 +336,18 @@ func doLoadOrGenerate(dataDir string, signerFactory signature.SignerFactory, sho
 		}
 	}
 
+	// Load or generate the beacon scalar for this node.
+	beaconScalarPath := filepath.Join(dataDir, beaconScalarFilename)
+	var beaconScalar pvss.Scalar
+	if err := beaconScalar.LoadOrGeneratePEM(beaconScalarPath); err != nil {
+		return nil, err
+	}
+
 	return &Identity{
 		NodeSigner:                 signers[0],
 		P2PSigner:                  signers[1],
 		ConsensusSigner:            signers[2],
+		BeaconScalar:               beaconScalar,
 		tlsSigner:                  memory.NewFromRuntime(cert.PrivateKey.(ed25519.PrivateKey)),
 		tlsCertificate:             cert,
 		nextTLSSigner:              nextSigner,
@@ -283,7 +355,12 @@ func doLoadOrGenerate(dataDir string, signerFactory signature.SignerFactory, sho
 		DoNotRotateTLS:             dnr,
 		TLSSentryClientCertificate: sentryClientCert,
 		tlsRotationNotifier:        pubsub.NewBroker(false),
+		dataDir:                    dataDir,
 	}, nil
+}
+
+func ephemeralKeyPath(dataDir, generation string) string {
+	return filepath.Join(dataDir, fmt.Sprintf("%s%s.pem", tlsEphemeralKeyBaseFilename, generation))
 }
 
 // TLSCertPaths returns the TLS private key and certificate paths relative

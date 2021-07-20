@@ -3,11 +3,14 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	tmtypes "github.com/tendermint/tendermint/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
@@ -85,10 +88,27 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 		// not in debug mode, this will just cause startup to fail which is good.
 		debondingInterval = 1
 	}
-	epochInterval := d.EpochTime.Parameters.Interval
-	if epochInterval == 0 && cmdFlags.DebugDontBlameOasis() && d.EpochTime.Parameters.DebugMockBackend {
-		// Use a default of 100 blocks in case epoch interval is unset and we are using debug mode.
-		epochInterval = 100
+	var epochInterval int64
+	switch d.Beacon.Parameters.Backend {
+	case beacon.BackendInsecure:
+		params := d.Beacon.Parameters.InsecureParameters
+		epochInterval = params.Interval
+		if epochInterval == 0 && cmdFlags.DebugDontBlameOasis() && d.Beacon.Parameters.DebugMockBackend {
+			// Use a default of 100 blocks in case epoch interval is unset
+			// and we are using debug mode.
+			epochInterval = 100
+		}
+	case beacon.BackendPVSS:
+		// Note: This assumes no protocol failures (the common case).
+		// In the event of a failure, it is entirely possible that epochs
+		// can drag on for significantly longer.
+		params := d.Beacon.Parameters.PVSSParameters
+		epochInterval = params.CommitInterval + params.RevealInterval + params.TransitionDelay
+	default:
+		return nil, fmt.Errorf("tendermint: unknown beacon backend: '%s'", d.Beacon.Parameters.Backend)
+	}
+	if epochInterval == 0 {
+		return nil, fmt.Errorf("tendermint: unable to determine epoch interval")
 	}
 
 	var evCfg tmproto.EvidenceParams
@@ -117,7 +137,19 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 		AppState: b,
 	}
 
+	doc.Validators, err = convertValidators(d)
+	if err != nil {
+		return nil, err
+	}
+
+	return &doc, nil
+}
+
+// convertValidators converts validators into Tendermint format.
+func convertValidators(d *genesis.Document) ([]tmtypes.GenesisValidator, error) {
+	var err error
 	var tmValidators []tmtypes.GenesisValidator
+	vPerE := make(map[signature.PublicKey]int)
 	for _, v := range d.Registry.Nodes {
 		var openedNode node.Node
 		if err = v.Open(registry.RegisterGenesisNodeSignatureContext, &openedNode); err != nil {
@@ -128,6 +160,12 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 			continue
 		}
 
+		// Skip expired nodes.
+		if openedNode.IsExpired(uint64(d.Beacon.Base)) {
+			continue
+		}
+
+		// Calculate voting power from stake.
 		var power int64
 		if d.Scheduler.Parameters.DebugBypassStake {
 			power = 1
@@ -137,7 +175,8 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 			if account, ok := d.Staking.Ledger[acctAddr]; ok {
 				stake = account.Escrow.Active.Balance.Clone()
 			} else {
-				// If all balances and stuff are zero, it's permitted not to have an account in the ledger at all.
+				// If all balances and stuff are zero, it's permitted not to
+				// have an account in the ledger at all.
 				stake = &quantity.Quantity{}
 			}
 			power, err = scheduler.VotingPowerFromStake(stake)
@@ -151,6 +190,17 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 			}
 		}
 
+		// Make sure that the number of validators per entity stays under
+		// the MaxValidatorsPerEntity limit.
+		if numV, exists := vPerE[openedNode.EntityID]; exists {
+			if numV >= d.Scheduler.Parameters.MaxValidatorsPerEntity {
+				continue
+			}
+			vPerE[openedNode.EntityID] = numV + 1
+		} else {
+			vPerE[openedNode.EntityID] = 1
+		}
+
 		pk := crypto.PublicKeyToTendermint(&openedNode.Consensus.ID)
 		validator := tmtypes.GenesisValidator{
 			Address: pk.Address(),
@@ -161,7 +211,15 @@ func genesisToTendermint(d *genesis.Document) (*tmtypes.GenesisDoc, error) {
 		tmValidators = append(tmValidators, validator)
 	}
 
-	doc.Validators = tmValidators
+	// Sort validators by power in descending order.
+	sort.Slice(tmValidators, func(i, j int) bool {
+		return tmValidators[i].Power > tmValidators[j].Power
+	})
 
-	return &doc, nil
+	// Keep only the first MaxValidators validators.
+	max := d.Scheduler.Parameters.MaxValidators
+	if max > len(tmValidators) {
+		max = len(tmValidators)
+	}
+	return tmValidators[:max], nil
 }

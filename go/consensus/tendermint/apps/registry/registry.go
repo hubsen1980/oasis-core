@@ -7,16 +7,18 @@ import (
 
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
+	roothashApi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/api"
 	stakingapp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/message"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -24,6 +26,7 @@ var _ api.Application = (*registryApplication)(nil)
 
 type registryApplication struct {
 	state api.ApplicationState
+	md    api.MessageDispatcher
 }
 
 func (app *registryApplication) Name() string {
@@ -46,8 +49,12 @@ func (app *registryApplication) Dependencies() []string {
 	return []string{stakingapp.AppName}
 }
 
-func (app *registryApplication) OnRegister(state api.ApplicationState) {
+func (app *registryApplication) OnRegister(state api.ApplicationState, md api.MessageDispatcher) {
 	app.state = state
+	app.md = md
+
+	// Subscribe to messages emitted by other apps.
+	md.Subscribe(roothashApi.RuntimeMessageRegistry, app)
 }
 
 func (app *registryApplication) OnCleanup() {
@@ -59,6 +66,23 @@ func (app *registryApplication) BeginBlock(ctx *api.Context, request types.Reque
 		return app.onRegistryEpochChanged(ctx, registryEpoch)
 	}
 	return nil
+}
+
+func (app *registryApplication) ExecuteMessage(ctx *api.Context, kind, msg interface{}) error {
+	state := registryState.NewMutableState(ctx.State())
+
+	switch kind {
+	case roothashApi.RuntimeMessageRegistry:
+		m := msg.(*message.RegistryMessage)
+		switch {
+		case m.UpdateRuntime != nil:
+			return app.registerRuntime(ctx, state, m.UpdateRuntime)
+		default:
+			return registry.ErrInvalidArgument
+		}
+	default:
+		return registry.ErrInvalidArgument
+	}
 }
 
 func (app *registryApplication) ExecuteTx(ctx *api.Context, tx *transaction.Transaction) error {
@@ -89,26 +113,21 @@ func (app *registryApplication) ExecuteTx(ctx *api.Context, tx *transaction.Tran
 
 		return app.unfreezeNode(ctx, state, &unfreeze)
 	case registry.MethodRegisterRuntime:
-		var sigRt registry.SignedRuntime
-		if err := cbor.Unmarshal(tx.Body, &sigRt); err != nil {
+		var rt registry.Runtime
+		if err := cbor.Unmarshal(tx.Body, &rt); err != nil {
 			return err
 		}
-
-		return app.registerRuntime(ctx, state, &sigRt)
+		return app.registerRuntime(ctx, state, &rt)
 	default:
 		return registry.ErrInvalidArgument
 	}
-}
-
-func (app *registryApplication) ForeignExecuteTx(ctx *api.Context, other api.Application, tx *transaction.Transaction) error {
-	return nil
 }
 
 func (app *registryApplication) EndBlock(ctx *api.Context, request types.RequestEndBlock) (types.ResponseEndBlock, error) {
 	return types.ResponseEndBlock{}, nil
 }
 
-func (app *registryApplication) onRegistryEpochChanged(ctx *api.Context, registryEpoch epochtime.EpochTime) (err error) {
+func (app *registryApplication) onRegistryEpochChanged(ctx *api.Context, registryEpoch beacon.EpochTime) (err error) {
 	state := registryState.NewMutableState(ctx.State())
 	stakeState := stakingState.NewMutableState(ctx.State())
 
@@ -176,7 +195,7 @@ func (app *registryApplication) onRegistryEpochChanged(ctx *api.Context, registr
 			// Overflow, the node will never be removed.
 			continue
 		}
-		if epochtime.EpochTime(node.Expiration)+debondingInterval < registryEpoch {
+		if beacon.EpochTime(node.Expiration)+debondingInterval < registryEpoch {
 			ctx.Logger().Debug("removing expired node",
 				"node_id", node.ID,
 			)

@@ -5,9 +5,11 @@ import (
 	"math"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
+	"github.com/oasisprotocol/oasis-core/go/common/service"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
@@ -28,14 +30,29 @@ var (
 	ErrInternal = errors.New(ModuleName, 2, "client: internal error")
 	// ErrTransactionExpired is an error returned when transaction expired.
 	ErrTransactionExpired = errors.New(ModuleName, 3, "client: transaction expired")
+	// ErrNotSynced is an error returned if transaction is submitted before node has finished
+	// initial syncing.
+	ErrNotSynced = errors.New(ModuleName, 4, "client: not finished initial sync")
+	// ErrCheckTxFailed is an error returned if the local transaction check fails.
+	ErrCheckTxFailed = errors.New(ModuleName, 5, "client: transaction check failed")
+	// ErrNoHostedRuntime is returned when the hosted runtime is not available locally.
+	ErrNoHostedRuntime = errors.New(ModuleName, 6, "client: no hosted runtime is available")
 )
 
 // RuntimeClient is the runtime client interface.
 type RuntimeClient interface {
 	enclaverpc.Transport
 
-	// SubmitTx submits a transaction to the runtime transaction scheduler.
+	// SubmitTx submits a transaction to the runtime transaction scheduler and waits
+	// for transaction execution results.
 	SubmitTx(ctx context.Context, request *SubmitTxRequest) ([]byte, error)
+
+	// SubmitTxNoWait submits a transaction to the runtime transaction scheduler but does
+	// not wait for transaction execution.
+	SubmitTxNoWait(ctx context.Context, request *SubmitTxRequest) error
+
+	// CheckTx asks the local runtime to check the specified transaction.
+	CheckTx(ctx context.Context, request *CheckTxRequest) error
 
 	// GetGenesisBlock returns the genesis block.
 	GetGenesisBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error)
@@ -54,7 +71,19 @@ type RuntimeClient interface {
 	GetTxByBlockHash(ctx context.Context, request *GetTxByBlockHashRequest) (*TxResult, error)
 
 	// GetTxs fetches all runtime transactions in a given block.
+	//
+	// DEPRECATED: This method is deprecated and may be removed in a future release, use
+	//             `GetTransactions` instead.
 	GetTxs(ctx context.Context, request *GetTxsRequest) ([][]byte, error)
+
+	// GetTransactions fetches all runtime transactions in a given block.
+	GetTransactions(ctx context.Context, request *GetTransactionsRequest) ([][]byte, error)
+
+	// GetEvents returns all events emitted in a given block.
+	GetEvents(ctx context.Context, request *GetEventsRequest) ([]*Event, error)
+
+	// Query makes a runtime-specific query.
+	Query(ctx context.Context, request *QueryRequest) (*QueryResponse, error)
 
 	// QueryTx queries the indexer for a specific runtime transaction.
 	QueryTx(ctx context.Context, request *QueryTxRequest) (*TxResult, error)
@@ -67,13 +96,22 @@ type RuntimeClient interface {
 
 	// WaitBlockIndexed waits for a runtime block to be indexed by the indexer.
 	WaitBlockIndexed(ctx context.Context, request *WaitBlockIndexedRequest) error
+}
 
-	// Cleanup cleans up the backend.
-	Cleanup()
+// RuntimeClientService is the runtime client service interface.
+type RuntimeClientService interface {
+	RuntimeClient
+	service.BackgroundService
 }
 
 // SubmitTxRequest is a SubmitTx request.
 type SubmitTxRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Data      []byte           `json:"data"`
+}
+
+// CheckTxRequest is a CheckTx request.
+type CheckTxRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
 	Data      []byte           `json:"data"`
 }
@@ -117,6 +155,40 @@ type GetTxsRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
 	Round     uint64           `json:"round"`
 	IORoot    hash.Hash        `json:"io_root"`
+}
+
+// GetTransactionsRequest is a GetTransactions request.
+type GetTransactionsRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Round     uint64           `json:"round"`
+}
+
+// GetEventsRequest is a GetEvents request.
+type GetEventsRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Round     uint64           `json:"round"`
+}
+
+// Event is an event emitted by a runtime in the form of a runtime transaction tag.
+//
+// Key and value semantics are runtime-dependent.
+type Event struct {
+	Key    []byte    `json:"key"`
+	Value  []byte    `json:"value"`
+	TxHash hash.Hash `json:"tx_hash"`
+}
+
+// QueryRequest is a Query request.
+type QueryRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Round     uint64           `json:"round"`
+	Method    string           `json:"method"`
+	Args      cbor.RawMessage  `json:"args"`
+}
+
+// QueryResponse is a response to the runtime query.
+type QueryResponse struct {
+	Data cbor.RawMessage `json:"data"`
 }
 
 // QueryTxRequest is a QueryTx request.

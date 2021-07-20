@@ -2,6 +2,7 @@ package byzantine
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
@@ -27,6 +29,8 @@ import (
 const (
 	// CfgFakeSGX configures registering with SGX capability.
 	CfgFakeSGX = "fake_sgx"
+	// CfgRuntimeID configures the runtime ID Byzantine node participates in.
+	CfgRuntimeID = "runtime_id"
 	// CfgVersionFakeEnclaveID configures runtime's EnclaveIdentity.
 	CfgVersionFakeEnclaveID = "runtime.version.fake_enclave_id"
 	// CfgActivationEpoch configures the epoch at which the Byzantine node activates.
@@ -35,6 +39,10 @@ const (
 	CfgSchedulerRoleExpected = "scheduler_role_expected"
 	// CfgExecutorMode configures the byzantine executor mode.
 	CfgExecutorMode = "executor_mode"
+	// CfgBeaconMode configures the byzantine beacon mode.
+	CfgBeaconMode = "beacon_mode"
+
+	defaultRuntimeIDHex = "8000000000000000000000000000000000000000000000000000000000000000"
 )
 
 // ExecutorMode represents the byzantine executor mode.
@@ -104,6 +112,11 @@ var (
 		Short: "act as a storage worker",
 		Run:   doStorageScenario,
 	}
+	beaconCmd = &cobra.Command{
+		Use:   "beacon",
+		Short: "act as a validator (for beacon testing)",
+		Run:   doBeaconScenario,
+	}
 )
 
 func activateCommonConfig(cmd *cobra.Command, args []string) {
@@ -114,7 +127,12 @@ func activateCommonConfig(cmd *cobra.Command, args []string) {
 }
 
 func doStorageScenario(cmd *cobra.Command, args []string) {
-	b, err := initializeAndRegisterByzantineNode(node.RoleStorageWorker, scheduler.RoleWorker, scheduler.RoleInvalid, false)
+	var runtimeID common.Namespace
+	if err := runtimeID.UnmarshalHex(viper.GetString(CfgRuntimeID)); err != nil {
+		panic(fmt.Errorf("error initializing node: failed to parse runtime ID: %w", err))
+	}
+
+	b, err := initializeAndRegisterByzantineNode(runtimeID, node.RoleStorageWorker, scheduler.RoleWorker, scheduler.RoleInvalid, false, false)
 	if err != nil {
 		panic(fmt.Sprintf("error initializing node: %+v", err))
 	}
@@ -126,8 +144,13 @@ func doStorageScenario(cmd *cobra.Command, args []string) {
 	time.Sleep(120 * time.Second)
 }
 
-func doExecutorScenario(cmd *cobra.Command, args []string) {
+func doExecutorScenario(cmd *cobra.Command, args []string) { //nolint: gocyclo
 	ctx := context.Background()
+
+	var runtimeID common.Namespace
+	if err := runtimeID.UnmarshalHex(viper.GetString(CfgRuntimeID)); err != nil {
+		panic(fmt.Errorf("error initializing node: failed to parse runtime ID: %w", err))
+	}
 
 	// Validate executor mode.
 	var executorMode ExecutorMode
@@ -136,7 +159,7 @@ func doExecutorScenario(cmd *cobra.Command, args []string) {
 	}
 
 	isTxScheduler := viper.GetBool(CfgSchedulerRoleExpected)
-	b, err := initializeAndRegisterByzantineNode(node.RoleComputeWorker, scheduler.RoleInvalid, scheduler.RoleWorker, isTxScheduler)
+	b, err := initializeAndRegisterByzantineNode(runtimeID, node.RoleComputeWorker, scheduler.RoleInvalid, scheduler.RoleWorker, isTxScheduler, false)
 	if err != nil {
 		panic(fmt.Sprintf("error initializing node: %+v", err))
 	}
@@ -149,7 +172,7 @@ func doExecutorScenario(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	cbc := newComputeBatchContext()
+	cbc := newComputeBatchContext(runtimeID)
 	switch isTxScheduler {
 	case true:
 		var cont bool
@@ -173,28 +196,55 @@ func doExecutorScenario(cmd *cobra.Command, args []string) {
 	}
 	defer cbc.closeTrees()
 
+	// Update current epoch to mimic the test key-value runtime.
+	var encodedEpoch [8]byte
+	binary.BigEndian.PutUint64(encodedEpoch[:], uint64(b.executorCommittee.ValidFor))
+
+	if err = cbc.stateTree.Insert(ctx, []byte{0x02}, encodedEpoch[:]); err != nil {
+		panic(fmt.Sprintf("compute state tree set failed: %+v", err))
+	}
+
 	switch executorMode {
 	case ModeExecutorHonest:
 		// Process transaction honestly.
-		if err = cbc.stateTree.Insert(ctx, []byte("hello_key"), []byte("hello_value")); err != nil {
-			panic(fmt.Sprintf("compute state tree set failed: %+v", err))
-		}
-		if err = cbc.addResultSuccess(ctx, cbc.txs[0], nil, transaction.Tags{
-			transaction.Tag{Key: []byte("kv_op"), Value: []byte("insert")},
-			transaction.Tag{Key: []byte("kv_key"), Value: []byte("hello_key")},
-		}); err != nil {
-			panic(fmt.Sprintf("compute add result success failed: %+v", err))
+		switch len(cbc.txs) {
+		case 0:
+			// No transactions, don't modify anything else.
+		case 1:
+			// A single transaction, simulate the key-value runtime.
+			if err = cbc.stateTree.Insert(ctx, []byte("hello_key"), []byte("hello_value")); err != nil {
+				panic(fmt.Sprintf("compute state tree set failed: %+v", err))
+			}
+			if err = cbc.addResultSuccess(ctx, cbc.txs[0], nil, transaction.Tags{
+				transaction.Tag{Key: []byte("kv_op"), Value: []byte("insert")},
+				transaction.Tag{Key: []byte("kv_key"), Value: []byte("hello_key")},
+			}); err != nil {
+				panic(fmt.Sprintf("compute add result success failed: %+v", err))
+			}
+		default:
+			// Unsupported condition.
+			panic(fmt.Sprintf("unsupported number of transactions: %d", len(cbc.txs)))
 		}
 	case ModeExecutorWrong:
-		// Alter the state wrong.
+		// Alter the state incorrectly.
 		if err = cbc.stateTree.Insert(ctx, []byte("hello_key"), []byte("wrong")); err != nil {
 			panic(fmt.Sprintf("compute state tree set failed: %+v", err))
 		}
-		if err = cbc.addResultSuccess(ctx, cbc.txs[0], nil, transaction.Tags{
-			transaction.Tag{Key: []byte("kv_op"), Value: []byte("insert")},
-			transaction.Tag{Key: []byte("kv_key"), Value: []byte("hello_key")},
-		}); err != nil {
-			panic(fmt.Sprintf("compute add result success failed: %+v", err))
+
+		switch len(cbc.txs) {
+		case 0:
+			// No transactions.
+		case 1:
+			// A single transaction.
+			if err = cbc.addResultSuccess(ctx, cbc.txs[0], nil, transaction.Tags{
+				transaction.Tag{Key: []byte("kv_op"), Value: []byte("insert")},
+				transaction.Tag{Key: []byte("kv_key"), Value: []byte("hello_key")},
+			}); err != nil {
+				panic(fmt.Sprintf("compute add result success failed: %+v", err))
+			}
+		default:
+			// Unsupported condition.
+			panic(fmt.Sprintf("unsupported number of transactions: %d", len(cbc.txs)))
 		}
 	case ModeExecutorFailureIndicating:
 		// No need to process anything as we'll submit a failure indicating commitment anyway.
@@ -229,7 +279,7 @@ func doExecutorScenario(cmd *cobra.Command, args []string) {
 
 	}
 
-	if err = cbc.publishToChain(b.tendermint.service, b.identity, defaultRuntimeID); err != nil {
+	if err = cbc.publishToChain(b.tendermint.service, b.identity); err != nil {
 		panic(fmt.Sprintf("compute publish to chain failed: %+v", err))
 	}
 	logger.Debug("executor: commitment sent")
@@ -239,22 +289,26 @@ func doExecutorScenario(cmd *cobra.Command, args []string) {
 func Register(parentCmd *cobra.Command) {
 	byzantineCmd.AddCommand(executorHonestCmd)
 	byzantineCmd.AddCommand(storageCmd)
+	byzantineCmd.AddCommand(beaconCmd)
 	parentCmd.AddCommand(byzantineCmd)
 }
 
 func init() {
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	fs.Bool(CfgFakeSGX, false, "register with SGX capability")
+	fs.String(CfgRuntimeID, defaultRuntimeIDHex, "runtime ID byzantine node participates in")
 	fs.String(CfgVersionFakeEnclaveID, "", "fake runtime enclave identity")
 	fs.Uint64(CfgActivationEpoch, 0, "epoch at which the Byzantine node should activate")
 	fs.Bool(CfgSchedulerRoleExpected, false, "is executor node expected to be scheduler or not")
 	fs.String(CfgExecutorMode, ModeExecutorHonest.String(), "configures executor mode")
+	fs.String(CfgBeaconMode, ModeBeaconHonest.String(), "configures beacon mode")
 	_ = viper.BindPFlags(fs)
 	byzantineCmd.PersistentFlags().AddFlagSet(fs)
 
 	storageFlags.Uint64(CfgNumStorageFailApplyBatch, 0, "Number of ApplyBatch requests to fail")
 	storageFlags.Uint64(CfgNumStorageFailApply, 0, "Number of Apply requests to fail")
-	storageFlags.Bool(CfgFailReadRequests, false, "If storage worker should fail read requests")
+	storageFlags.Bool(CfgFailReadRequests, false, "Whether the storage node should fail read requests")
+	storageFlags.Bool(CfgCorruptGetDiff, false, "Whether the storage node should corrupt GetDiff responses")
 	_ = viper.BindPFlags(storageFlags)
 	byzantineCmd.PersistentFlags().AddFlagSet(storageFlags)
 

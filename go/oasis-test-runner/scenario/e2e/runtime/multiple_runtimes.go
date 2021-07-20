@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
 const (
@@ -27,12 +29,12 @@ const (
 // MultipleRuntimes is a scenario which tests running multiple runtimes on one node.
 var MultipleRuntimes = func() scenario.Scenario {
 	sc := &multipleRuntimesImpl{
-		runtimeImpl: *newRuntimeImpl("multiple-runtimes", "simple-keyvalue-client", nil),
+		runtimeImpl: *newRuntimeImpl("multiple-runtimes", nil),
 	}
 	sc.Flags.Int(cfgNumComputeRuntimes, 2, "number of compute runtimes per worker")
 	sc.Flags.Int(cfgNumComputeRuntimeTxns, 2, "number of transactions to perform")
 	sc.Flags.Int(cfgNumComputeWorkers, 2, "number of workers to initiate")
-	sc.Flags.Int(cfgExecutorGroupSize, 2, "number of executor workers in committee")
+	sc.Flags.Uint16(cfgExecutorGroupSize, 2, "number of executor workers in committee")
 
 	return sc
 }()
@@ -56,13 +58,13 @@ func (sc *multipleRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 	// Remove existing compute runtimes from fixture, remember RuntimeID and
 	// binary from the first one.
 	var id common.Namespace
-	var runtimeBinary string
+	var runtimeBinaries map[node.TEEHardware][]string
 	var rts []oasis.RuntimeFixture
 	for _, rt := range f.Runtimes {
 		if rt.Kind == registry.KindCompute {
-			if runtimeBinary == "" {
+			if runtimeBinaries == nil {
 				copy(id[:], rt.ID[:])
-				runtimeBinary = rt.Binaries[0]
+				runtimeBinaries = rt.Binaries
 			}
 		} else {
 			rts = append(rts, rt)
@@ -71,11 +73,11 @@ func (sc *multipleRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 	f.Runtimes = rts
 
 	// Avoid unexpected blocks.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
 
 	// Add some more consecutive runtime IDs with the same binary.
 	numComputeRuntimes, _ := sc.Flags.GetInt(cfgNumComputeRuntimes)
-	executorGroupSize, _ := sc.Flags.GetInt(cfgExecutorGroupSize)
+	executorGroupSize, _ := sc.Flags.GetUint16(cfgExecutorGroupSize)
 	for i := 1; i <= numComputeRuntimes; i++ {
 		// Increase LSB by 1.
 		id[len(id)-1]++
@@ -84,9 +86,9 @@ func (sc *multipleRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 			Kind:       registry.KindCompute,
 			Entity:     0,
 			Keymanager: 0,
-			Binaries:   []string{runtimeBinary},
+			Binaries:   runtimeBinaries,
 			Executor: registry.ExecutorParameters{
-				GroupSize:       uint64(executorGroupSize),
+				GroupSize:       executorGroupSize,
 				GroupBackupSize: 0,
 				RoundTimeout:    20,
 			},
@@ -106,6 +108,23 @@ func (sc *multipleRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 			AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 				AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 			},
+			Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+				scheduler.KindComputeExecutor: {
+					scheduler.RoleWorker: {
+						MinPoolSize: &registry.MinPoolSizeConstraint{
+							Limit: executorGroupSize,
+						},
+					},
+				},
+				scheduler.KindStorage: {
+					scheduler.RoleWorker: {
+						MinPoolSize: &registry.MinPoolSizeConstraint{
+							Limit: 1,
+						},
+					},
+				},
+			},
+			GovernanceModel: registry.GovernanceEntity,
 		}
 
 		f.Runtimes = append(f.Runtimes, newRtFixture)
@@ -129,6 +148,8 @@ func (sc *multipleRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 		)
 	}
 
+	f.Clients[0].Runtimes = computeRuntimes
+
 	return f, nil
 }
 
@@ -150,7 +171,7 @@ func (sc *multipleRuntimesImpl) Run(childEnv *env.Env) error {
 	ctx := context.Background()
 
 	// Submit transactions.
-	epoch := epochtime.EpochTime(3)
+	epoch := beacon.EpochTime(3)
 	numComputeRuntimeTxns, _ := sc.Flags.GetInt(cfgNumComputeRuntimeTxns)
 	for _, r := range sc.Net.Runtimes() {
 		rt := r.ToRuntimeDescriptor()
@@ -161,7 +182,7 @@ func (sc *multipleRuntimesImpl) Run(childEnv *env.Env) error {
 					"runtime_id", rt.ID,
 				)
 
-				if err := sc.submitKeyValueRuntimeInsertTx(ctx, rt.ID, "hello", fmt.Sprintf("world at iteration %d from %s", i, rt.ID)); err != nil {
+				if _, err := sc.submitKeyValueRuntimeInsertTx(ctx, rt.ID, "hello", fmt.Sprintf("world at iteration %d from %s", i, rt.ID), 0); err != nil {
 					return err
 				}
 

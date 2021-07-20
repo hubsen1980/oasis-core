@@ -25,16 +25,18 @@ func (d *Document) SanityCheck() error {
 		pkBlacklist[v] = true
 	}
 
-	if err := d.EpochTime.SanityCheck(); err != nil {
+	if err := d.Beacon.SanityCheck(); err != nil {
 		return err
 	}
-	if err := d.Registry.SanityCheck(d.EpochTime.Base, d.Staking.Ledger, d.Staking.Parameters.Thresholds, pkBlacklist); err != nil {
+	epoch := d.Beacon.Base // Note: d.Height has no easy connection to the epoch.
+
+	if err := d.Registry.SanityCheck(d.Time, epoch, d.Staking.Ledger, d.Staking.Parameters.Thresholds, pkBlacklist); err != nil {
 		return err
 	}
 	if err := d.RootHash.SanityCheck(); err != nil {
 		return err
 	}
-	if err := d.Staking.SanityCheck(d.EpochTime.Base); err != nil {
+	if err := d.Staking.SanityCheck(epoch); err != nil {
 		return err
 	}
 	if err := d.KeyManager.SanityCheck(); err != nil {
@@ -43,11 +45,11 @@ func (d *Document) SanityCheck() error {
 	if err := d.Scheduler.SanityCheck(&d.Staking.TotalSupply); err != nil {
 		return err
 	}
-	if err := d.Beacon.SanityCheck(); err != nil {
+	if err := d.Governance.SanityCheck(epoch, &d.Staking.GovernanceDeposits); err != nil {
 		return err
 	}
 
-	if d.HaltEpoch < d.EpochTime.Base {
+	if d.HaltEpoch < epoch {
 		return fmt.Errorf("genesis: sanity check failed: halt epoch is in the past")
 	}
 

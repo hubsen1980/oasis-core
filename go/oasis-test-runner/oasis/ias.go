@@ -1,9 +1,11 @@
 package oasis
 
 import (
+	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	tlsCert "github.com/oasisprotocol/oasis-core/go/common/crypto/tls"
 	iasProxyApi "github.com/oasisprotocol/oasis-core/go/ias/proxy"
 	iasCmd "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/ias"
@@ -12,42 +14,36 @@ import (
 var mockSPID []byte
 
 type iasProxy struct {
-	Node
+	*Node
 
-	mock        bool
-	useRegistry bool
-	grpcPort    uint16
+	mock     bool
+	grpcPort uint16
+
+	tlsPublicKey signature.PublicKey
 }
 
-func (ias *iasProxy) tlsCertPath() string {
-	tlsCertPath, _ := iasCmd.TLSCertPaths(ias.dir.String())
-	return tlsCertPath
-}
-
-func (ias *iasProxy) startNode() error {
-	args := newArgBuilder().
-		debugDontBlameOasis().
+func (ias *iasProxy) AddArgs(args *argBuilder) error {
+	args.debugDontBlameOasis().
 		debugAllowTestKeys().
 		grpcServerPort(ias.grpcPort).
 		grpcWait()
 
 	// If non-mock, IAS Proxy should get the SPID and API key through env vars.
 	if ias.mock {
-		args = args.iasDebugMock().iasSPID(mockSPID)
+		args.iasDebugMock().iasSPID(mockSPID)
 	}
 
-	switch ias.useRegistry {
-	case true:
-		// XXX: IAS proxy is started before the validators. Pregenerate temp validator internal socket path, if needed.
-		if ias.net.cfg.UseShortGrpcSocketPaths && ias.net.validators[0].customGrpcSocketPath == "" {
-			ias.net.validators[0].customGrpcSocketPath = ias.net.generateTempSocketPath()
-		}
-		args = args.internalSocketAddress(ias.net.validators[0].SocketPath())
-	case false:
-		args = args.iasUseGenesis()
+	// XXX: IAS proxy is started before the validators. Pregenerate temp validator internal socket path.
+	if ias.net.cfg.UseShortGrpcSocketPaths && ias.net.validators[0].customGrpcSocketPath == "" {
+		ias.net.validators[0].customGrpcSocketPath = ias.net.generateTempSocketPath()
 	}
+	args.internalSocketAddress(ias.net.validators[0].SocketPath())
 
-	if err := ias.net.startOasisNode(&ias.Node, []string{"ias", "proxy"}, args); err != nil {
+	return nil
+}
+
+func (ias *iasProxy) CustomStart(args *argBuilder) error {
+	if err := ias.net.startOasisNode(ias.Node, []string{"ias", "proxy"}, args); err != nil {
 		return fmt.Errorf("oasis/ias: failed to launch node %s: %w", ias.Name, err)
 	}
 
@@ -60,38 +56,35 @@ func (net *Network) newIASProxy() (*iasProxy, error) {
 	}
 
 	iasName := "ias-proxy"
-
-	iasDir, err := net.baseDir.NewSubDir(iasName)
+	host, err := net.GetNamedNode(iasName, nil)
 	if err != nil {
-		net.logger.Error("failed to create ias proxy subdir",
-			"err", err,
-		)
-		return nil, fmt.Errorf("oasis/ias: failed to create ias proxy subdir: %w", err)
+		return nil, err
 	}
 
 	// Pre-provision the IAS TLS certificates as they are used by other nodes
 	// during startup.
-	tlsCertPath, tlsKeyPath := iasCmd.TLSCertPaths(iasDir.String())
-	if _, err = tlsCert.LoadOrGenerate(tlsCertPath, tlsKeyPath, iasProxyApi.CommonName); err != nil {
+	tlsCertPath, tlsKeyPath := iasCmd.TLSCertPaths(host.dir.String())
+	iasCert, err := tlsCert.LoadOrGenerate(tlsCertPath, tlsKeyPath, iasProxyApi.CommonName)
+	if err != nil {
 		net.logger.Error("failed to generate IAS proxy TLS cert",
 			"err", err,
 		)
 		return nil, fmt.Errorf("oasis/ias: failed to generate IAS proxy TLS cert: %w", err)
 	}
+	tlsPublicKey := iasCert.PrivateKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey)
 
 	net.iasProxy = &iasProxy{
-		Node: Node{
-			Name: iasName,
-			net:  net,
-			dir:  iasDir,
-		},
-		useRegistry: net.cfg.IAS.UseRegistry,
-		mock:        net.cfg.IAS.Mock,
-		grpcPort:    net.nextNodePort,
+		Node:     host,
+		mock:     net.cfg.IAS.Mock,
+		grpcPort: host.getProvisionedPort("iasgrpc"),
 	}
-	net.iasProxy.doStartNode = net.iasProxy.startNode
 
-	net.nextNodePort++
+	// Store TLS public key so other nodes can configure authentication.
+	if err = net.iasProxy.tlsPublicKey.UnmarshalBinary(tlsPublicKey[:]); err != nil {
+		return nil, fmt.Errorf("oasis/ias: failed to unmarshal IAS proxy TLS public key: %w", err)
+	}
+
+	host.features = append(host.features, net.iasProxy)
 
 	return net.iasProxy, nil
 }

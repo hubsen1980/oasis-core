@@ -6,13 +6,15 @@ import (
 
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
+	roothashApi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/api"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/message"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -42,8 +44,11 @@ func (app *stakingApplication) Dependencies() []string {
 	return nil
 }
 
-func (app *stakingApplication) OnRegister(state api.ApplicationState) {
+func (app *stakingApplication) OnRegister(state api.ApplicationState, md api.MessageDispatcher) {
 	app.state = state
+
+	// Subscribe to messages emitted by other apps.
+	md.Subscribe(roothashApi.RuntimeMessageStaking, app)
 }
 
 func (app *stakingApplication) OnCleanup() {
@@ -54,16 +59,22 @@ func (app *stakingApplication) BeginBlock(ctx *api.Context, request types.Reques
 	stakeState := stakingState.NewMutableState(ctx.State())
 
 	// Look up the proposer's entity.
-	proposingEntity := app.resolveEntityIDFromProposer(ctx, regState, request)
+	proposingEntity, err := app.resolveEntityIDFromProposer(ctx, regState, request)
+	if err != nil {
+		return fmt.Errorf("failed to resolve proposer entity ID: %w", err)
+	}
 
 	// Go through all voters of the previous block and resolve entities.
 	// numEligibleValidators is how many total validators are in the validator set, while
 	// votingEntities is from the validators which actually voted.
 	numEligibleValidators := len(request.GetLastCommitInfo().Votes)
-	votingEntities := app.resolveEntityIDsFromVotes(ctx, regState, request.GetLastCommitInfo())
+	votingEntities, err := app.resolveEntityIDsFromVotes(ctx, regState, request.GetLastCommitInfo())
+	if err != nil {
+		return fmt.Errorf("failed to resolve entity IDs from votes: %w", err)
+	}
 
 	// Disburse fees from previous block.
-	if err := app.disburseFeesVQ(ctx, stakeState, proposingEntity, numEligibleValidators, votingEntities); err != nil {
+	if err = app.disburseFeesVQ(ctx, stakeState, proposingEntity, numEligibleValidators, votingEntities); err != nil {
 		return fmt.Errorf("disburse fees voters and next proposer: %w", err)
 	}
 
@@ -71,31 +82,60 @@ func (app *stakingApplication) BeginBlock(ctx *api.Context, request types.Reques
 	stakingState.SetBlockProposer(ctx, proposingEntity)
 
 	// Add rewards for proposer.
-	if err := app.rewardBlockProposing(ctx, stakeState, proposingEntity, numEligibleValidators, len(votingEntities)); err != nil {
+	if err = app.rewardBlockProposing(ctx, stakeState, proposingEntity, numEligibleValidators, len(votingEntities)); err != nil {
 		return fmt.Errorf("staking: block proposing reward: %w", err)
 	}
 
 	// Track signing for rewards.
-	if err := app.updateEpochSigning(ctx, stakeState, votingEntities); err != nil {
+	if err = app.updateEpochSigning(ctx, stakeState, votingEntities); err != nil {
 		return fmt.Errorf("staking: failed to update epoch signing info: %w", err)
 	}
 
 	// Iterate over any submitted evidence of a validator misbehaving. Note that
 	// the actual evidence has already been verified by Tendermint to be valid.
 	for _, evidence := range request.ByzantineValidators {
+		var reason staking.SlashReason
 		switch evidence.Type {
 		case types.EvidenceType_DUPLICATE_VOTE:
-			if err := onEvidenceDoubleSign(ctx, evidence.Validator.Address, evidence.Height, evidence.Time, evidence.Validator.Power); err != nil {
-				return err
-			}
+			reason = staking.SlashConsensusEquivocation
+		case types.EvidenceType_LIGHT_CLIENT_ATTACK:
+			reason = staking.SlashConsensusLightClientAttack
 		default:
 			ctx.Logger().Warn("ignoring unknown evidence type",
 				"evidence_type", evidence.Type,
 			)
+			continue
+		}
+
+		if err = onEvidenceByzantineConsensus(ctx, reason, evidence.Validator.Address, evidence.Height, evidence.Time, evidence.Validator.Power); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+func (app *stakingApplication) ExecuteMessage(ctx *api.Context, kind, msg interface{}) error {
+	state := stakingState.NewMutableState(ctx.State())
+
+	switch kind {
+	case roothashApi.RuntimeMessageStaking:
+		m := msg.(*message.StakingMessage)
+		switch {
+		case m.Transfer != nil:
+			return app.transfer(ctx, state, m.Transfer)
+		case m.Withdraw != nil:
+			return app.withdraw(ctx, state, m.Withdraw)
+		case m.AddEscrow != nil:
+			return app.addEscrow(ctx, state, m.AddEscrow)
+		case m.ReclaimEscrow != nil:
+			return app.reclaimEscrow(ctx, state, m.ReclaimEscrow)
+		default:
+			return staking.ErrInvalidArgument
+		}
+	default:
+		return staking.ErrInvalidArgument
+	}
 }
 
 func (app *stakingApplication) ExecuteTx(ctx *api.Context, tx *transaction.Transaction) error {
@@ -156,10 +196,6 @@ func (app *stakingApplication) ExecuteTx(ctx *api.Context, tx *transaction.Trans
 	}
 }
 
-func (app *stakingApplication) ForeignExecuteTx(ctx *api.Context, other api.Application, tx *transaction.Transaction) error {
-	return nil
-}
-
 func (app *stakingApplication) EndBlock(ctx *api.Context, request types.RequestEndBlock) (types.ResponseEndBlock, error) {
 	fees := stakingState.BlockFees(ctx)
 	if err := app.disburseFeesP(ctx, stakingState.NewMutableState(ctx.State()), stakingState.BlockProposer(ctx), &fees); err != nil {
@@ -172,7 +208,7 @@ func (app *stakingApplication) EndBlock(ctx *api.Context, request types.RequestE
 	return types.ResponseEndBlock{}, nil
 }
 
-func (app *stakingApplication) onEpochChange(ctx *api.Context, epoch epochtime.EpochTime) error {
+func (app *stakingApplication) onEpochChange(ctx *api.Context, epoch beacon.EpochTime) error {
 	state := stakingState.NewMutableState(ctx.State())
 
 	// Delegation unbonding after debonding period elapses.
@@ -223,10 +259,10 @@ func (app *stakingApplication) onEpochChange(ctx *api.Context, epoch epochtime.E
 		}
 
 		// Update state.
-		if err = state.RemoveFromDebondingQueue(ctx, e.Epoch, e.DelegatorAddr, e.EscrowAddr, e.Seq); err != nil {
+		if err = state.RemoveFromDebondingQueue(ctx, e.Epoch, e.DelegatorAddr, e.EscrowAddr); err != nil {
 			return fmt.Errorf("failed to remove from debonding queue: %w", err)
 		}
-		if err = state.SetDebondingDelegation(ctx, e.DelegatorAddr, e.EscrowAddr, e.Seq, nil); err != nil {
+		if err = state.SetDebondingDelegation(ctx, e.DelegatorAddr, e.EscrowAddr, e.Delegation.DebondEndTime, nil); err != nil {
 			return fmt.Errorf("failed to set debonding delegation: %w", err)
 		}
 		if err = state.SetAccount(ctx, e.DelegatorAddr, delegator); err != nil {
@@ -242,14 +278,15 @@ func (app *stakingApplication) onEpochChange(ctx *api.Context, epoch epochtime.E
 			"escrow_addr", e.EscrowAddr,
 			"delegator_addr", e.DelegatorAddr,
 			"base_units", stakeAmount,
+			"num_shares", shareAmount,
 		)
 
-		evt := staking.ReclaimEscrowEvent{
+		ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.ReclaimEscrowEvent{
 			Owner:  e.DelegatorAddr,
 			Escrow: e.EscrowAddr,
 			Amount: *stakeAmount,
-		}
-		ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyReclaimEscrow, cbor.Marshal(evt)))
+			Shares: *shareAmount,
+		}))
 	}
 
 	// Add signing rewards.

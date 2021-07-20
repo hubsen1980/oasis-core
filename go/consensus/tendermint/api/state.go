@@ -6,17 +6,19 @@ import (
 	"fmt"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
+	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
 
 // ErrNoState is the error returned when state is nil.
@@ -45,14 +47,14 @@ type ApplicationState interface {
 	BlockContext() *BlockContext
 
 	// GetBaseEpoch returns the base epoch.
-	GetBaseEpoch() (epochtime.EpochTime, error)
+	GetBaseEpoch() (beacon.EpochTime, error)
 
 	// GetCurrentEpoch returns the epoch at the current block height.
-	GetCurrentEpoch(ctx context.Context) (epochtime.EpochTime, error)
+	GetCurrentEpoch(ctx context.Context) (beacon.EpochTime, error)
 
 	// EpochChanged returns true iff the current epoch has changed since the
 	// last block.  As a matter of convenience, the current epoch is returned.
-	EpochChanged(ctx *Context) (bool, epochtime.EpochTime)
+	EpochChanged(ctx *Context) (bool, beacon.EpochTime)
 
 	// MinGasPrice returns the configured minimum gas price.
 	MinGasPrice() *quantity.Quantity
@@ -62,6 +64,9 @@ type ApplicationState interface {
 
 	// OwnTxSignerAddress returns the transaction signer's staking address of the local node.
 	OwnTxSignerAddress() staking.Address
+
+	// Upgrader returns the upgrade backend if available.
+	Upgrader() upgrade.Backend
 
 	// NewContext creates a new application processing context.
 	NewContext(mode ContextMode, now time.Time) *Context
@@ -73,15 +78,28 @@ type ApplicationQueryState interface {
 	// Storage returns the storage backend.
 	Storage() storage.LocalBackend
 
+	// Checkpointer returns the checkpointer associated with the application state.
+	//
+	// This may be nil in case checkpoints are disabled.
+	Checkpointer() checkpoint.Checkpointer
+
 	// BlockHeight returns the last committed block height.
 	BlockHeight() int64
 
 	// GetEpoch returns epoch at block height.
-	GetEpoch(ctx context.Context, blockHeight int64) (epochtime.EpochTime, error)
+	GetEpoch(ctx context.Context, blockHeight int64) (beacon.EpochTime, error)
 
 	// LastRetainedVersion returns the earliest retained version the ABCI
 	// state.
 	LastRetainedVersion() (int64, error)
+}
+
+// MockApplicationState is the mock application state interface.
+type MockApplicationState interface {
+	ApplicationState
+
+	// UpdateMockApplicationStateConfig updates the mock application config.
+	UpdateMockApplicationStateConfig(cfg *MockApplicationStateConfig)
 }
 
 // MockApplicationStateConfig is the configuration for the mock application state.
@@ -89,8 +107,8 @@ type MockApplicationStateConfig struct {
 	BlockHeight int64
 	BlockHash   []byte
 
-	BaseEpoch    epochtime.EpochTime
-	CurrentEpoch epochtime.EpochTime
+	BaseEpoch    beacon.EpochTime
+	CurrentEpoch beacon.EpochTime
 	EpochChanged bool
 
 	MaxBlockGas transaction.Gas
@@ -113,6 +131,10 @@ func (ms *mockApplicationState) Storage() storage.LocalBackend {
 	panic("not implemented")
 }
 
+func (ms *mockApplicationState) Checkpointer() checkpoint.Checkpointer {
+	return nil
+}
+
 func (ms *mockApplicationState) InitialHeight() int64 {
 	return ms.cfg.Genesis.Height
 }
@@ -129,11 +151,11 @@ func (ms *mockApplicationState) BlockContext() *BlockContext {
 	return ms.blockCtx
 }
 
-func (ms *mockApplicationState) GetBaseEpoch() (epochtime.EpochTime, error) {
+func (ms *mockApplicationState) GetBaseEpoch() (beacon.EpochTime, error) {
 	return ms.cfg.BaseEpoch, nil
 }
 
-func (ms *mockApplicationState) GetEpoch(ctx context.Context, blockHeight int64) (epochtime.EpochTime, error) {
+func (ms *mockApplicationState) GetEpoch(ctx context.Context, blockHeight int64) (beacon.EpochTime, error) {
 	return ms.cfg.CurrentEpoch, nil
 }
 
@@ -141,11 +163,11 @@ func (ms *mockApplicationState) LastRetainedVersion() (int64, error) {
 	return ms.cfg.Genesis.Height, nil
 }
 
-func (ms *mockApplicationState) GetCurrentEpoch(ctx context.Context) (epochtime.EpochTime, error) {
+func (ms *mockApplicationState) GetCurrentEpoch(ctx context.Context) (beacon.EpochTime, error) {
 	return ms.cfg.CurrentEpoch, nil
 }
 
-func (ms *mockApplicationState) EpochChanged(ctx *Context) (bool, epochtime.EpochTime) {
+func (ms *mockApplicationState) EpochChanged(ctx *Context) (bool, beacon.EpochTime) {
 	return ms.cfg.EpochChanged, ms.cfg.CurrentEpoch
 }
 
@@ -159,6 +181,10 @@ func (ms *mockApplicationState) OwnTxSigner() signature.PublicKey {
 
 func (ms *mockApplicationState) OwnTxSignerAddress() staking.Address {
 	return ms.ownTxSignerAddress
+}
+
+func (ms *mockApplicationState) Upgrader() upgrade.Backend {
+	return nil
 }
 
 func (ms *mockApplicationState) ConsensusParameters() *consensusGenesis.Parameters {
@@ -182,15 +208,13 @@ func (ms *mockApplicationState) NewContext(mode ContextMode, now time.Time) *Con
 	return c
 }
 
-// NewMockApplicationState creates a new mock application state for testing.
-func NewMockApplicationState(cfg *MockApplicationStateConfig) ApplicationState {
-	tree := mkvs.New(nil, nil)
+func (ms *mockApplicationState) UpdateMockApplicationStateConfig(cfg *MockApplicationStateConfig) {
+	ms.cfg = cfg
 
-	blockCtx := NewBlockContext()
 	if cfg.MaxBlockGas > 0 {
-		blockCtx.Set(GasAccountantKey{}, NewGasAccountant(cfg.MaxBlockGas))
+		ms.blockCtx.Set(GasAccountantKey{}, NewGasAccountant(cfg.MaxBlockGas))
 	} else {
-		blockCtx.Set(GasAccountantKey{}, NewNopGasAccountant())
+		ms.blockCtx.Set(GasAccountantKey{}, NewNopGasAccountant())
 	}
 
 	if cfg.Genesis == nil {
@@ -199,13 +223,21 @@ func NewMockApplicationState(cfg *MockApplicationStateConfig) ApplicationState {
 	if cfg.Genesis.Height == 0 {
 		cfg.Genesis.Height = 1
 	}
+}
 
-	return &mockApplicationState{
-		cfg:                cfg,
+// NewMockApplicationState creates a new mock application state for testing.
+func NewMockApplicationState(cfg *MockApplicationStateConfig) MockApplicationState {
+	tree := mkvs.New(nil, nil, storage.RootTypeState)
+
+	blockCtx := NewBlockContext()
+	m := &mockApplicationState{
 		blockCtx:           blockCtx,
 		tree:               tree,
 		ownTxSignerAddress: staking.NewAddress(cfg.OwnTxSigner),
 	}
+	m.UpdateMockApplicationStateConfig(cfg)
+
+	return m
 }
 
 // ImmutableState is an immutable state wrapper.
@@ -280,10 +312,7 @@ func NewImmutableState(ctx context.Context, state ApplicationQueryState, version
 		// Unexpected number of roots.
 		return nil, fmt.Errorf("state: incorrect number of roots (%d): %+v", version, roots)
 	}
-	tree := mkvs.NewWithRoot(nil, ndb, storage.Root{
-		Version: uint64(version),
-		Hash:    roots[0],
-	}, mkvs.WithoutWriteLog())
+	tree := mkvs.NewWithRoot(nil, ndb, roots[0], mkvs.WithoutWriteLog())
 
 	return &ImmutableState{tree}, nil
 }

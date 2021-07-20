@@ -23,6 +23,10 @@ var (
 	// ErrInvalidNonce is the error returned when a nonce is invalid.
 	ErrInvalidNonce = errors.New(moduleName, 1, "transaction: invalid nonce")
 
+	// ErrUpgradePending is the error returned when an upgrade is pending and the transaction thus
+	// cannot be processed right now. The submitter should retry the transaction in this case.
+	ErrUpgradePending = errors.New(moduleName, 4, "transaction: upgrade pending")
+
 	// SignatureContext is the context used for signing transactions.
 	SignatureContext = signature.NewContext("oasis-core/consensus: tx", signature.WithChainSeparation())
 
@@ -81,6 +85,9 @@ func (t Transaction) PrettyPrintBody(ctx context.Context, prefix string, w io.Wr
 // PrettyPrint writes a pretty-printed representation of the transaction to the
 // given writer.
 func (t Transaction) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
+	fmt.Fprintf(w, "%sMethod: %s\n", prefix, t.Method)
+	fmt.Fprintf(w, "%sBody:\n", prefix)
+	t.PrettyPrintBody(ctx, prefix+"  ", w)
 	fmt.Fprintf(w, "%sNonce:  %d\n", prefix, t.Nonce)
 	if t.Fee != nil {
 		fmt.Fprintf(w, "%sFee:\n", prefix)
@@ -88,10 +95,6 @@ func (t Transaction) PrettyPrint(ctx context.Context, prefix string, w io.Writer
 	} else {
 		fmt.Fprintf(w, "%sFee:   none\n", prefix)
 	}
-	fmt.Fprintf(w, "%sMethod: %s\n", prefix, t.Method)
-	fmt.Fprintf(w, "%sBody:\n", prefix)
-	t.PrettyPrintBody(ctx, prefix+"  ", w)
-
 	if genesisHash, ok := ctx.Value(prettyprint.ContextKeyGenesisHash).(hash.Hash); ok {
 		fmt.Println("Other info:")
 		fmt.Printf("  Genesis document's hash: %s\n", genesisHash)
@@ -221,6 +224,28 @@ func Sign(signer signature.Signer, tx *Transaction) (*SignedTransaction, error) 
 // MethodSeparator is the separator used to separate backend name from method name.
 const MethodSeparator = "."
 
+// MethodPriority is the method handling priority.
+type MethodPriority uint8
+
+const (
+	// MethodPriorityNormal is the normal method priority.
+	MethodPriorityNormal = 0
+	// MethodPriorityCritical is the priority for methods critical to the protocol operation.
+	MethodPriorityCritical = 255
+)
+
+// MethodMetadata is the method metadata.
+type MethodMetadata struct {
+	Priority MethodPriority
+}
+
+// MethodMetadataProvider is the method metadata provider interface that can be implemented by
+// method body types to provide additional method metadata.
+type MethodMetadataProvider interface {
+	// MethodMetadata returns the method metadata.
+	MethodMetadata() MethodMetadata
+}
+
 // MethodName is a method name.
 type MethodName string
 
@@ -237,6 +262,23 @@ func (m MethodName) SanityCheck() error {
 func (m MethodName) BodyType() interface{} {
 	bodyType, _ := registeredMethods.Load(string(m))
 	return bodyType
+}
+
+// Metadata returns the method metadata.
+func (m MethodName) Metadata() MethodMetadata {
+	mp, ok := m.BodyType().(MethodMetadataProvider)
+	if !ok {
+		// Return defaults.
+		return MethodMetadata{
+			Priority: MethodPriorityNormal,
+		}
+	}
+	return mp.MethodMetadata()
+}
+
+// IsCritical returns true if the method is critical for the operation of the protocol.
+func (m MethodName) IsCritical() bool {
+	return m.Metadata().Priority == MethodPriorityCritical
 }
 
 // NewMethodName creates a new method name.

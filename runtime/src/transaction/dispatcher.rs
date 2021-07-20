@@ -1,14 +1,13 @@
 //! Runtime transaction batch dispatcher.
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
 
-use anyhow::{anyhow, Context as AnyContext, Result};
-use serde::{de::DeserializeOwned, Serialize};
+use anyhow::{Context as AnyContext, Result as AnyResult};
 use thiserror::Error;
 
 use super::{
@@ -16,7 +15,155 @@ use super::{
     tags::Tags,
     types::{TxnBatch, TxnCall, TxnCheckResult, TxnOutput},
 };
-use crate::common::{cbor, crypto::hash::Hash, roothash::Message as RoothashMessage};
+use crate::{
+    common::crypto::hash::Hash,
+    consensus::roothash,
+    types::{CheckTxResult, Error as RuntimeError, TransactionWeight},
+};
+
+/// Runtime transaction dispatcher trait.
+///
+/// It defines the interface used by the runtime call dispatcher
+/// to process transactions.
+pub trait Dispatcher {
+    /// Execute the transactions in the given batch.
+    fn execute_batch(
+        &self,
+        ctx: Context,
+        batch: &TxnBatch,
+    ) -> Result<ExecuteBatchResult, RuntimeError>;
+
+    /// Check the transactions in the given batch for validity.
+    fn check_batch(
+        &self,
+        ctx: Context,
+        batch: &TxnBatch,
+    ) -> Result<Vec<CheckTxResult>, RuntimeError>;
+
+    /// Invoke the finalizer (if any).
+    fn finalize(&self, _new_storage_root: Hash) {
+        // Default implementation does nothing.
+    }
+
+    /// Configure abort batch flag.
+    fn set_abort_batch_flag(&mut self, _abort_batch: Arc<AtomicBool>) {
+        // Default implementation does nothing.
+    }
+
+    /// Process a query.
+    fn query(
+        &self,
+        _ctx: Context,
+        _method: &str,
+        _args: cbor::Value,
+    ) -> Result<cbor::Value, RuntimeError> {
+        // Default implementation returns an error.
+        Err(RuntimeError::new(
+            "rhp/dispatcher",
+            2,
+            "query not supported",
+        ))
+    }
+}
+
+impl<T: Dispatcher + ?Sized> Dispatcher for Box<T> {
+    fn execute_batch(
+        &self,
+        ctx: Context,
+        batch: &TxnBatch,
+    ) -> Result<ExecuteBatchResult, RuntimeError> {
+        T::execute_batch(&*self, ctx, batch)
+    }
+
+    fn check_batch(
+        &self,
+        ctx: Context,
+        batch: &TxnBatch,
+    ) -> Result<Vec<CheckTxResult>, RuntimeError> {
+        T::check_batch(&*self, ctx, batch)
+    }
+
+    fn finalize(&self, new_storage_root: Hash) {
+        T::finalize(&*self, new_storage_root)
+    }
+
+    fn set_abort_batch_flag(&mut self, abort_batch: Arc<AtomicBool>) {
+        T::set_abort_batch_flag(&mut *self, abort_batch)
+    }
+
+    fn query(
+        &self,
+        ctx: Context,
+        method: &str,
+        args: cbor::Value,
+    ) -> Result<cbor::Value, RuntimeError> {
+        T::query(&*self, ctx, method, args)
+    }
+}
+
+/// Result of processing an ExecuteTx.
+pub struct ExecuteTxResult {
+    /// Transaction output.
+    pub output: Vec<u8>,
+    /// Emitted tags.
+    pub tags: Tags,
+}
+
+/// Result of processing a batch of ExecuteTx.
+pub struct ExecuteBatchResult {
+    /// Per-transaction execution results.
+    pub results: Vec<ExecuteTxResult>,
+    /// Emitted runtime messages.
+    pub messages: Vec<roothash::Message>,
+    /// Block emitted tags (not emitted by a specific transaction).
+    pub block_tags: Tags,
+    /// Batch weight limits valid for next round. This is used as a fast-path,
+    /// to avoid having the transaction scheduler query these on every round.
+    pub batch_weight_limits: Option<BTreeMap<TransactionWeight, u64>>,
+}
+
+/// No-op dispatcher.
+///
+/// This is mainly used by the runtime dispatcher as a fallback in case
+/// the runtime's initializer doesn't produce its own dispatcher object.
+pub struct NoopDispatcher {}
+
+impl NoopDispatcher {
+    pub fn new() -> NoopDispatcher {
+        NoopDispatcher {}
+    }
+}
+
+impl Dispatcher for NoopDispatcher {
+    fn execute_batch(
+        &self,
+        _ctx: Context,
+        _batch: &TxnBatch,
+    ) -> Result<ExecuteBatchResult, RuntimeError> {
+        Ok(ExecuteBatchResult {
+            results: Vec::new(),
+            messages: Vec::new(),
+            block_tags: Tags::new(),
+            batch_weight_limits: None,
+        })
+    }
+
+    fn check_batch(
+        &self,
+        _ctx: Context,
+        _batch: &TxnBatch,
+    ) -> Result<Vec<CheckTxResult>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    fn finalize(&self, _new_storage_root: Hash) {
+        // Nothing to do here.
+    }
+
+    fn set_abort_batch_flag(&mut self, _abort_batch: Arc<AtomicBool>) {
+        // Nothing to abort.
+    }
+}
 
 /// Dispatch error.
 #[derive(Error, Debug)]
@@ -28,12 +175,14 @@ enum DispatchError {
 /// Error indicating that performing a transaction check was successful.
 #[derive(Error, Debug, Default)]
 #[error("transaction check successful")]
+#[deprecated(note = "see oasis-core#3572")]
 pub struct CheckOnlySuccess(pub TxnCheckResult);
 
 /// Custom batch handler.
 ///
 /// A custom batch handler can be configured on the `Dispatcher` and will have
 /// its `start_batch` and `end_batch` methods called at the appropriate times.
+#[deprecated(note = "see oasis-core#3572")]
 pub trait BatchHandler {
     /// Called before the first call in a batch is dispatched.
     ///
@@ -46,6 +195,7 @@ pub trait BatchHandler {
 }
 
 /// Custom context initializer.
+#[deprecated(note = "see oasis-core#3572")]
 pub trait ContextInitializer {
     /// Called to initialize the context.
     fn init(&self, ctx: &mut Context);
@@ -61,6 +211,7 @@ where
 }
 
 /// Custom finalizer.
+#[deprecated(note = "see oasis-core#3572")]
 pub trait Finalizer {
     /// Called to finalize transaction.
     ///
@@ -80,6 +231,7 @@ where
 
 /// Descriptor of a runtime API method.
 #[derive(Clone, Debug)]
+#[deprecated(note = "see oasis-core#3572")]
 pub struct MethodDescriptor {
     /// Method name.
     pub name: String,
@@ -88,27 +240,28 @@ pub struct MethodDescriptor {
 /// Handler for a runtime method.
 pub trait MethodHandler<Call, Output> {
     /// Invoke the method implementation and return a response.
-    fn handle(&self, call: &Call, ctx: &mut Context) -> Result<Output>;
+    fn handle(&self, call: &Call, ctx: &mut Context) -> AnyResult<Output>;
 }
 
 impl<Call, Output, F> MethodHandler<Call, Output> for F
 where
     Call: 'static,
     Output: 'static,
-    F: Fn(&Call, &mut Context) -> Result<Output> + 'static,
+    F: Fn(&Call, &mut Context) -> AnyResult<Output> + 'static,
 {
-    fn handle(&self, call: &Call, ctx: &mut Context) -> Result<Output> {
+    fn handle(&self, call: &Call, ctx: &mut Context) -> AnyResult<Output> {
         (*self)(&call, ctx)
     }
 }
 
 /// Dispatcher for a runtime method.
+#[deprecated(note = "see oasis-core#3572")]
 pub trait MethodHandlerDispatch {
     /// Get method descriptor.
     fn get_descriptor(&self) -> &MethodDescriptor;
 
     /// Dispatches the given raw call.
-    fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> Result<cbor::Value>;
+    fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> AnyResult<cbor::Value>;
 }
 
 struct MethodHandlerDispatchImpl<Call, Output> {
@@ -120,14 +273,14 @@ struct MethodHandlerDispatchImpl<Call, Output> {
 
 impl<Call, Output> MethodHandlerDispatch for MethodHandlerDispatchImpl<Call, Output>
 where
-    Call: DeserializeOwned + 'static,
-    Output: Serialize + 'static,
+    Call: cbor::Decode + 'static,
+    Output: cbor::Encode + 'static,
 {
     fn get_descriptor(&self) -> &MethodDescriptor {
         &self.descriptor
     }
 
-    fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> Result<cbor::Value> {
+    fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> AnyResult<cbor::Value> {
         let call = cbor::from_value(call.args).context("unable to parse call arguments")?;
         let response = self.handler.handle(&call, ctx)?;
 
@@ -136,6 +289,7 @@ where
 }
 
 /// Runtime method dispatcher implementation.
+#[deprecated(note = "see oasis-core#3572")]
 pub struct Method {
     /// Method dispatcher.
     dispatcher: Box<dyn MethodHandlerDispatch>,
@@ -145,8 +299,8 @@ impl Method {
     /// Create a new enclave method descriptor.
     pub fn new<Call, Output, Handler>(method: MethodDescriptor, handler: Handler) -> Self
     where
-        Call: DeserializeOwned + 'static,
-        Output: Serialize + 'static,
+        Call: cbor::Decode + 'static,
+        Output: cbor::Encode + 'static,
         Handler: MethodHandler<Call, Output> + 'static,
     {
         Method {
@@ -163,57 +317,8 @@ impl Method {
     }
 
     /// Dispatch method call.
-    pub fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> Result<cbor::Value> {
+    pub fn dispatch(&self, call: TxnCall, ctx: &mut Context) -> AnyResult<cbor::Value> {
         self.dispatcher.dispatch(call, ctx)
-    }
-}
-
-/// Runtime transaction dispatcher trait.
-///
-/// It defines the interface used by the runtime call dispatcher
-/// to process transactions.
-pub trait Dispatcher {
-    /// Dispatches a batch of runtime requests.
-    fn dispatch_batch(
-        &self,
-        batch: &TxnBatch,
-        ctx: Context,
-    ) -> Result<(TxnBatch, Vec<Tags>, Vec<RoothashMessage>)>;
-    /// Invoke the finalizer (if any).
-    fn finalize(&self, new_storage_root: Hash);
-    /// Configure abort batch flag.
-    fn set_abort_batch_flag(&mut self, abort_batch: Arc<AtomicBool>);
-}
-
-/// No-op dispatcher.
-///
-/// This is mainly used by the runtime dispatcher as a fallback in case
-/// the runtime's initializer doesn't produce its own dispatcher object.
-pub struct NoopDispatcher {}
-
-impl NoopDispatcher {
-    pub fn new() -> NoopDispatcher {
-        NoopDispatcher {}
-    }
-}
-
-impl Dispatcher for NoopDispatcher {
-    fn dispatch_batch(
-        &self,
-        _batch: &TxnBatch,
-        ctx: Context,
-    ) -> Result<(TxnBatch, Vec<Tags>, Vec<RoothashMessage>)> {
-        let outputs = TxnBatch::new(Vec::new());
-        let (tags, roothash_messages) = ctx.close();
-        Ok((outputs, tags, roothash_messages))
-    }
-
-    fn finalize(&self, _new_storage_root: Hash) {
-        // Nothing to do here.
-    }
-
-    fn set_abort_batch_flag(&mut self, _abort_batch: Arc<AtomicBool>) {
-        // Nothing to abort.
     }
 }
 
@@ -222,6 +327,7 @@ impl Dispatcher for NoopDispatcher {
 /// The dispatcher is a concrete implementation of the Dispatcher trait.
 /// It holds all registered runtime methods and provides an entry point
 /// for their invocation.
+#[deprecated(note = "see oasis-core#3572")]
 pub struct MethodDispatcher {
     /// Registered runtime methods.
     methods: HashMap<String, Method>,
@@ -276,20 +382,46 @@ impl MethodDispatcher {
         self.finalizer = Some(Box::new(finalizer));
     }
 
-    /// Dispatches a raw runtime invocation request.
-    fn dispatch(&self, call: &Vec<u8>, ctx: &mut Context) -> Vec<u8> {
-        let rsp = match self.dispatch_fallible(call, ctx) {
-            Ok(response) => TxnOutput::Success(response),
-            Err(error) => match error.downcast::<CheckOnlySuccess>() {
-                Ok(check_result) => TxnOutput::Success(cbor::to_value(check_result.0)),
-                Err(error) => TxnOutput::Error(format!("{}", error)),
+    /// Dispatches a raw runtime check request.
+    fn dispatch_check(&self, call: &Vec<u8>, ctx: &mut Context) -> CheckTxResult {
+        match self.dispatch_fallible(call, ctx) {
+            Ok(_response) => CheckTxResult {
+                error: Default::default(),
+                // Deprecated method dispatcher doesn't support check tx metadata.
+                meta: None,
             },
-        };
-
-        cbor::to_vec(&rsp)
+            Err(error) => match error.downcast::<CheckOnlySuccess>() {
+                Ok(_check_result) => CheckTxResult {
+                    error: Default::default(),
+                    // Deprecated method dispatcher doesn't support check tx metadata.
+                    meta: None,
+                },
+                Err(error) => CheckTxResult {
+                    error: RuntimeError {
+                        module: "".to_string(),
+                        code: 1,
+                        message: format!("{:#}", error),
+                    },
+                    meta: None,
+                },
+            },
+        }
     }
 
-    fn dispatch_fallible(&self, call: &Vec<u8>, ctx: &mut Context) -> Result<cbor::Value> {
+    /// Dispatches a raw runtime invocation request.
+    fn dispatch_execute(&self, call: &Vec<u8>, ctx: &mut Context) -> ExecuteTxResult {
+        let rsp = match self.dispatch_fallible(call, ctx) {
+            Ok(response) => TxnOutput::Success(response),
+            Err(error) => TxnOutput::Error(format!("{:#}", error)),
+        };
+
+        ExecuteTxResult {
+            output: cbor::to_vec(rsp),
+            tags: ctx.take_tags(),
+        }
+    }
+
+    fn dispatch_fallible(&self, call: &Vec<u8>, ctx: &mut Context) -> AnyResult<cbor::Value> {
         let call: TxnCall = cbor::from_slice(call).context("unable to parse call")?;
 
         match self.methods.get(&call.method) {
@@ -303,11 +435,11 @@ impl MethodDispatcher {
 }
 
 impl Dispatcher for MethodDispatcher {
-    fn dispatch_batch(
+    fn check_batch(
         &self,
-        batch: &TxnBatch,
         mut ctx: Context,
-    ) -> Result<(TxnBatch, Vec<Tags>, Vec<RoothashMessage>)> {
+        batch: &TxnBatch,
+    ) -> Result<Vec<CheckTxResult>, RuntimeError> {
         if let Some(ref ctx_init) = self.ctx_initializer {
             ctx_init.init(&mut ctx);
         }
@@ -318,7 +450,7 @@ impl Dispatcher for MethodDispatcher {
         }
 
         // Process batch.
-        let mut vec = Vec::new();
+        let mut results = Vec::new();
         for call in batch.iter() {
             if self
                 .abort_batch
@@ -326,20 +458,56 @@ impl Dispatcher for MethodDispatcher {
                 .map(|b| b.load(Ordering::SeqCst))
                 .unwrap_or(false)
             {
-                return Err(anyhow!("batch aborted"));
+                return Err(RuntimeError::new("rhp/dispatcher", 1, "batch aborted"));
             }
-            ctx.start_transaction();
-            vec.push(self.dispatch(call, &mut ctx));
+            results.push(self.dispatch_check(call, &mut ctx));
+            let _ = ctx.take_tags();
         }
-        let outputs = TxnBatch::new(vec);
+
+        Ok(results)
+    }
+
+    fn execute_batch(
+        &self,
+        mut ctx: Context,
+        batch: &TxnBatch,
+    ) -> Result<ExecuteBatchResult, RuntimeError> {
+        if let Some(ref ctx_init) = self.ctx_initializer {
+            ctx_init.init(&mut ctx);
+        }
+
+        // Invoke start batch handler.
+        if let Some(ref handler) = self.batch_handler {
+            handler.start_batch(&mut ctx);
+        }
+
+        // Process batch.
+        let mut results = Vec::new();
+        for call in batch.iter() {
+            if self
+                .abort_batch
+                .as_ref()
+                .map(|b| b.load(Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                return Err(RuntimeError::new("rhp/dispatcher", 1, "batch aborted"));
+            }
+            results.push(self.dispatch_execute(call, &mut ctx));
+        }
 
         // Invoke end batch handler.
         if let Some(ref handler) = self.batch_handler {
             handler.end_batch(&mut ctx);
         }
 
-        let (tags, roothash_messages) = ctx.close();
-        Ok((outputs, tags, roothash_messages))
+        Ok(ExecuteBatchResult {
+            results,
+            messages: ctx.close(),
+            // No support for block tags in the deprecated dispatcher.
+            block_tags: Tags::new(),
+            // No support for custom batch weight limits.
+            batch_weight_limits: None,
+        })
     }
 
     fn finalize(&self, new_storage_root: Hash) {
@@ -357,15 +525,17 @@ impl Dispatcher for MethodDispatcher {
 #[cfg(test)]
 mod tests {
     use io_context::Context as IoContext;
-    use serde::{Deserialize, Serialize};
 
-    use crate::common::{cbor, roothash::Header};
+    use crate::{
+        consensus::{roothash::Header, state::ConsensusState},
+        storage::mkvs::{sync::NoopReadSyncer, RootType, Tree},
+    };
 
     use super::*;
 
     const TEST_TIMESTAMP: u64 = 0xcafedeadbeefc0de;
 
-    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Eq, PartialEq, cbor::Encode, cbor::Decode)]
     struct Complex {
         text: String,
         number: u32,
@@ -378,7 +548,7 @@ mod tests {
             MethodDescriptor {
                 name: "dummy".to_owned(),
             },
-            |call: &Complex, ctx: &mut Context| -> Result<Complex> {
+            |call: &Complex, ctx: &mut Context| -> AnyResult<Complex> {
                 assert_eq!(ctx.header.timestamp, TEST_TIMESTAMP);
 
                 Ok(Complex {
@@ -394,6 +564,15 @@ mod tests {
         let mut dispatcher = MethodDispatcher::new();
         register_dummy_method(&mut dispatcher);
 
+        let mkvs = Tree::make()
+            .with_root_type(RootType::State)
+            .new(Box::new(NoopReadSyncer));
+        let consensus_state = ConsensusState::new(mkvs);
+
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
         // Prepare a dummy call.
         let call = TxnCall {
             method: "dummy".to_owned(),
@@ -402,19 +581,29 @@ mod tests {
                 number: 21,
             }),
         };
-        let call_encoded = cbor::to_vec(&call);
+        let call_encoded = cbor::to_vec(call);
 
         let header = Header {
             timestamp: TEST_TIMESTAMP,
             ..Default::default()
         };
-        let mut ctx = Context::new(IoContext::background().freeze(), &header, false);
+        let results = Default::default();
+        let mut ctx = Context::new(
+            IoContext::background().freeze(),
+            &tokio_rt,
+            consensus_state,
+            &header,
+            0,
+            &results,
+            0,
+            false,
+        );
 
         // Call runtime.
-        let result = dispatcher.dispatch(&call_encoded, &mut ctx);
+        let result = dispatcher.dispatch_execute(&call_encoded, &mut ctx);
 
         // Decode result.
-        let result_decoded: TxnOutput = cbor::from_slice(&result).unwrap();
+        let result_decoded: TxnOutput = cbor::from_slice(&result.output).unwrap();
         match result_decoded {
             TxnOutput::Success(value) => {
                 let value: Complex = cbor::from_value(value).unwrap();

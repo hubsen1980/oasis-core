@@ -2,36 +2,28 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"path"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	epoch "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 )
 
-var (
-	// NodeUpgradeCancel is the node upgrade scenario.
-	NodeUpgradeCancel scenario.Scenario = newNodeUpgradeCancelImpl()
+const upgradeHandler = "__e2e-test-upgrade-cancel"
 
-	// Warning: this string contains printf conversions, it's NOT directly usable as a descriptor.
-	descriptorTemplate = `{
-		"name": "__e2e-test-upgrade-cancel",
-		"epoch": 3,
-		"method": "internal",
-		"identifier": "%v"
-	}`
-)
+// NodeUpgradeCancel is the node upgrade scenario.
+var NodeUpgradeCancel scenario.Scenario = newNodeUpgradeCancelImpl()
 
 type nodeUpgradeCancelImpl struct {
 	E2E
 
 	ctx          context.Context
-	currentEpoch epoch.EpochTime
+	currentEpoch beacon.EpochTime
 }
 
 func (sc *nodeUpgradeCancelImpl) nextEpoch() error {
@@ -63,23 +55,27 @@ func (sc *nodeUpgradeCancelImpl) Fixture() (*oasis.NetworkFixture, error) {
 		return nil, err
 	}
 
-	return &oasis.NetworkFixture{
+	ff := &oasis.NetworkFixture{
 		Network: oasis.NetworkCfg{
-			NodeBinary:    f.Network.NodeBinary,
-			EpochtimeMock: true,
+			NodeBinary: f.Network.NodeBinary,
 		},
 		Entities: []oasis.EntityCfg{
 			{IsDebugTestEntity: true},
 			{},
 		},
 		Validators: []oasis.ValidatorFixture{
-			{Entity: 1},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{SupplementarySanityInterval: 1}},
 			{Entity: 1},
 			{Entity: 1},
 			{Entity: 1},
 		},
 		Seeds: []oasis.SeedFixture{{}},
-	}, nil
+	}
+
+	ff.Network.SetMockEpoch()
+	ff.Network.SetInsecureBeacon()
+
+	return ff, nil
 }
 
 func (sc *nodeUpgradeCancelImpl) Run(childEnv *env.Env) error {
@@ -103,17 +99,16 @@ func (sc *nodeUpgradeCancelImpl) Run(childEnv *env.Env) error {
 	// the node should normally shut down when it reaches the epoch.
 	sc.Logger.Info("submitting upgrade descriptor")
 
-	var nodeHash hash.Hash
-	nodeText, err := ioutil.ReadFile(sc.Net.Validators()[0].BinaryPath())
-	if err != nil {
-		return fmt.Errorf("can't read node binary for hashing: %w", err)
-	}
-	nodeHash.FromBytes(nodeText)
-
-	descriptor := fmt.Sprintf(descriptorTemplate, nodeHash.String())
+	descriptor := baseDescriptor
+	descriptor.Handler = upgradeHandler
+	descriptor.Epoch = 3
 
 	filePath := path.Join(sc.Net.BasePath(), "upgrade-descriptor.json")
-	if err = ioutil.WriteFile(filePath, []byte(descriptor), 0o644); err != nil { //nolint: gosec
+	desc, err := json.Marshal(descriptor)
+	if err != nil {
+		return fmt.Errorf("json.Marshal(descriptor): %w", err)
+	}
+	if err = ioutil.WriteFile(filePath, desc, 0o644); err != nil { //nolint: gosec
 		return fmt.Errorf("can't write descriptor to network directory: %w", err)
 	}
 
@@ -138,6 +133,7 @@ func (sc *nodeUpgradeCancelImpl) Run(childEnv *env.Env) error {
 		"--log.level", "debug",
 		"--wait",
 		"--address", "unix:" + val.SocketPath(),
+		filePath,
 	}
 	if err = cli.RunSubCommand(childEnv, sc.Logger, "control-upgrade", sc.Net.Config().NodeBinary, cancelArgs); err != nil {
 		return fmt.Errorf("error canceling upgrade: %w", err)

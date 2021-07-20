@@ -17,8 +17,8 @@ import (
 	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
 )
 
-// MakeDoubleSignEvidence creates consensus evidence of double signing.
-func MakeDoubleSignEvidence(t *testing.T, ident *identity.Identity, blk *consensus.Block) *consensus.Evidence {
+// MakeConsensusEquivocationEvidence creates consensus evidence of equivocation.
+func MakeConsensusEquivocationEvidence(t *testing.T, ident *identity.Identity, blk *consensus.Block) *consensus.Evidence {
 	require := require.New(t)
 
 	// Create empty directory for private validator metadata.
@@ -59,6 +59,9 @@ func MakeDoubleSignEvidence(t *testing.T, ident *identity.Identity, blk *consens
 		},
 	}
 	ev := &tmtypes.DuplicateVoteEvidence{
+		Timestamp:        blk.Time,
+		TotalVotingPower: 1,
+		ValidatorPower:   1,
 		// NOTE: ChainID must match the unit test genesis block.
 		VoteA: makeVote(pv1, genesisTestHelpers.TestChainID, 0, blk.Height, 2, 1, blockID1, blk.Time),
 		VoteB: makeVote(pv2, genesisTestHelpers.TestChainID, 0, blk.Height, 2, 1, blockID2, blk.Time),

@@ -1,7 +1,7 @@
-FROM ubuntu:18.04
+FROM ubuntu:20.04
 
 # Package versions.
-ARG GO_VERSION=1.15.1
+ARG GO_VERSION=1.16.3
 ARG GO_NANCY_VERSION=1.0.0
 ARG GO_NANCY_CHECKSUM=13804837a34c07e7a933b0d6f52c5e580b03ccb209e38fc3d6394b791b414c33
 ARG GO_PROTOC_VERSION=3.6.1
@@ -9,7 +9,9 @@ ARG GO_PROTOC_GEN_GO_VERSION=1.21.0
 ARG GOLANGCILINT_VERSION=1.28.2
 ARG GOCOVMERGE_VERSION=b5bfa59ec0adc420475f97f89b58045c721d761c
 ARG GOFUMPT_VERSION=abc0db2c416aca0f60ea33c23c76665f6e7ba0b6
-ARG RUST_NIGHTLY_VERSION=2020-08-29
+ARG RUST_NIGHTLY_VERSION=2021-05-20
+ARG JEMALLOC_VERSION=5.2.1
+ARG JEMALLOC_CHECKSUM=34330e5ce276099e2e8950d9335db5a875689a4c6a56751ef3b1d8c537f887f6
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -17,17 +19,16 @@ RUN apt-get update -qq && apt-get upgrade -qq && apt-get install -qq \
     build-essential git gdb cmake \
     curl wget unzip \
     pkg-config software-properties-common \
-    python python-pyelftools \
+    python3 python3-pyelftools \
     # for gitlint
-    python-pip \
+    python3-pip \
     # for rust openssl
     libssl-dev libcurl4-openssl-dev \
     # for benchmarks
     python3-prometheus-client \
     # for seccomp Go bindings support
     libseccomp-dev \
-    # for bubblewrap
-    libcap2 && \
+    bubblewrap && \
     apt-get autoclean && apt-get autoremove && rm -rf /var/cache/apt/archives/* && \
     # for linting Git commits
     pip install gitlint
@@ -72,8 +73,17 @@ RUN wget https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz && \
     GO111MODULE=on go get mvdan.cc/gofumpt@${GOFUMPT_VERSION} && \
     GO111MODULE=on go get mvdan.cc/gofumpt/gofumports@${GOFUMPT_VERSION}
 
-# Install bubblewrap (we need version 0.3.3 which is not available for 18.04).
-RUN wget http://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.3.3-2_amd64.deb && \
-    echo '1cf9bdae5cfab75f292fad9ee0ef76a7c55243dbc0515709624b2a9573d19447 bubblewrap_0.3.3-2_amd64.deb' | sha256sum -c && \
-    dpkg -i bubblewrap_0.3.3-2_amd64.deb && \
-    rm bubblewrap_0.3.3-2_amd64.deb
+# Install jemalloc (used by BadgerDB).
+RUN wget -O jemalloc.tar.bz2 \
+    https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2 && \
+    # Ensure checksum matches.
+    echo "${JEMALLOC_CHECKSUM}  jemalloc.tar.bz2" | sha256sum -c && \
+    tar -xf jemalloc.tar.bz2 && \
+    cd jemalloc-${JEMALLOC_VERSION} && \
+    # Ensure reproducible jemalloc build.
+    # https://reproducible-builds.org/docs/build-path/
+    EXTRA_CXXFLAGS=-ffile-prefix-map=$(pwd -L)=. EXTRA_CFLAGS=-ffile-prefix-map=$(pwd -L)=. \
+    ./configure --with-jemalloc-prefix='je_' --with-malloc-conf='background_thread:true,metadata_thp:auto' && \
+    make && \
+    make install && \
+    cd .. && rm jemalloc.tar.bz2 && rm -rf jemalloc-${JEMALLOC_VERSION}

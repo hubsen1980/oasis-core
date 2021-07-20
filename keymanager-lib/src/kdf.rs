@@ -19,16 +19,14 @@ use oasis_core_keymanager_api_common::{
 use oasis_core_keymanager_client::{KeyManagerClient, RemoteClient};
 use oasis_core_runtime::{
     common::{
-        cbor,
         crypto::{
             mrae::deoxysii::{DeoxysII, NONCE_SIZE, TAG_SIZE},
             signature,
         },
-        runtime::RuntimeId,
+        namespace::Namespace,
         sgx::egetkey::egetkey,
     },
     enclave_rpc::Context as RpcContext,
-    executor::Executor,
     runtime_context,
     storage::StorageContext,
     BUILD_INFO,
@@ -86,7 +84,7 @@ struct Inner {
     /// Master secret.
     master_secret: Option<MasterSecret>,
     checksum: Option<Vec<u8>>,
-    runtime_id: Option<RuntimeId>,
+    runtime_id: Option<Namespace>,
     signer: Option<Arc<dyn signature::Signer>>,
     cache: LruCache<Vec<u8>, KeyPair>,
 }
@@ -236,8 +234,7 @@ impl Kdf {
 
                     let result =
                         km_client.replicate_master_secret(IoContext::create_child(&ctx.io_ctx));
-                    let master_secret =
-                        Executor::with_current(|executor| executor.block_on(result))?;
+                    let master_secret = ctx.tokio.block_on(result)?;
                     (master_secret.unwrap(), true)
                 }
             };
@@ -312,7 +309,7 @@ impl Kdf {
             policy_checksum,
         };
 
-        let body = cbor::to_vec(&init_response);
+        let body = cbor::to_vec(init_response.clone());
         let signature = inner
             .signer
             .as_ref()
@@ -379,7 +376,7 @@ impl Kdf {
         }
     }
 
-    fn load_master_secret(runtime_id: &RuntimeId) -> Option<MasterSecret> {
+    fn load_master_secret(runtime_id: &Namespace) -> Option<MasterSecret> {
         let ciphertext = StorageContext::with_current(|_mkvs, untrusted_local| {
             untrusted_local.get(MASTER_SECRET_STORAGE_KEY.to_vec())
         })
@@ -407,7 +404,7 @@ impl Kdf {
         Some(MasterSecret::from(plaintext))
     }
 
-    fn save_master_secret(master_secret: &MasterSecret, runtime_id: &RuntimeId) {
+    fn save_master_secret(master_secret: &MasterSecret, runtime_id: &Namespace) {
         let mut rng = OsRng {};
 
         // Encrypt the master secret.
@@ -428,7 +425,7 @@ impl Kdf {
         .expect("failed to persist master secret");
     }
 
-    fn generate_master_secret(runtime_id: &RuntimeId) -> MasterSecret {
+    fn generate_master_secret(runtime_id: &Namespace) -> MasterSecret {
         let mut rng = OsRng {};
 
         // TODO: Support static keying for debugging.
@@ -441,7 +438,7 @@ impl Kdf {
         master_secret
     }
 
-    fn checksum_master_secret(master_secret: &MasterSecret, runtime_id: &RuntimeId) -> Vec<u8> {
+    fn checksum_master_secret(master_secret: &MasterSecret, runtime_id: &Namespace) -> Vec<u8> {
         let mut k = [0u8; 32];
 
         // KMAC256(master_secret, kmRuntimeID, 32, "ekiden-checksum-master-secret")

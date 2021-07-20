@@ -9,11 +9,10 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/api"
@@ -53,14 +52,25 @@ type test struct {
 	ckNodes  keySet
 }
 
-func fillDB(ctx context.Context, require *require.Assertions, values [][]byte, version uint64, ndb api.NodeDB) node.Root {
-	emptyRoot := node.Root{
-		Namespace: testNs,
-		Version:   version,
+func fillDB(
+	ctx context.Context,
+	require *require.Assertions,
+	values [][]byte,
+	prevRoot *node.Root,
+	version, commitVersion uint64,
+	ndb api.NodeDB,
+) node.Root {
+	if prevRoot == nil {
+		emptyRoot := node.Root{
+			Namespace: testNs,
+			Version:   version,
+			Type:      node.RootTypeState,
+		}
+		emptyRoot.Hash.Empty()
+		prevRoot = &emptyRoot
 	}
-	emptyRoot.Hash.Empty()
 
-	tree := mkvs.NewWithRoot(nil, ndb, emptyRoot)
+	tree := mkvs.NewWithRoot(nil, ndb, *prevRoot)
 	require.NotNil(tree, "NewWithRoot()")
 
 	var wl writelog.WriteLog
@@ -71,12 +81,13 @@ func fillDB(ctx context.Context, require *require.Assertions, values [][]byte, v
 	err := tree.ApplyWriteLog(ctx, writelog.NewStaticIterator(wl))
 	require.NoError(err, "ApplyWriteLog()")
 
-	_, hash, err := tree.Commit(ctx, testNs, 2)
+	_, hash, err := tree.Commit(ctx, testNs, commitVersion)
 	require.NoError(err, "Commit()")
 
 	return node.Root{
 		Namespace: testNs,
 		Version:   version + 1,
+		Type:      node.RootTypeState,
 		Hash:      hash,
 	}
 }
@@ -89,7 +100,7 @@ func createCheckpoint(ctx context.Context, require *require.Assertions, dir stri
 	fc, err := checkpoint.NewFileCreator(dir, ndb)
 	require.NoError(err, "NewFileCreator()")
 
-	ckRoot := fillDB(ctx, require, values, version, ndb)
+	ckRoot := fillDB(ctx, require, values, nil, version, 2, ndb)
 	ckMeta, err := fc.CreateCheckpoint(ctx, ckRoot, 1024*1024)
 	require.NoError(err, "CreateCheckpoint()")
 
@@ -152,6 +163,8 @@ func restoreCheckpoint(ctx *test, ckMeta *checkpoint.Metadata, ckNodes keySet) c
 	restorer, err := checkpoint.NewRestorer(ctx.badgerdb)
 	ctx.require.NoError(err, "NewRestorer()")
 
+	err = ctx.badgerdb.StartMultipartInsert(ckMeta.Root.Version)
+	ctx.require.NoError(err, "StartMultipartInsert()")
 	err = restorer.StartRestore(ctx.ctx, ckMeta)
 	ctx.require.NoError(err, "StartRestore()")
 	for i := range ckMeta.Chunks {
@@ -219,6 +232,8 @@ func testAbort(ctx *test) {
 	restorer := restoreCheckpoint(ctx, ctx.ckMeta, ctx.ckNodes)
 	err := restorer.AbortRestore(ctx.ctx)
 	ctx.require.NoError(err, "AbortRestore()")
+	err = ctx.badgerdb.AbortMultipartInsert()
+	ctx.require.NoError(err, "AbortMultipartInsert()")
 
 	verifyNodes(ctx.require, ctx.badgerdb, keySet{})
 	checkNoLogKeys(ctx.require, ctx.badgerdb)
@@ -229,7 +244,17 @@ func testFinalize(ctx *test) {
 	// This time, all the restored nodes should be present, but the
 	// log keys should be gone.
 	restoreCheckpoint(ctx, ctx.ckMeta, ctx.ckNodes)
-	err := ctx.badgerdb.Finalize(ctx.ctx, ctx.ckMeta.Root.Version, []hash.Hash{ctx.ckMeta.Root.Hash})
+
+	// Test parameter sanity checking first.
+	err := ctx.badgerdb.Finalize(ctx.ctx, nil)
+	ctx.require.Error(err, "Finalize with no roots should fail")
+
+	bogusRoot := ctx.ckMeta.Root
+	bogusRoot.Version++
+	err = ctx.badgerdb.Finalize(ctx.ctx, []node.Root{ctx.ckMeta.Root, bogusRoot})
+	ctx.require.Error(err, "Finalize with roots from different versions should fail")
+
+	err = ctx.badgerdb.Finalize(ctx.ctx, []node.Root{ctx.ckMeta.Root})
 	ctx.require.NoError(err, "Finalize()")
 
 	verifyNodes(ctx.require, ctx.badgerdb, ctx.ckNodes)
@@ -256,7 +281,7 @@ func testExistingNodes(ctx *test) {
 
 	// Restore first checkpoint. The database is empty.
 	restoreCheckpoint(ctx, ctx.ckMeta, ctx.ckNodes)
-	err := ctx.badgerdb.Finalize(ctx.ctx, ctx.ckMeta.Root.Version, []hash.Hash{ctx.ckMeta.Root.Hash})
+	err := ctx.badgerdb.Finalize(ctx.ctx, []node.Root{ctx.ckMeta.Root})
 	ctx.require.NoError(err, "Finalize()")
 	verifyNodes(ctx.require, ctx.badgerdb, ctx.ckNodes)
 
@@ -265,6 +290,8 @@ func testExistingNodes(ctx *test) {
 	restorer := restoreCheckpoint(ctx, ckMeta2, ckNodes2)
 	err = restorer.AbortRestore(ctx.ctx)
 	ctx.require.NoError(err, "AbortRestore()")
+	err = ctx.badgerdb.AbortMultipartInsert()
+	ctx.require.NoError(err, "AbortMultipartInsert()")
 	verifyNodes(ctx.require, ctx.badgerdb, ctx.ckNodes)
 }
 
@@ -324,4 +351,32 @@ func TestReadOnlyBatch(t *testing.T) {
 
 	_, err = badgerdb.NewBatch(node.Root{}, 13, false)
 	require.Error(err, "NewBatch()")
+}
+
+func TestFinalizeBasic(t *testing.T) {
+	ctx := context.Background()
+	require := require.New(t)
+
+	offset := func(vals [][]byte) [][]byte {
+		ret := make([][]byte, 0, len(vals))
+		for _, val := range vals {
+			ret = append(ret, append(val, 0x0a))
+		}
+		return ret
+	}
+
+	ndb, err := New(dbCfg)
+	require.NoError(err, "New()")
+	defer ndb.Close()
+
+	root1 := fillDB(ctx, require, testValues, nil, 1, 2, ndb)
+	err = ndb.Finalize(ctx, []node.Root{root1})
+	require.NoError(err, "Finalize({root1})")
+
+	// Finalize a corrupted root.
+	currentValues := offset(testValues)
+	root2 := fillDB(ctx, require, currentValues, &root1, 2, 3, ndb)
+	root2.Hash[3]++
+	err = ndb.Finalize(ctx, []node.Root{root2})
+	require.Errorf(err, "mkvs: root not found", "Finalize({root2-broken})")
 }

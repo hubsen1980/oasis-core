@@ -4,7 +4,11 @@ use std::{any::Any, sync::Arc};
 use io_context::Context as IoContext;
 
 use super::tags::{Tag, Tags};
-use crate::common::roothash::{Header, Message};
+use crate::consensus::{
+    beacon::EpochTime,
+    roothash::{Header, Message, RoundResults},
+    state::ConsensusState,
+};
 
 struct NoRuntimeContext;
 
@@ -12,8 +16,18 @@ struct NoRuntimeContext;
 pub struct Context<'a> {
     /// I/O context.
     pub io_ctx: Arc<IoContext>,
+    /// Tokio runtime.
+    pub tokio: &'a tokio::runtime::Runtime,
+    /// Consensus state tree.
+    pub consensus_state: ConsensusState,
     /// The block header accompanying this transaction.
     pub header: &'a Header,
+    /// Epoch corresponding to the currently processed block.
+    pub epoch: EpochTime,
+    /// Results of processing the previous successful round.
+    pub round_results: &'a RoundResults,
+    /// The maximum number of messages that can be emitted in this round.
+    pub max_messages: u32,
     /// Runtime-specific context.
     pub runtime: Box<dyn Any>,
 
@@ -22,33 +36,47 @@ pub struct Context<'a> {
     pub check_only: bool,
 
     /// List of emitted tags for each transaction.
-    tags: Vec<Tags>,
+    tags: Tags,
 
-    /// List of messages emitted.
+    /// List of emitted messages.
     messages: Vec<Message>,
 }
 
 impl<'a> Context<'a> {
     /// Construct new transaction context.
-    pub fn new(io_ctx: Arc<IoContext>, header: &'a Header, check_only: bool) -> Self {
+    pub fn new(
+        io_ctx: Arc<IoContext>,
+        tokio: &'a tokio::runtime::Runtime,
+        consensus_state: ConsensusState,
+        header: &'a Header,
+        epoch: EpochTime,
+        round_results: &'a RoundResults,
+        max_messages: u32,
+        check_only: bool,
+    ) -> Self {
         Self {
             io_ctx,
+            tokio,
+            consensus_state,
             header,
+            epoch,
+            round_results,
+            max_messages,
             runtime: Box::new(NoRuntimeContext),
             check_only,
-            tags: Vec::new(),
+            tags: Tags::new(),
             messages: Vec::new(),
         }
     }
 
-    /// Start a new transaction.
-    pub fn start_transaction(&mut self) {
-        self.tags.push(Tags::new());
+    /// Close the context and return the sent roothash messages.
+    pub fn close(self) -> Vec<Message> {
+        self.messages
     }
 
-    /// Close the context and return the emitted tags and sent roothash messages.
-    pub fn close(self) -> (Vec<Tags>, Vec<Message>) {
-        (self.tags, self.messages)
+    /// Takes the tags accumulated so far and replaces them with an empty set.
+    pub fn take_tags(&mut self) -> Tags {
+        std::mem::take(&mut self.tags)
     }
 
     /// Emit a runtime-specific indexable tag refering to the specific
@@ -56,30 +84,21 @@ impl<'a> Context<'a> {
     ///
     /// If multiple tags with the same key are emitted for a transaction, only
     /// the last one will be indexed.
-    ///
-    /// # Panics
-    ///
-    /// Calling this method outside of a transaction will panic.
-    ///
     pub fn emit_txn_tag<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        assert!(
-            !self.tags.is_empty(),
-            "must only be called inside a transaction"
-        );
-
         self.tags
-            .last_mut()
-            .expect("tags is not empty")
             .push(Tag::new(key.as_ref().to_vec(), value.as_ref().to_vec()))
     }
 
-    /// Send a roothash message as part of the block that contains this transaction.
-    /// See RFC 0065 for information on roothash messages.
-    pub fn send_roothash_message(&mut self, message: Message) {
+    /// Emit a message as part of the current round.
+    ///
+    /// Returns the index of the emitted message which is needed to check for the result of the
+    /// emitted message in the next round.
+    pub fn emit_message(&mut self, message: Message) -> u32 {
         self.messages.push(message);
+        self.messages.len() as u32 - 1
     }
 }

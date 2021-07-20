@@ -38,9 +38,14 @@ func (s *genesisFileImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	// A single validator is enough for this scenario.
+	//
+	// WARNING: Once the insecure backend goes away, it will no longer
+	// be possible to run this configuration as the PVSS backend
+	// currently requires multiple validators.
 	f.Validators = []oasis.ValidatorFixture{
-		{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
+		{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true, SupplementarySanityInterval: 1}},
 	}
+	f.Network.SetInsecureBeacon()
 
 	return f, nil
 }
@@ -49,7 +54,7 @@ func (s *genesisFileImpl) Run(childEnv *env.Env) error {
 	// Manually provision genesis file.
 	s.Logger.Info("manually provisioning genesis file before starting the network")
 	if err := s.Net.MakeGenesis(); err != nil {
-		return fmt.Errorf("e2e/genesis-file: failed to create genesis file")
+		return fmt.Errorf("e2e/genesis-file: failed to create genesis file: %w", err)
 	}
 	// Set this genesis file in network's configuration.
 	cfg := s.Net.Config()
@@ -93,7 +98,7 @@ func (s *genesisFileImpl) Run(childEnv *env.Env) error {
 		return fmt.Errorf("e2e/genesis-file: creating uncanonical genesis file failed: %w", err)
 	}
 	err = s.runGenesisCheckCmd(childEnv, uncanonicalPath)
-	expectedError := "genesis document is not marshalled in the canonical form"
+	expectedError := "genesis file is not in canonical form, see the diff on stderr"
 	switch {
 	case err == nil:
 		return fmt.Errorf("e2e/genesis-file: running genesis check for an uncanonical genesis file should fail")

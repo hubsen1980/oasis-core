@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
@@ -24,13 +25,14 @@ import (
 	tendermintCommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
 	tendermintFull "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/full"
 	consensusTests "github.com/oasisprotocol/oasis-core/go/consensus/tests"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
+	governanceTests "github.com/oasisprotocol/oasis-core/go/governance/tests"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdCommonFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/node"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	registryTests "github.com/oasisprotocol/oasis-core/go/registry/tests"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	roothashTests "github.com/oasisprotocol/oasis-core/go/roothash/tests"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	clientTests "github.com/oasisprotocol/oasis-core/go/runtime/client/tests"
@@ -45,7 +47,6 @@ import (
 	storageTests "github.com/oasisprotocol/oasis-core/go/storage/tests"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
 	"github.com/oasisprotocol/oasis-core/go/worker/compute"
-	"github.com/oasisprotocol/oasis-core/go/worker/compute/executor"
 	executorCommittee "github.com/oasisprotocol/oasis-core/go/worker/compute/executor/committee"
 	executorWorkerTests "github.com/oasisprotocol/oasis-core/go/worker/compute/executor/tests"
 	storageWorker "github.com/oasisprotocol/oasis-core/go/worker/storage"
@@ -69,10 +70,10 @@ var (
 		{cmdCommonFlags.CfgDebugDontBlameOasis, true},
 		{storageWorker.CfgBackend, "badger"},
 		{compute.CfgWorkerEnabled, true},
-		{workerCommon.CfgRuntimeProvisioner, workerCommon.RuntimeProvisionerMock},
+		{runtimeRegistry.CfgRuntimeProvisioner, runtimeRegistry.RuntimeProvisionerMock},
 		{workerCommon.CfgClientPort, workerClientPort},
 		{storageWorker.CfgWorkerEnabled, true},
-		{executor.CfgScheduleCheckTxEnabled, false},
+		{storageWorker.CfgWorkerPublicRPCEnabled, true},
 		{tendermintCommon.CfgCoreListenAddress, "tcp://0.0.0.0:27565"},
 		{tendermintFull.CfgSupplementarySanityEnabled, true},
 		{tendermintFull.CfgSupplementarySanityInterval, 1},
@@ -105,6 +106,23 @@ var (
 		AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 			AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 		},
+		Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+			scheduler.KindComputeExecutor: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+				},
+			},
+			scheduler.KindStorage: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+				},
+			},
+		},
+		GovernanceModel: registry.GovernanceEntity,
 	}
 
 	testRuntimeID common.Namespace
@@ -159,7 +177,7 @@ func newTestNode(t *testing.T) *testNode {
 	viper.Set("log.file", filepath.Join(dataDir, "test-node.log"))
 	viper.Set(runtimeRegistry.CfgSupported, testRuntimeID.String())
 	viper.Set(runtimeRegistry.CfgTagIndexerBackend, "bleve")
-	viper.Set(workerCommon.CfgRuntimePaths, map[string]string{
+	viper.Set(runtimeRegistry.CfgRuntimePaths, map[string]string{
 		testRuntimeID.String(): "mock-runtime",
 	})
 	viper.Set("worker.registration.entity", filepath.Join(dataDir, "entity.json"))
@@ -231,6 +249,10 @@ func TestNode(t *testing.T) {
 		// Runtime client tests also need a functional runtime.
 		{"RuntimeClient", testRuntimeClient},
 
+		// Governance requires a registered node that is a validator and was
+		// not slashed.
+		{"Governance", testGovernance},
+
 		// Staking requires a registered node that is a validator.
 		{"Staking", testStaking},
 		{"StakingClient", testStakingClient},
@@ -244,7 +266,6 @@ func TestNode(t *testing.T) {
 
 		{"Consensus", testConsensus},
 		{"ConsensusClient", testConsensusClient},
-		{"EpochTime", testEpochTime},
 		{"Beacon", testBeacon},
 		{"Storage", testStorage},
 		{"Registry", testRegistry},
@@ -281,9 +302,7 @@ func testRegisterEntityRuntime(t *testing.T, node *testNode) {
 	require.NoError(err, "register test entity")
 
 	// Register the test runtime.
-	signedRt, err := registry.SignRuntime(testEntitySigner, registry.RegisterRuntimeSignatureContext, testRuntime)
-	require.NoError(err, "sign runtime descriptor")
-	tx = registry.NewRegisterRuntimeTx(0, nil, signedRt)
+	tx = registry.NewRegisterRuntimeTx(0, nil, testRuntime)
 	err = consensusAPI.SignAndSubmitTx(context.Background(), node.Consensus, testEntitySigner, tx)
 	require.NoError(err, "register test entity")
 
@@ -306,9 +325,9 @@ func testDeregisterEntityRuntime(t *testing.T, node *testNode) {
 
 	// Perform an epoch transition to expire the node as otherwise there is no way
 	// to deregister the entity.
-	require.Implements(t, (*epochtime.SetableBackend)(nil), node.Consensus.EpochTime(), "epoch time backend is mock")
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
-	_ = epochtimeTests.MustAdvanceEpoch(t, timeSource, 2+1+1) // 2 epochs for expiry, 1 for debonding, 1 for removal.
+	require.Implements(t, (*beacon.SetableBackend)(nil), node.Consensus.Beacon(), "epoch time backend is mock")
+	timeSource := (node.Consensus.Beacon()).(beacon.SetableBackend)
+	_ = beaconTests.MustAdvanceEpoch(t, timeSource, 2+1+1) // 2 epochs for expiry, 1 for debonding, 1 for removal.
 
 WaitLoop:
 	for {
@@ -366,14 +385,11 @@ func testConsensusClient(t *testing.T, node *testNode) {
 	consensusTests.ConsensusImplementationTests(t, client)
 }
 
-func testEpochTime(t *testing.T, node *testNode) {
-	epochtimeTests.EpochtimeSetableImplementationTest(t, node.Consensus.EpochTime())
-}
-
 func testBeacon(t *testing.T, node *testNode) {
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
+	beaconTests.EpochtimeSetableImplementationTest(t, node.Consensus.Beacon())
 
-	beaconTests.BeaconImplementationTests(t, node.Consensus.Beacon(), timeSource)
+	timeSource := (node.Consensus.Beacon()).(beacon.SetableBackend)
+	beaconTests.BeaconImplementationTests(t, timeSource)
 }
 
 func testStorage(t *testing.T, node *testNode) {
@@ -423,11 +439,43 @@ func testStakingClient(t *testing.T, node *testNode) {
 }
 
 func testRootHash(t *testing.T, node *testNode) {
-	roothashTests.RootHashImplementationTests(t, node.Consensus.RootHash(), node.Consensus, node.Identity)
+	// Directly.
+	t.Run("Direct", func(t *testing.T) {
+		roothashTests.RootHashImplementationTests(t, node.Consensus.RootHash(), node.Consensus, node.Identity)
+	})
+
+	// Over gRPC.
+	t.Run("OverGrpc", func(t *testing.T) {
+		// Create a client backend connected to the local node's internal socket.
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+		require.NoError(t, err, "Dial")
+		defer conn.Close()
+
+		client := roothash.NewRootHashClient(conn)
+		roothashTests.RootHashImplementationTests(t, client, node.Consensus, node.Identity)
+	})
+}
+
+func testGovernance(t *testing.T, node *testNode) {
+	// Directly.
+	t.Run("Direct", func(t *testing.T) {
+		governanceTests.GovernanceImplementationTests(t, node.Consensus.Governance(), node.Consensus, node.entity, node.entitySigner)
+	})
+
+	// Over gRPC.
+	t.Run("OverGrpc", func(t *testing.T) {
+		// Create a client backend connected to the local node's internal socket.
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+		require.NoError(t, err, "Dial")
+		defer conn.Close()
+
+		client := governance.NewGovernanceClient(conn)
+		governanceTests.GovernanceImplementationTests(t, client, node.Consensus, node.entity, node.entitySigner)
+	})
 }
 
 func testExecutorWorker(t *testing.T, node *testNode) {
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
+	timeSource := (node.Consensus.Beacon()).(beacon.SetableBackend)
 
 	require.NotNil(t, node.executorCommitteeNode)
 	executorWorkerTests.WorkerImplementationTests(
@@ -471,15 +519,18 @@ func testStorageClientWithNode(t *testing.T, node *testNode) {
 	require.NoError(t, err, "GetRuntime")
 	localBackend := rt.Storage().(storageAPI.LocalBackend)
 
-	client, err := storageClient.NewStatic(ctx, testRuntimeID, node.Identity, node.Consensus.Registry(), node.Identity.NodeSigner.Public())
+	client, err := storageClient.NewStatic(ctx, node.Identity, node.Consensus, node.Identity.NodeSigner.Public())
 	require.NoError(t, err, "NewStatic")
 
 	// Determine the current round. This is required so that we can commit into
-	// storage at the next (non-finalized) round.
-	blk, err := node.Consensus.RootHash().GetLatestBlock(ctx, testRuntimeID, consensusAPI.HeightLatest)
+	// storage at some higher (non-finalized) round.
+	blk, err := node.Consensus.RootHash().GetLatestBlock(ctx, &roothash.RuntimeRequest{
+		RuntimeID: testRuntimeID,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(t, err, "GetLatestBlock")
 
-	storageTests.StorageImplementationTests(t, localBackend, client, testRuntimeID, blk.Header.Round+1)
+	storageTests.StorageImplementationTests(t, localBackend, client, testRuntimeID, blk.Header.Round+1000)
 }
 
 func testStorageClientWithoutNode(t *testing.T, node *testNode) {

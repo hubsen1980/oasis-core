@@ -2,7 +2,6 @@
 package staking
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
@@ -84,6 +83,15 @@ func (sc *serviceClient) LastBlockFees(ctx context.Context, height int64) (*quan
 	return q.LastBlockFees(ctx)
 }
 
+func (sc *serviceClient) GovernanceDeposits(ctx context.Context, height int64) (*quantity.Quantity, error) {
+	q, err := sc.querier.QueryAt(ctx, height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.GovernanceDeposits(ctx)
+}
+
 func (sc *serviceClient) Threshold(ctx context.Context, query *api.ThresholdQuery) (*quantity.Quantity, error) {
 	q, err := sc.querier.QueryAt(ctx, query.Height)
 	if err != nil {
@@ -111,22 +119,58 @@ func (sc *serviceClient) Account(ctx context.Context, query *api.OwnerQuery) (*a
 	return q.Account(ctx, query.Owner)
 }
 
-func (sc *serviceClient) Delegations(ctx context.Context, query *api.OwnerQuery) (map[api.Address]*api.Delegation, error) {
+func (sc *serviceClient) DelegationsFor(ctx context.Context, query *api.OwnerQuery) (map[api.Address]*api.Delegation, error) {
 	q, err := sc.querier.QueryAt(ctx, query.Height)
 	if err != nil {
 		return nil, err
 	}
 
-	return q.Delegations(ctx, query.Owner)
+	return q.DelegationsFor(ctx, query.Owner)
 }
 
-func (sc *serviceClient) DebondingDelegations(ctx context.Context, query *api.OwnerQuery) (map[api.Address][]*api.DebondingDelegation, error) {
+func (sc *serviceClient) DelegationInfosFor(ctx context.Context, query *api.OwnerQuery) (map[api.Address]*api.DelegationInfo, error) {
 	q, err := sc.querier.QueryAt(ctx, query.Height)
 	if err != nil {
 		return nil, err
 	}
 
-	return q.DebondingDelegations(ctx, query.Owner)
+	return q.DelegationInfosFor(ctx, query.Owner)
+}
+
+func (sc *serviceClient) DelegationsTo(ctx context.Context, query *api.OwnerQuery) (map[api.Address]*api.Delegation, error) {
+	q, err := sc.querier.QueryAt(ctx, query.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.DelegationsTo(ctx, query.Owner)
+}
+
+func (sc *serviceClient) DebondingDelegationsFor(ctx context.Context, query *api.OwnerQuery) (map[api.Address][]*api.DebondingDelegation, error) {
+	q, err := sc.querier.QueryAt(ctx, query.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.DebondingDelegationsFor(ctx, query.Owner)
+}
+
+func (sc *serviceClient) DebondingDelegationInfosFor(ctx context.Context, query *api.OwnerQuery) (map[api.Address][]*api.DebondingDelegationInfo, error) {
+	q, err := sc.querier.QueryAt(ctx, query.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.DebondingDelegationInfosFor(ctx, query.Owner)
+}
+
+func (sc *serviceClient) DebondingDelegationsTo(ctx context.Context, query *api.OwnerQuery) (map[api.Address][]*api.DebondingDelegation, error) {
+	q, err := sc.querier.QueryAt(ctx, query.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.DebondingDelegationsTo(ctx, query.Owner)
 }
 
 func (sc *serviceClient) Allowance(ctx context.Context, query *api.AllowanceQuery) (*quantity.Quantity, error) {
@@ -284,7 +328,7 @@ func EventsFromTendermint(
 			val := pair.GetValue()
 
 			switch {
-			case bytes.Equal(key, app.KeyTakeEscrow):
+			case tmapi.IsAttributeKind(key, &api.TakeEscrowEvent{}):
 				// Take escrow event.
 				var e api.TakeEscrowEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {
@@ -294,7 +338,7 @@ func EventsFromTendermint(
 
 				evt := &api.Event{Height: height, TxHash: txHash, Escrow: &api.EscrowEvent{Take: &e}}
 				events = append(events, evt)
-			case bytes.Equal(key, app.KeyTransfer):
+			case tmapi.IsAttributeKind(key, &api.TransferEvent{}):
 				// Transfer event.
 				var e api.TransferEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {
@@ -304,7 +348,7 @@ func EventsFromTendermint(
 
 				evt := &api.Event{Height: height, TxHash: txHash, Transfer: &e}
 				events = append(events, evt)
-			case bytes.Equal(key, app.KeyReclaimEscrow):
+			case tmapi.IsAttributeKind(key, &api.ReclaimEscrowEvent{}):
 				// Reclaim escrow event.
 				var e api.ReclaimEscrowEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {
@@ -314,7 +358,7 @@ func EventsFromTendermint(
 
 				evt := &api.Event{Height: height, TxHash: txHash, Escrow: &api.EscrowEvent{Reclaim: &e}}
 				events = append(events, evt)
-			case bytes.Equal(key, app.KeyAddEscrow):
+			case tmapi.IsAttributeKind(key, &api.AddEscrowEvent{}):
 				// Add escrow event.
 				var e api.AddEscrowEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {
@@ -324,7 +368,17 @@ func EventsFromTendermint(
 
 				evt := &api.Event{Height: height, TxHash: txHash, Escrow: &api.EscrowEvent{Add: &e}}
 				events = append(events, evt)
-			case bytes.Equal(key, app.KeyBurn):
+			case tmapi.IsAttributeKind(key, &api.DebondingStartEscrowEvent{}):
+				// Debonding start escrow event.
+				var e api.DebondingStartEscrowEvent
+				if err := cbor.Unmarshal(val, &e); err != nil {
+					errs = multierror.Append(errs, fmt.Errorf("staking: corrupt DebondingStart escrow event: %w", err))
+					continue
+				}
+
+				evt := &api.Event{Height: height, TxHash: txHash, Escrow: &api.EscrowEvent{DebondingStart: &e}}
+				events = append(events, evt)
+			case tmapi.IsAttributeKind(key, &api.BurnEvent{}):
 				// Burn event.
 				var e api.BurnEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {
@@ -334,7 +388,7 @@ func EventsFromTendermint(
 
 				evt := &api.Event{Height: height, TxHash: txHash, Burn: &e}
 				events = append(events, evt)
-			case bytes.Equal(key, app.KeyAllowanceChange):
+			case tmapi.IsAttributeKind(key, &api.AllowanceChangeEvent{}):
 				// Allowance change event.
 				var e api.AllowanceChangeEvent
 				if err := cbor.Unmarshal(val, &e); err != nil {

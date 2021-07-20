@@ -27,7 +27,7 @@ type treeOverlay struct {
 func NewOverlay(inner Tree) OverlayTree {
 	return &treeOverlay{
 		inner:   inner,
-		overlay: New(nil, nil, WithoutWriteLog()),
+		overlay: New(nil, nil, inner.RootType(), WithoutWriteLog()),
 		dirty:   make(map[string]bool),
 	}
 }
@@ -111,6 +111,7 @@ func (o *treeOverlay) Commit(ctx context.Context) error {
 			return err
 		}
 	}
+	o.dirty = make(map[string]bool)
 
 	return nil
 }
@@ -169,7 +170,7 @@ func (it *treeOverlayIterator) Seek(key node.Key) {
 }
 
 func (it *treeOverlayIterator) Next() {
-	if !it.overlay.Valid() || it.inner.Key().Compare(it.overlay.Key()) <= 0 {
+	if !it.overlay.Valid() || (it.inner.Valid() && it.inner.Key().Compare(it.overlay.Key()) <= 0) {
 		// Key of inner iterator is smaller or equal than the key of the overlay iterator.
 		it.inner.Next()
 	} else {

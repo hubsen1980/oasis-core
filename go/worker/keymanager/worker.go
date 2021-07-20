@@ -11,6 +11,7 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/accessctl"
+	cmnBackoff "github.com/oasisprotocol/oasis-core/go/common/backoff"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/grpc/policy"
@@ -23,9 +24,9 @@ import (
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	runtimeCommittee "github.com/oasisprotocol/oasis-core/go/runtime/committee"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
+	"github.com/oasisprotocol/oasis-core/go/runtime/nodes"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
 	committeeCommon "github.com/oasisprotocol/oasis-core/go/worker/common/committee"
@@ -50,7 +51,7 @@ var (
 // runtimes in order to update the access control lists.
 type Worker struct { // nolint: maligned
 	sync.RWMutex
-	*workerCommon.RuntimeHostNode
+	*runtimeRegistry.RuntimeHostNode
 
 	logger *logging.Logger
 
@@ -187,7 +188,7 @@ func (w *Worker) updateStatus(status *api.Status, startedEvent *host.StartedEven
 		if !initOk {
 			// If initialization failed setup a retry ticker.
 			if w.initTicker == nil {
-				w.initTicker = backoff.NewTicker(backoff.NewExponentialBackOff())
+				w.initTicker = backoff.NewTicker(cmnBackoff.NewExponentialBackOff())
 				w.initTickerCh = w.initTicker.C
 			}
 		}
@@ -693,6 +694,12 @@ func (crw *clientRuntimeWatcher) HandleNewEventLocked(*roothash.Event) {
 }
 
 // Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleNodeUpdateLocked(update *runtimeCommittee.NodeUpdate, snapshot *committeeCommon.EpochSnapshot) {
+func (crw *clientRuntimeWatcher) HandleNodeUpdateLocked(update *nodes.NodeUpdate, snapshot *committeeCommon.EpochSnapshot) {
 	crw.updateExternalServicePolicyLocked(snapshot)
+}
+
+func (crw *clientRuntimeWatcher) Initialized() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }

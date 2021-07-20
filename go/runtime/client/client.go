@@ -11,6 +11,7 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
@@ -26,7 +27,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/runtime/transaction"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
-	executor "github.com/oasisprotocol/oasis-core/go/worker/compute/executor/api"
 )
 
 const (
@@ -59,9 +59,11 @@ type runtimeClient struct {
 	sync.Mutex
 
 	common *clientCommon
+	quitCh chan struct{}
 
-	watchers  map[common.Namespace]*blockWatcher
-	kmClients map[common.Namespace]*keymanager.Client
+	hosts        map[common.Namespace]*clientHost
+	txSubmitters map[common.Namespace]*txSubmitter
+	kmClients    map[common.Namespace]*keymanager.Client
 
 	maxTransactionAge int64
 
@@ -77,35 +79,47 @@ func (c *runtimeClient) tagIndexer(runtimeID common.Namespace) (tagindexer.Query
 	return rt.TagIndexer(), nil
 }
 
-// Implements api.RuntimeClient.
-func (c *runtimeClient) SubmitTx(ctx context.Context, request *api.SubmitTxRequest) ([]byte, error) {
+func (c *runtimeClient) submitTx(ctx context.Context, request *api.SubmitTxRequest) (<-chan *txResult, error) {
 	if c.common.p2p == nil {
 		return nil, fmt.Errorf("client: cannot submit transaction, p2p disabled")
 	}
 
-	var watcher *blockWatcher
-	var ok bool
-	var err error
-	c.Lock()
-	if watcher, ok = c.watchers[request.RuntimeID]; !ok {
-		watcher, err = newWatcher(c.common, request.RuntimeID, c.common.p2p, c.maxTransactionAge)
+	// Make sure consensus is synced.
+	select {
+	case <-c.common.consensus.Synced():
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		return nil, api.ErrNotSynced
+	}
+
+	// Perform a local transaction check when a hosted runtime is available.
+	if hrt, ok := c.hosts[request.RuntimeID]; ok && hrt.GetHostedRuntime() != nil {
+		err := c.CheckTx(ctx, &api.CheckTxRequest{
+			RuntimeID: request.RuntimeID,
+			Data:      request.Data,
+		})
 		if err != nil {
-			c.Unlock()
 			return nil, err
 		}
-		if err = watcher.Start(); err != nil {
-			c.Unlock()
-			return nil, err
-		}
-		c.watchers[request.RuntimeID] = watcher
+	}
+
+	var submitter *txSubmitter
+	var ok bool
+	c.Lock()
+	if submitter, ok = c.txSubmitters[request.RuntimeID]; !ok {
+		submitter = newTxSubmitter(c.common, request.RuntimeID, c.common.p2p, c.maxTransactionAge)
+		submitter.Start()
+		c.txSubmitters[request.RuntimeID] = submitter
 	}
 	c.Unlock()
 
 	// Send a request for watching a new runtime transaction.
-	respCh := make(chan *watchResult)
-	req := &watchRequest{
+	respCh := make(chan *txResult)
+	req := &txRequest{
 		ctx:    ctx,
 		respCh: respCh,
+		req:    request,
 	}
 	req.id.FromBytes(request.Data)
 	select {
@@ -115,12 +129,22 @@ func (c *runtimeClient) SubmitTx(ctx context.Context, request *api.SubmitTxReque
 	case <-c.common.ctx.Done():
 		// Client is shutting down.
 		return nil, fmt.Errorf("client: shutting down")
-	case watcher.newCh <- req:
+	case submitter.newCh <- req:
 	}
 
-	// Wait for response, handling retries if/when needed.
+	return respCh, nil
+}
+
+// Implements api.RuntimeClient.
+func (c *runtimeClient) SubmitTx(ctx context.Context, request *api.SubmitTxRequest) ([]byte, error) {
+	respCh, err := c.submitTx(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for result.
 	for {
-		var resp *watchResult
+		var resp *txResult
 		var ok bool
 
 		select {
@@ -134,37 +158,67 @@ func (c *runtimeClient) SubmitTx(ctx context.Context, request *api.SubmitTxReque
 			if !ok {
 				return nil, fmt.Errorf("client: block watch channel closed unexpectedly (unknown error)")
 			}
-
-			if resp.err != nil {
-				return nil, resp.err
-			}
-
-			// The main event is getting a response from the watcher, handled below. If there is
-			// no result yet, this means that we need to retry publish.
-			if resp.result == nil {
-				break
-			}
-
-			return resp.result, nil
+			return resp.result, resp.err
 		}
-
-		c.common.p2p.Publish(context.Background(), request.RuntimeID, &p2p.Message{
-			Tx: &executor.Tx{
-				Data: request.Data,
-			},
-			GroupVersion: resp.groupVersion,
-		})
 	}
 }
 
 // Implements api.RuntimeClient.
+func (c *runtimeClient) SubmitTxNoWait(ctx context.Context, request *api.SubmitTxRequest) error {
+	_, err := c.submitTx(ctx, request)
+	return err
+}
+
+// Implements api.RuntimeClient.
+func (c *runtimeClient) CheckTx(ctx context.Context, request *api.CheckTxRequest) error {
+	hrt, ok := c.hosts[request.RuntimeID]
+	if !ok {
+		return api.ErrNoHostedRuntime
+	}
+	rt := hrt.GetHostedRuntime()
+	if rt == nil {
+		return api.ErrNoHostedRuntime
+	}
+
+	// Get current blocks.
+	rs, err := c.common.consensus.RootHash().GetRuntimeState(ctx, &roothash.RuntimeRequest{
+		RuntimeID: request.RuntimeID,
+		Height:    consensus.HeightLatest,
+	})
+	if err != nil {
+		return fmt.Errorf("client: failed to get runtime %s state: %w", request.RuntimeID, err)
+	}
+	lb, err := c.common.consensus.GetLightBlock(ctx, rs.CurrentBlockHeight)
+	if err != nil {
+		return fmt.Errorf("client: failed to get light block at height %d: %w", rs.CurrentBlockHeight, err)
+	}
+	epoch, err := c.common.consensus.Beacon().GetEpoch(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("client: failed to get current epoch: %w", err)
+	}
+
+	resp, err := rt.CheckTx(ctx, rs.CurrentBlock, lb, epoch, transaction.RawBatch{request.Data})
+	if err != nil {
+		return fmt.Errorf("client: local transaction check failed: %w", err)
+	}
+	if !resp[0].IsSuccess() {
+		return errors.WithContext(api.ErrCheckTxFailed, resp[0].Error.String())
+	}
+
+	return nil
+}
+
+// Implements api.RuntimeClient.
 func (c *runtimeClient) WatchBlocks(ctx context.Context, runtimeID common.Namespace) (<-chan *roothash.AnnotatedBlock, pubsub.ClosableSubscription, error) {
-	return c.common.consensus.RootHash().WatchBlocks(runtimeID)
+	return c.common.consensus.RootHash().WatchBlocks(ctx, runtimeID)
 }
 
 // Implements api.RuntimeClient.
 func (c *runtimeClient) GetGenesisBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error) {
-	return c.common.consensus.RootHash().GetGenesisBlock(ctx, runtimeID, consensus.HeightLatest)
+	return c.common.consensus.RootHash().GetGenesisBlock(ctx, &roothash.RuntimeRequest{
+		RuntimeID: runtimeID,
+		Height:    consensus.HeightLatest,
+	})
 }
 
 // Implements api.RuntimeClient.
@@ -186,6 +240,7 @@ func (c *runtimeClient) getTxnTree(blk *block.Block) *transaction.Tree {
 	ioRoot := storage.Root{
 		Namespace: blk.Header.Namespace,
 		Version:   blk.Header.Round,
+		Type:      storage.RootTypeIO,
 		Hash:      blk.Header.IORoot,
 	}
 
@@ -267,6 +322,7 @@ func (c *runtimeClient) GetTxs(ctx context.Context, request *api.GetTxsRequest) 
 
 	ioRoot := storage.Root{
 		Version: request.Round,
+		Type:    storage.RootTypeIO,
 		Hash:    request.IORoot,
 	}
 	copy(ioRoot.Namespace[:], request.RuntimeID[:])
@@ -288,6 +344,55 @@ func (c *runtimeClient) GetTxs(ctx context.Context, request *api.GetTxsRequest) 
 }
 
 // Implements api.RuntimeClient.
+func (c *runtimeClient) GetTransactions(ctx context.Context, request *api.GetTransactionsRequest) ([][]byte, error) {
+	blk, err := c.GetBlock(ctx, &api.GetBlockRequest{RuntimeID: request.RuntimeID, Round: request.Round})
+	if err != nil {
+		return nil, err
+	}
+
+	tree := c.getTxnTree(blk)
+	defer tree.Close()
+
+	txs, err := tree.GetTransactions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	inputs := [][]byte{}
+	for _, tx := range txs {
+		inputs = append(inputs, tx.Input)
+	}
+
+	return inputs, nil
+}
+
+// Implements api.RuntimeClient.
+func (c *runtimeClient) GetEvents(ctx context.Context, request *api.GetEventsRequest) ([]*api.Event, error) {
+	blk, err := c.GetBlock(ctx, &api.GetBlockRequest{RuntimeID: request.RuntimeID, Round: request.Round})
+	if err != nil {
+		return nil, err
+	}
+
+	tree := c.getTxnTree(blk)
+	defer tree.Close()
+
+	tags, err := tree.GetTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var events []*api.Event
+	for _, tag := range tags {
+		events = append(events, &api.Event{
+			Key:    tag.Key,
+			Value:  tag.Value,
+			TxHash: tag.TxHash,
+		})
+	}
+	return events, nil
+}
+
+// Implements api.RuntimeClient.
 func (c *runtimeClient) GetBlockByHash(ctx context.Context, request *api.GetBlockByHashRequest) (*block.Block, error) {
 	tagIndexer, err := c.tagIndexer(request.RuntimeID)
 	if err != nil {
@@ -300,6 +405,41 @@ func (c *runtimeClient) GetBlockByHash(ctx context.Context, request *api.GetBloc
 	}
 
 	return c.GetBlock(ctx, &api.GetBlockRequest{RuntimeID: request.RuntimeID, Round: round})
+}
+
+// Implements api.RuntimeClient.
+func (c *runtimeClient) Query(ctx context.Context, request *api.QueryRequest) (*api.QueryResponse, error) {
+	hrt, ok := c.hosts[request.RuntimeID]
+	if !ok {
+		return nil, api.ErrNoHostedRuntime
+	}
+	rt := hrt.GetHostedRuntime()
+	if rt == nil {
+		return nil, api.ErrNoHostedRuntime
+	}
+
+	// Get current blocks.
+	rs, err := c.common.consensus.RootHash().GetRuntimeState(ctx, &roothash.RuntimeRequest{
+		RuntimeID: request.RuntimeID,
+		Height:    consensus.HeightLatest,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("client: failed to get runtime %s state: %w", request.RuntimeID, err)
+	}
+	lb, err := c.common.consensus.GetLightBlock(ctx, rs.CurrentBlockHeight)
+	if err != nil {
+		return nil, fmt.Errorf("client: failed to get light block at height %d: %w", rs.CurrentBlockHeight, err)
+	}
+	epoch, err := c.common.consensus.Beacon().GetEpoch(ctx, rs.CurrentBlockHeight)
+	if err != nil {
+		return nil, fmt.Errorf("client: failed to get epoch at height %d: %w", rs.CurrentBlockHeight, err)
+	}
+
+	data, err := rt.Query(ctx, rs.CurrentBlock, lb, epoch, request.Method, request.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &api.QueryResponse{Data: data}, nil
 }
 
 // Implements api.RuntimeClient.
@@ -409,7 +549,7 @@ func (c *runtimeClient) CallEnclave(ctx context.Context, request *enclaverpc.Cal
 		if km = c.kmClients[rt.ID()]; km == nil {
 			c.logger.Debug("creating new key manager client instance")
 
-			km, err = keymanager.New(c.common.ctx, rt, c.common.consensus.KeyManager(), c.common.consensus.Registry(), nil)
+			km, err = keymanager.New(c.common.ctx, rt, c.common.consensus, nil)
 			if err != nil {
 				c.Unlock()
 				c.logger.Error("failed to create key manager client instance",
@@ -430,15 +570,54 @@ func (c *runtimeClient) CallEnclave(ctx context.Context, request *enclaverpc.Cal
 	}
 }
 
-// Cleanup stops all running block watchers and waits for them to finish.
+// Implements service.BackgroundService.
+func (c *runtimeClient) Name() string {
+	return "runtime client"
+}
+
+// Implements service.BackgroundService.
+func (c *runtimeClient) Start() error {
+	for _, host := range c.hosts {
+		if err := host.Start(); err != nil {
+			return err
+		}
+	}
+	go func() {
+		defer close(c.quitCh)
+		for _, host := range c.hosts {
+			<-host.Quit()
+		}
+	}()
+	return nil
+}
+
+// Implements service.BackgroundService.
+func (c *runtimeClient) Stop() {
+	// Watchers.
+	c.Lock()
+	for _, submitter := range c.txSubmitters {
+		submitter.Stop()
+	}
+	c.Unlock()
+	// Hosts.
+	for _, host := range c.hosts {
+		host.Stop()
+	}
+}
+
+// Implements service.BackgroundService.
+func (c *runtimeClient) Quit() <-chan struct{} {
+	return c.quitCh
+}
+
+// Cleanup waits for all block watchers to finish.
 func (c *runtimeClient) Cleanup() {
 	// Watchers.
-	for _, watcher := range c.watchers {
-		watcher.Stop()
+	c.Lock()
+	for _, submitter := range c.txSubmitters {
+		<-submitter.Quit()
 	}
-	for _, watcher := range c.watchers {
-		<-watcher.Quit()
-	}
+	c.Unlock()
 }
 
 // New returns a new runtime client instance.
@@ -448,7 +627,7 @@ func New(
 	consensus consensus.Backend,
 	runtimeRegistry runtimeRegistry.Registry,
 	p2p *p2p.P2P,
-) (api.RuntimeClient, error) {
+) (api.RuntimeClientService, error) {
 	maxTransactionAge := viper.GetInt64(CfgMaxTransactionAge)
 	if maxTransactionAge < minMaxTransactionAge && !cmdFlags.DebugDontBlameOasis() {
 		return nil, fmt.Errorf("max transaction age too low: %d, minimum: %d", maxTransactionAge, minMaxTransactionAge)
@@ -462,11 +641,27 @@ func New(
 			ctx:             ctx,
 			p2p:             p2p,
 		},
-		watchers:          make(map[common.Namespace]*blockWatcher),
+		quitCh:            make(chan struct{}),
+		hosts:             make(map[common.Namespace]*clientHost),
+		txSubmitters:      make(map[common.Namespace]*txSubmitter),
 		kmClients:         make(map[common.Namespace]*keymanager.Client),
 		maxTransactionAge: maxTransactionAge,
 		logger:            logging.GetLogger("runtime/client"),
 	}
+
+	// Create all configured runtime hosts.
+	for _, rt := range runtimeRegistry.Runtimes() {
+		if !rt.HasHost() {
+			continue
+		}
+
+		host, err := newClientHost(rt, consensus)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create new client host for %s: %w", rt.ID(), err)
+		}
+		c.hosts[rt.ID()] = host
+	}
+
 	return c, nil
 }
 

@@ -1,6 +1,10 @@
-use std::sync::Arc;
+// Allow until oasis-core#3572.
+#![allow(deprecated)]
+
+use std::{collections::BTreeMap, io::Cursor, sync::Arc};
 
 use anyhow::{anyhow, Result};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use io_context::Context as IoContext;
 
 use oasis_core_keymanager_client::{KeyManagerClient, KeyPairId};
@@ -10,21 +14,62 @@ use oasis_core_runtime::{
             hash::Hash,
             mrae::deoxysii::{DeoxysII, KEY_SIZE, NONCE_SIZE, TAG_SIZE},
         },
-        runtime::RuntimeId,
+        key_format::KeyFormat,
+        namespace::Namespace,
         version::Version,
+        versioned::Versioned,
     },
-    executor::Executor,
+    consensus::{
+        address::Address,
+        roothash::{Message, RegistryMessage, StakingMessage},
+        staking::{Account, Delegation},
+        state::staking::ImmutableState as StakingImmutableState,
+    },
     rak::RAK,
     register_runtime_txn_methods, runtime_context,
     storage::{StorageContext, MKVS},
-    transaction::{dispatcher::CheckOnlySuccess, Context as TxnContext},
+    transaction::{
+        dispatcher::{BatchHandler, CheckOnlySuccess},
+        Context as TxnContext,
+    },
     version_from_cargo, Protocol, RpcDemux, RpcDispatcher, TxnDispatcher, TxnMethDispatcher,
 };
 use simple_keymanager::trusted_policy_signers;
-use simple_keyvalue_api::{with_api, Key, KeyValue};
+use simple_keyvalue_api::{
+    with_api, AddEscrow, Key, KeyValue, ReclaimEscrow, Transfer, UpdateRuntime, Withdraw,
+};
+
+/// Key format used for transaction artifacts.
+#[derive(Debug)]
+struct PendingMessagesKeyFormat {
+    index: u32,
+}
+
+impl KeyFormat for PendingMessagesKeyFormat {
+    fn prefix() -> u8 {
+        0x00
+    }
+
+    fn size() -> usize {
+        4
+    }
+
+    fn encode_atoms(self, atoms: &mut Vec<Vec<u8>>) {
+        let mut index: Vec<u8> = Vec::with_capacity(4);
+        index.write_u32::<BigEndian>(self.index).unwrap();
+        atoms.push(index);
+    }
+
+    fn decode_atoms(data: &[u8]) -> Self {
+        let mut reader = Cursor::new(data);
+        Self {
+            index: reader.read_u32::<BigEndian>().unwrap(),
+        }
+    }
+}
 
 struct Context {
-    test_runtime_id: RuntimeId,
+    test_runtime_id: Namespace,
     km_client: Arc<dyn KeyManagerClient>,
 }
 
@@ -33,6 +78,144 @@ fn get_runtime_id(_args: &(), ctx: &mut TxnContext) -> Result<Option<String>> {
     let rctx = runtime_context!(ctx, Context);
 
     Ok(Some(rctx.test_runtime_id.to_string()))
+}
+
+/// Queries all consensus accounts.
+/// Note: this is a transaction but could be a query in a non-test runtime.
+fn consensus_accounts(
+    _args: &(),
+    ctx: &mut TxnContext,
+) -> Result<(
+    BTreeMap<Address, Account>,
+    BTreeMap<Address, BTreeMap<Address, Delegation>>,
+)> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    let state = StakingImmutableState::new(&ctx.consensus_state);
+    let mut result = BTreeMap::new();
+    let addrs = state.addresses(IoContext::create_child(&ctx.io_ctx))?;
+    for addr in addrs {
+        result.insert(
+            addr.clone(),
+            state.account(IoContext::create_child(&ctx.io_ctx), addr)?,
+        );
+    }
+
+    let delegations = state.delegations(IoContext::create_child(&ctx.io_ctx))?;
+
+    Ok((result, delegations))
+}
+
+/// Withdraw from the consensus layer into the runtime account.
+fn consensus_withdraw(args: &Withdraw, ctx: &mut TxnContext) -> Result<()> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    StorageContext::with_current(|mkvs, _untrusted_local| {
+        let index = ctx.emit_message(Message::Staking(Versioned::new(
+            0,
+            StakingMessage::Withdraw(args.withdraw.clone()),
+        )));
+
+        mkvs.insert(
+            IoContext::create_child(&ctx.io_ctx),
+            &PendingMessagesKeyFormat { index }.encode(),
+            b"withdraw",
+        );
+    });
+
+    Ok(())
+}
+
+/// Transfer from the runtime account to another account in the consensus layer.
+fn consensus_transfer(args: &Transfer, ctx: &mut TxnContext) -> Result<()> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    StorageContext::with_current(|mkvs, _untrusted_local| {
+        let index = ctx.emit_message(Message::Staking(Versioned::new(
+            0,
+            StakingMessage::Transfer(args.transfer.clone()),
+        )));
+
+        mkvs.insert(
+            IoContext::create_child(&ctx.io_ctx),
+            &PendingMessagesKeyFormat { index }.encode(),
+            b"transfer",
+        );
+    });
+
+    Ok(())
+}
+
+/// Add escrow from the runtime account to an account in the consensus layer.
+fn consensus_add_escrow(args: &AddEscrow, ctx: &mut TxnContext) -> Result<()> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    StorageContext::with_current(|mkvs, _untrusted_local| {
+        let index = ctx.emit_message(Message::Staking(Versioned::new(
+            0,
+            StakingMessage::AddEscrow(args.escrow.clone()),
+        )));
+
+        mkvs.insert(
+            IoContext::create_child(&ctx.io_ctx),
+            &PendingMessagesKeyFormat { index }.encode(),
+            b"add_escrow",
+        );
+    });
+
+    Ok(())
+}
+
+/// Reclaim escrow to the runtime account.
+fn consensus_reclaim_escrow(args: &ReclaimEscrow, ctx: &mut TxnContext) -> Result<()> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    StorageContext::with_current(|mkvs, _untrusted_local| {
+        let index = ctx.emit_message(Message::Staking(Versioned::new(
+            0,
+            StakingMessage::ReclaimEscrow(args.reclaim_escrow.clone()),
+        )));
+
+        mkvs.insert(
+            IoContext::create_child(&ctx.io_ctx),
+            &PendingMessagesKeyFormat { index }.encode(),
+            b"reclaim_escrow",
+        );
+    });
+
+    Ok(())
+}
+
+/// Update existing runtime with given descriptor.
+fn update_runtime(args: &UpdateRuntime, ctx: &mut TxnContext) -> Result<()> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
+
+    StorageContext::with_current(|mkvs, _untrusted_local| {
+        let index = ctx.emit_message(Message::Registry(Versioned::new(
+            0,
+            RegistryMessage::UpdateRuntime(args.update_runtime.clone()),
+        )));
+
+        mkvs.insert(
+            IoContext::create_child(&ctx.io_ctx),
+            &PendingMessagesKeyFormat { index }.encode(),
+            b"update_runtime",
+        );
+    });
+
+    Ok(())
 }
 
 /// Insert a key/value pair.
@@ -94,13 +277,16 @@ fn get_encryption_context(ctx: &mut TxnContext, key: &[u8]) -> Result<Encryption
     // Fetch encryption keys.
     let io_ctx = IoContext::create_child(&ctx.io_ctx);
     let result = rctx.km_client.get_or_create_keys(io_ctx, key_pair_id);
-    let key = Executor::with_current(|executor| executor.block_on(result))?;
+    let key = ctx.tokio.block_on(result)?;
 
     Ok(EncryptionContext::new(key.state_key.as_ref()))
 }
 
 /// (encrypted) Insert a key/value pair.
 fn enc_insert(args: &KeyValue, ctx: &mut TxnContext) -> Result<Option<String>> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
     // NOTE: This is only for example purposes, the correct way would be
     //       to also generate a (deterministic) nonce.
     let nonce = [0u8; NONCE_SIZE];
@@ -120,6 +306,9 @@ fn enc_insert(args: &KeyValue, ctx: &mut TxnContext) -> Result<Option<String>> {
 
 /// (encrypted) Retrieve a key/value pair.
 fn enc_get(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
     let enc_ctx = get_encryption_context(ctx, args.key.as_bytes())?;
     let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
         enc_ctx.get(
@@ -133,6 +322,9 @@ fn enc_get(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
 
 /// (encrypted) Remove a key/value pair.
 fn enc_remove(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
+    if ctx.check_only {
+        return Err(CheckOnlySuccess::default().into());
+    }
     let enc_ctx = get_encryption_context(ctx, args.key.as_bytes())?;
     let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
         enc_ctx.remove(
@@ -229,7 +421,10 @@ impl EncryptionContext {
         // approximate it with a Deoxys-II call with an all 0 nonce.
 
         let nonce = [0u8; NONCE_SIZE];
-        self.d2.seal(&nonce, key.to_vec(), vec![])
+        // XXX: Prefix all keys by 0x01 to make sure they do not clash with pending messages.
+        let mut pkey = vec![0x01];
+        pkey.append(&mut self.d2.seal(&nonce, key.to_vec(), vec![]));
+        pkey
     }
 
     fn derive_nonce(nonce: &[u8]) -> [u8; NONCE_SIZE] {
@@ -242,6 +437,80 @@ impl EncryptionContext {
 
         n
     }
+}
+
+struct BlockHandler;
+
+impl BlockHandler {
+    fn process_message_results(&self, ctx: &mut TxnContext) {
+        for ev in &ctx.round_results.messages {
+            // Fetch and remove message metadata.
+            let meta = StorageContext::with_current(|mkvs, _| {
+                mkvs.remove(
+                    IoContext::create_child(&ctx.io_ctx),
+                    &PendingMessagesKeyFormat { index: ev.index }.encode(),
+                )
+            });
+
+            // Make sure metadata is as expected.
+            match meta.as_ref().map(|v| v.as_slice()) {
+                Some(b"withdraw") => {
+                    // Withdraw.
+                }
+
+                Some(b"transfer") => {
+                    // Transfer.
+                }
+
+                Some(b"add_escrow") => {
+                    // AddEscrow.
+                }
+
+                Some(b"reclaim_escrow") => {
+                    // ReclaimEscrow.
+                }
+
+                meta => panic!("unexpected message metadata: {:?}", meta),
+            }
+        }
+
+        // Check if there are any leftover pending messages metadata.
+        StorageContext::with_current(|mkvs, _| {
+            let mut it = mkvs.iter(IoContext::create_child(&ctx.io_ctx));
+            it.seek(&PendingMessagesKeyFormat { index: 0 }.encode_partial(0));
+            // Either there should be no next key...
+            it.next().and_then(|(key, _value)| {
+                assert!(
+                    // ...or the next key should be something else.
+                    PendingMessagesKeyFormat::decode(&key).is_none(),
+                    "leftover message metadata (some messages not processed?): key={:?}",
+                    key
+                );
+                Some(())
+            });
+        })
+    }
+}
+
+impl BatchHandler for BlockHandler {
+    fn start_batch(&self, ctx: &mut TxnContext) {
+        if ctx.check_only {
+            return;
+        }
+
+        self.process_message_results(ctx);
+
+        // Store current epoch to test consistency.
+        StorageContext::with_current(|mkvs, _| {
+            mkvs.insert(
+                IoContext::create_child(&ctx.io_ctx),
+                &[0x02],
+                &ctx.epoch.to_be_bytes(),
+            );
+        });
+    }
+
+    fn end_batch(&self, _ctx: &mut TxnContext) {}
 }
 
 pub fn main() {
@@ -274,6 +543,7 @@ pub fn main() {
                 .expect("failed to update km client policy");
         })));
 
+        txn.set_batch_handler(BlockHandler);
         txn.set_context_initializer(move |ctx: &mut TxnContext| {
             ctx.runtime = Box::new(Context {
                 test_runtime_id: rt_id.clone(),

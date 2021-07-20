@@ -63,6 +63,23 @@ func (app *stakingApplication) initLastBlockFees(ctx *abciAPI.Context, st *staki
 	return nil
 }
 
+func (app *stakingApplication) initGovernanceDeposits(ctx *abciAPI.Context, state *stakingState.MutableState, st *staking.Genesis, totalSupply *quantity.Quantity) error {
+	if !st.GovernanceDeposits.IsValid() {
+		return fmt.Errorf("tendermint/staking: invalid genesis state GovernanceDeposits")
+	}
+	if err := totalSupply.Add(&st.GovernanceDeposits); err != nil {
+		ctx.Logger().Error("InitChain: failed to add governance deposits",
+			"err", err,
+		)
+		return fmt.Errorf("tendermint/staking: failed to add governance deposits: %w", err)
+	}
+	if err := state.SetGovernanceDeposits(ctx, &st.GovernanceDeposits); err != nil {
+		ctx.Logger().Error("InitChain: failed to set governance deposits state", "err", err)
+		return fmt.Errorf("tendermint/staking: failed to set governance deposits state")
+	}
+	return nil
+}
+
 func (app *stakingApplication) initLedger(
 	ctx *abciAPI.Context,
 	state *stakingState.MutableState,
@@ -242,7 +259,7 @@ func (app *stakingApplication) initDebondingDelegations(ctx *abciAPI.Context, st
 					)
 				}
 
-				if err := state.SetDebondingDelegation(ctx, delegatorAddr, escrowAddr, uint64(idx), delegation); err != nil {
+				if err := state.SetDebondingDelegation(ctx, delegatorAddr, escrowAddr, delegation.DebondEndTime, delegation); err != nil {
 					return fmt.Errorf("tendermint/staking: failed to set debonding delegation to %s from %s index %d: %w",
 						escrowAddr, delegatorAddr, idx, err,
 					)
@@ -289,6 +306,10 @@ func (app *stakingApplication) InitChain(ctx *abciAPI.Context, request types.Req
 		return err
 	}
 
+	if err := app.initGovernanceDeposits(ctx, state, st, &totalSupply); err != nil {
+		return err
+	}
+
 	if err := app.initLedger(ctx, state, st, &totalSupply); err != nil {
 		return err
 	}
@@ -330,6 +351,11 @@ func (sq *stakingQuerier) Genesis(ctx context.Context) (*staking.Genesis, error)
 		return nil, err
 	}
 
+	governanceDeposits, err := sq.state.GovernanceDeposits(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	addresses, err := sq.state.Addresses(ctx)
 	if err != nil {
 		return nil, err
@@ -366,6 +392,7 @@ func (sq *stakingQuerier) Genesis(ctx context.Context) (*staking.Genesis, error)
 		TotalSupply:          *totalSupply,
 		CommonPool:           *commonPool,
 		LastBlockFees:        *lastBlockFees,
+		GovernanceDeposits:   *governanceDeposits,
 		Ledger:               ledger,
 		Delegations:          delegations,
 		DebondingDelegations: debondingDelegations,

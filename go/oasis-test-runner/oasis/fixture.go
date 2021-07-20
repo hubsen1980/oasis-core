@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
 
@@ -45,6 +46,9 @@ func (f *NetworkFixture) Create(env *env.Env) (*Network, error) {
 	if net, err = New(env, &f.Network); err != nil {
 		return nil, err
 	}
+
+	// Ensure the creation order here is good enough for proper startup in
+	// net.Start, since that'll just iterate through node objects.
 
 	// Provision entities.
 	for _, entCfg := range f.Entities {
@@ -132,9 +136,6 @@ type ConsensusFixture struct { // nolint: maligned
 	// SubmissionGasPrice is the gas price to use when submitting consensus transactions.
 	SubmissionGasPrice uint64 `json:"submission_gas_price"`
 
-	// DisableCheckTx causes the consensus layer to skip transaction checks.
-	DisableCheckTx bool `json:"disable_check_tx"`
-
 	// PruneNumKept is the number of blocks to keep (zero disables pruning).
 	PruneNumKept uint64 `json:"prune_num_kept"`
 
@@ -143,6 +144,18 @@ type ConsensusFixture struct { // nolint: maligned
 
 	// EnableConsensusRPCWorker enables the public consensus RPC services worker.
 	EnableConsensusRPCWorker bool `json:"enable_consensusrpc_worker,omitempty"`
+
+	// SupplementarySanityInterval configures the sanity check application.
+	SupplementarySanityInterval uint64 `json:"supplementary_sanity_interval,omitempty"`
+}
+
+// NodeFixture is a common subset of settings for node-backed fixtures.
+type NodeFixture struct {
+	// Name is the name of the node that hosts the feature. Leave empty
+	// to automatically instantiate a dedicated node with a default name.
+	Name string `json:"node_name,omitempty"`
+
+	ExtraArgs []Argument `json:"extra_args,omitempty"`
 }
 
 // TEEFixture is a TEE configuration fixture.
@@ -153,10 +166,16 @@ type TEEFixture struct {
 
 // ValidatorFixture is a validator fixture.
 type ValidatorFixture struct { // nolint: maligned
+	NodeFixture
+
 	AllowEarlyTermination bool `json:"allow_early_termination"`
 	AllowErrorTermination bool `json:"allow_error_termination"`
 
 	NoAutoStart bool `json:"no_auto_start,omitempty"`
+
+	CrashPointsProbability float64 `json:"crash_points_probability,omitempty"`
+
+	EnableProfiling bool `json:"enable_profiling"`
 
 	Entity int `json:"entity"`
 
@@ -181,13 +200,18 @@ func (f *ValidatorFixture) Create(net *Network) (*Validator, error) {
 
 	return net.NewValidator(&ValidatorCfg{
 		NodeCfg: NodeCfg{
-			AllowEarlyTermination:      f.AllowEarlyTermination,
-			AllowErrorTermination:      f.AllowErrorTermination,
-			LogWatcherHandlerFactories: f.LogWatcherHandlerFactories,
-			Consensus:                  f.Consensus,
-			NoAutoStart:                f.NoAutoStart,
+			Name:                        f.Name,
+			AllowEarlyTermination:       f.AllowEarlyTermination,
+			AllowErrorTermination:       f.AllowErrorTermination,
+			LogWatcherHandlerFactories:  f.LogWatcherHandlerFactories,
+			Consensus:                   f.Consensus,
+			NoAutoStart:                 f.NoAutoStart,
+			CrashPointsProbability:      f.CrashPointsProbability,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			Entity:                      entity,
+			ExtraArgs:                   f.ExtraArgs,
 		},
-		Entity:   entity,
 		Sentries: sentries,
 	})
 }
@@ -199,17 +223,20 @@ type RuntimeFixture struct { // nolint: maligned
 	Entity     int                  `json:"entity"`
 	Keymanager int                  `json:"keymanager"`
 
-	Binaries         []string         `json:"binaries"`
-	GenesisState     storage.WriteLog `json:"genesis_state,omitempty"`
-	GenesisStatePath string           `json:"genesis_state_path,omitempty"`
-	GenesisRound     uint64           `json:"genesis_round,omitempty"`
+	Binaries         map[node.TEEHardware][]string `json:"binaries"`
+	GenesisState     storage.WriteLog              `json:"genesis_state,omitempty"`
+	GenesisStatePath string                        `json:"genesis_state_path,omitempty"`
+	GenesisRound     uint64                        `json:"genesis_round,omitempty"`
 
 	Executor     registry.ExecutorParameters     `json:"executor"`
 	TxnScheduler registry.TxnSchedulerParameters `json:"txn_scheduler"`
 	Storage      registry.StorageParameters      `json:"storage"`
 
-	AdmissionPolicy registry.RuntimeAdmissionPolicy   `json:"admission_policy"`
-	Staking         registry.RuntimeStakingParameters `json:"staking,omitempty"`
+	AdmissionPolicy registry.RuntimeAdmissionPolicy                                               `json:"admission_policy"`
+	Constraints     map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints `json:"constraints,omitempty"`
+	Staking         registry.RuntimeStakingParameters                                             `json:"staking,omitempty"`
+
+	GovernanceModel registry.RuntimeGovernanceModel `json:"governance_model"`
 
 	Pruner RuntimePrunerCfg `json:"pruner,omitempty"`
 
@@ -253,6 +280,7 @@ func (f *RuntimeFixture) Create(netFixture *NetworkFixture, net *Network) (*Runt
 		GenesisRound:       f.GenesisRound,
 		Pruner:             f.Pruner,
 		ExcludeFromGenesis: f.ExcludeFromGenesis,
+		GovernanceModel:    f.GovernanceModel,
 	})
 }
 
@@ -277,19 +305,27 @@ func (f *KeymanagerPolicyFixture) Create(net *Network) (*KeymanagerPolicy, error
 
 // KeymanagerFixture is a key manager fixture.
 type KeymanagerFixture struct {
+	NodeFixture
+
 	Runtime int `json:"runtime"`
 	Entity  int `json:"entity"`
 	Policy  int `json:"policy"`
+
+	RuntimeProvisioner string `json:"runtime_provisioner"`
 
 	AllowEarlyTermination bool `json:"allow_early_termination"`
 	AllowErrorTermination bool `json:"allow_error_termination"`
 
 	NoAutoStart bool `json:"no_auto_start,omitempty"`
 
+	EnableProfiling bool `json:"enable_profiling"`
+
 	Sentries []int `json:"sentries,omitempty"`
 
 	// Consensus contains configuration for the consensus backend.
 	Consensus ConsensusFixture `json:"consensus"`
+
+	CrashPointsProbability float64 `json:"crash_points_probability,omitempty"`
 
 	LogWatcherHandlerFactories []log.WatcherHandlerFactory `json:"-"`
 }
@@ -311,21 +347,29 @@ func (f *KeymanagerFixture) Create(net *Network) (*Keymanager, error) {
 
 	return net.NewKeymanager(&KeymanagerCfg{
 		NodeCfg: NodeCfg{
-			AllowEarlyTermination:      f.AllowEarlyTermination,
-			AllowErrorTermination:      f.AllowErrorTermination,
-			LogWatcherHandlerFactories: f.LogWatcherHandlerFactories,
-			Consensus:                  f.Consensus,
-			NoAutoStart:                f.NoAutoStart,
+			Name:                        f.Name,
+			AllowEarlyTermination:       f.AllowEarlyTermination,
+			AllowErrorTermination:       f.AllowErrorTermination,
+			LogWatcherHandlerFactories:  f.LogWatcherHandlerFactories,
+			CrashPointsProbability:      f.CrashPointsProbability,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			Consensus:                   f.Consensus,
+			NoAutoStart:                 f.NoAutoStart,
+			Entity:                      entity,
+			ExtraArgs:                   f.ExtraArgs,
 		},
-		Runtime:       runtime,
-		Entity:        entity,
-		Policy:        policy,
-		SentryIndices: f.Sentries,
+		RuntimeProvisioner: f.RuntimeProvisioner,
+		Runtime:            runtime,
+		Policy:             policy,
+		SentryIndices:      f.Sentries,
 	})
 }
 
 // StorageWorkerFixture is a storage worker fixture.
 type StorageWorkerFixture struct { // nolint: maligned
+	NodeFixture
+
 	Backend string `json:"backend"`
 	Entity  int    `json:"entity"`
 
@@ -334,7 +378,10 @@ type StorageWorkerFixture struct { // nolint: maligned
 
 	NoAutoStart bool `json:"no_auto_start,omitempty"`
 
+	EnableProfiling bool `json:"enable_profiling"`
+
 	DisableCertRotation bool `json:"disable_cert_rotation"`
+	DisablePublicRPC    bool `json:"disable_public_rpc"`
 
 	LogWatcherHandlerFactories []log.WatcherHandlerFactory `json:"-"`
 
@@ -346,6 +393,8 @@ type StorageWorkerFixture struct { // nolint: maligned
 	CheckpointCheckInterval time.Duration `json:"checkpoint_check_interval,omitempty"`
 	IgnoreApplies           bool          `json:"ignore_applies,omitempty"`
 	CheckpointSyncEnabled   bool          `json:"checkpoint_sync_enabled,omitempty"`
+
+	CrashPointsProbability float64 `json:"crash_points_probability,omitempty"`
 
 	// Runtimes contains the indexes of the runtimes to enable. Leave
 	// empty or nil for the default behaviour (i.e. include all runtimes).
@@ -361,27 +410,35 @@ func (f *StorageWorkerFixture) Create(net *Network) (*Storage, error) {
 
 	return net.NewStorage(&StorageCfg{
 		NodeCfg: NodeCfg{
-			AllowEarlyTermination:      f.AllowEarlyTermination,
-			AllowErrorTermination:      f.AllowErrorTermination,
-			NoAutoStart:                f.NoAutoStart,
-			LogWatcherHandlerFactories: f.LogWatcherHandlerFactories,
-			Consensus:                  f.Consensus,
+			Name:                        f.Name,
+			AllowEarlyTermination:       f.AllowEarlyTermination,
+			AllowErrorTermination:       f.AllowErrorTermination,
+			CrashPointsProbability:      f.CrashPointsProbability,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			NoAutoStart:                 f.NoAutoStart,
+			LogWatcherHandlerFactories:  f.LogWatcherHandlerFactories,
+			Consensus:                   f.Consensus,
+			Entity:                      entity,
+			ExtraArgs:                   f.ExtraArgs,
 		},
 		Backend:                 f.Backend,
-		Entity:                  entity,
 		SentryIndices:           f.Sentries,
 		CheckpointCheckInterval: f.CheckpointCheckInterval,
 		IgnoreApplies:           f.IgnoreApplies,
-		// The checkpoint syncing flas is intentionally flipped here.
+		// The checkpoint syncing flag is intentionally flipped here.
 		// Syncing should normally be enabled, but normally disabled in tests.
 		CheckpointSyncDisabled: !f.CheckpointSyncEnabled,
 		DisableCertRotation:    f.DisableCertRotation,
+		DisablePublicRPC:       f.DisablePublicRPC,
 		Runtimes:               f.Runtimes,
 	})
 }
 
 // ComputeWorkerFixture is a compute worker fixture.
 type ComputeWorkerFixture struct {
+	NodeFixture
+
 	Entity int `json:"entity"`
 
 	RuntimeProvisioner string `json:"runtime_provisioner"`
@@ -391,13 +448,20 @@ type ComputeWorkerFixture struct {
 
 	NoAutoStart bool `json:"no_auto_start,omitempty"`
 
+	EnableProfiling bool `json:"enable_profiling"`
+
 	// Consensus contains configuration for the consensus backend.
 	Consensus ConsensusFixture `json:"consensus"`
+
+	CrashPointsProbability float64 `json:"crash_point_probability"`
 
 	LogWatcherHandlerFactories []log.WatcherHandlerFactory `json:"-"`
 
 	// Runtimes contains the indexes of the runtimes to enable.
 	Runtimes []int `json:"runtimes,omitempty"`
+
+	// RuntimeConfig contains the per-runtime node-local configuration.
+	RuntimeConfig map[int]map[string]interface{} `json:"runtime_config,omitempty"`
 }
 
 // Create instantiates the compute worker described by the fixture.
@@ -409,33 +473,51 @@ func (f *ComputeWorkerFixture) Create(net *Network) (*Compute, error) {
 
 	return net.NewCompute(&ComputeCfg{
 		NodeCfg: NodeCfg{
-			AllowEarlyTermination:      f.AllowEarlyTermination,
-			AllowErrorTermination:      f.AllowErrorTermination,
-			NoAutoStart:                f.NoAutoStart,
-			LogWatcherHandlerFactories: f.LogWatcherHandlerFactories,
-			Consensus:                  f.Consensus,
+			Name:                        f.Name,
+			AllowEarlyTermination:       f.AllowEarlyTermination,
+			AllowErrorTermination:       f.AllowErrorTermination,
+			NoAutoStart:                 f.NoAutoStart,
+			CrashPointsProbability:      f.CrashPointsProbability,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			LogWatcherHandlerFactories:  f.LogWatcherHandlerFactories,
+			Consensus:                   f.Consensus,
+			Entity:                      entity,
+			ExtraArgs:                   f.ExtraArgs,
 		},
-		Entity:             entity,
 		RuntimeProvisioner: f.RuntimeProvisioner,
 		Runtimes:           f.Runtimes,
+		RuntimeConfig:      f.RuntimeConfig,
 	})
 }
 
 // SeedFixture is a seed node fixture.
 type SeedFixture struct {
+	NodeFixture
+
 	DisableAddrBookFromGenesis bool `json:"disable_addr_book_from_genesis"`
 }
 
 // Create instantiates the seed node described by the fixture.
 func (f *SeedFixture) Create(net *Network) (*Seed, error) {
 	return net.NewSeed(&SeedCfg{
+		Name:                       f.Name,
 		DisableAddrBookFromGenesis: f.DisableAddrBookFromGenesis,
 	})
 }
 
 // SentryFixture is a sentry node fixture.
 type SentryFixture struct {
+	NodeFixture
+
 	LogWatcherHandlerFactories []log.WatcherHandlerFactory `json:"-"`
+
+	CrashPointsProbability float64 `json:"crash_points_probability,omitempty"`
+
+	EnableProfiling bool `json:"enable_profiling"`
+
+	// Consensus contains configuration for the consensus backend.
+	Consensus ConsensusFixture `json:"consensus"`
 
 	Validators        []int `json:"validators"`
 	StorageWorkers    []int `json:"storage_workers"`
@@ -446,7 +528,12 @@ type SentryFixture struct {
 func (f *SentryFixture) Create(net *Network) (*Sentry, error) {
 	return net.NewSentry(&SentryCfg{
 		NodeCfg: NodeCfg{
-			LogWatcherHandlerFactories: f.LogWatcherHandlerFactories,
+			Name:                        f.Name,
+			LogWatcherHandlerFactories:  f.LogWatcherHandlerFactories,
+			CrashPointsProbability:      f.CrashPointsProbability,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			ExtraArgs:                   f.ExtraArgs,
 		},
 		ValidatorIndices:  f.Validators,
 		StorageIndices:    f.StorageWorkers,
@@ -456,8 +543,23 @@ func (f *SentryFixture) Create(net *Network) (*Sentry, error) {
 
 // ClientFixture is a client node fixture.
 type ClientFixture struct {
+	NodeFixture
+
+	AllowErrorTermination bool `json:"allow_error_termination"`
+	AllowEarlyTermination bool `json:"allow_early_termination"`
+
+	EnableProfiling bool `json:"enable_profiling"`
+
 	// Consensus contains configuration for the consensus backend.
 	Consensus ConsensusFixture `json:"consensus"`
+
+	// Runtimes contains the indexes of the runtimes to enable.
+	Runtimes []int `json:"runtimes,omitempty"`
+
+	RuntimeProvisioner string `json:"runtime_provisioner"`
+
+	// RuntimeConfig contains the per-runtime node-local configuration.
+	RuntimeConfig map[int]map[string]interface{} `json:"runtime_config,omitempty"`
 
 	// MaxTransactionAge configures the MaxTransactionAge configuration of the client.
 	MaxTransactionAge int64 `json:"max_transaction_age"`
@@ -467,21 +569,35 @@ type ClientFixture struct {
 func (f *ClientFixture) Create(net *Network) (*Client, error) {
 	return net.NewClient(&ClientCfg{
 		NodeCfg: NodeCfg{
-			Consensus: f.Consensus,
+			Name:                        f.Name,
+			Consensus:                   f.Consensus,
+			AllowErrorTermination:       f.AllowErrorTermination,
+			AllowEarlyTermination:       f.AllowEarlyTermination,
+			SupplementarySanityInterval: f.Consensus.SupplementarySanityInterval,
+			EnableProfiling:             f.EnableProfiling,
+			ExtraArgs:                   f.ExtraArgs,
 		},
-		MaxTransactionAge: f.MaxTransactionAge,
+		MaxTransactionAge:  f.MaxTransactionAge,
+		Runtimes:           f.Runtimes,
+		RuntimeProvisioner: f.RuntimeProvisioner,
+		RuntimeConfig:      f.RuntimeConfig,
 	})
 }
 
 // ByzantineFixture is a byzantine node fixture.
 type ByzantineFixture struct { // nolint: maligned
-	Script    string   `json:"script"`
-	ExtraArgs []string `json:"extra_args"`
+	NodeFixture
+
+	Script    string     `json:"script"`
+	ExtraArgs []Argument `json:"extra_args"`
 
 	IdentitySeed string `json:"identity_seed"`
 	Entity       int    `json:"entity"`
 
-	ActivationEpoch epochtime.EpochTime `json:"activation_epoch"`
+	EnableProfiling bool `json:"enable_profiling"`
+
+	ActivationEpoch beacon.EpochTime `json:"activation_epoch"`
+	Runtime         int              `json:"runtime"`
 
 	// Consensus contains configuration for the consensus backend.
 	Consensus ConsensusFixture `json:"consensus"`
@@ -499,15 +615,19 @@ func (f *ByzantineFixture) Create(net *Network) (*Byzantine, error) {
 
 	return net.NewByzantine(&ByzantineCfg{
 		NodeCfg: NodeCfg{
+			Name:                                     f.Name,
 			DisableDefaultLogWatcherHandlerFactories: !f.EnableDefaultLogWatcherHandlerFactories,
 			LogWatcherHandlerFactories:               f.LogWatcherHandlerFactories,
 			Consensus:                                f.Consensus,
+			EnableProfiling:                          f.EnableProfiling,
+			AllowEarlyTermination:                    true,
+			Entity:                                   entity,
 		},
 		Script:          f.Script,
 		ExtraArgs:       f.ExtraArgs,
 		IdentitySeed:    f.IdentitySeed,
-		Entity:          entity,
 		ActivationEpoch: f.ActivationEpoch,
+		Runtime:         f.Runtime,
 	})
 }
 

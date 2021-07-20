@@ -11,9 +11,9 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
-	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
+	cmdContext "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/context"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/staking/api"
@@ -40,16 +40,27 @@ const (
 
 	// CfgCommissionScheduleBounds configures the commission schedule rate bound steps.
 	CfgCommissionScheduleBounds = "stake.commission_schedule.bounds"
+
+	// CfgAllowBeneficiary configures the beneficiary address.
+	CfgAllowBeneficiary = "stake.allow.beneficiary"
+
+	// CfgAllowAmountChange configures the allowance change.
+	CfgAllowAmountChange = "stake.allow.amount_change"
+
+	// CfgWithdrawSource configures the withdrawal source address.
+	CfgWithdrawSource = "stake.withdraw.source"
 )
 
 var (
-	accountInfoFlags        = flag.NewFlagSet("", flag.ContinueOnError)
+	commonAccountFlags      = flag.NewFlagSet("", flag.ContinueOnError)
 	amountFlags             = flag.NewFlagSet("", flag.ContinueOnError)
 	sharesFlags             = flag.NewFlagSet("", flag.ContinueOnError)
 	commonEscrowFlags       = flag.NewFlagSet("", flag.ContinueOnError)
 	commissionScheduleFlags = flag.NewFlagSet("", flag.ContinueOnError)
 	accountTransferFlags    = flag.NewFlagSet("", flag.ContinueOnError)
 	accountBurnFlags        = flag.NewFlagSet("", flag.ContinueOnError)
+	accountAllowFlags       = flag.NewFlagSet("", flag.ContinueOnError)
+	accountWithdrawFlags    = flag.NewFlagSet("", flag.ContinueOnError)
 
 	accountCmd = &cobra.Command{
 		Use:   "account",
@@ -58,8 +69,20 @@ var (
 
 	accountInfoCmd = &cobra.Command{
 		Use:   "info",
-		Short: "query account info",
+		Short: "get account info",
 		Run:   doAccountInfo,
+	}
+
+	accountNonceCmd = &cobra.Command{
+		Use:   "nonce",
+		Short: "get account nonce",
+		Run:   doAccountNonce,
+	}
+
+	accountValidateAddressCmd = &cobra.Command{
+		Use:   "validate_address",
+		Short: "validate account address",
+		Run:   doValidateAddress,
 	}
 
 	accountTransferCmd = &cobra.Command{
@@ -70,38 +93,40 @@ var (
 
 	accountBurnCmd = &cobra.Command{
 		Use:   "gen_burn",
-		Short: "Generate a burn transaction",
+		Short: "generate a burn transaction",
 		Run:   doAccountBurn,
 	}
 
 	accountEscrowCmd = &cobra.Command{
 		Use:   "gen_escrow",
-		Short: "Generate an escrow (stake) transaction",
+		Short: "generate an escrow (stake) transaction",
 		Run:   doAccountEscrow,
 	}
 
 	accountReclaimEscrowCmd = &cobra.Command{
 		Use:   "gen_reclaim_escrow",
-		Short: "Generate a reclaim_escrow (unstake) transaction",
+		Short: "generate a reclaim escrow (unstake) transaction",
 		Run:   doAccountReclaimEscrow,
 	}
 
 	accountAmendCommissionScheduleCmd = &cobra.Command{
 		Use:   "gen_amend_commission_schedule",
-		Short: "Generate an amend_commission_schedule transaction",
+		Short: "generate an amend commission schedule transaction",
 		Run:   doAccountAmendCommissionSchedule,
 	}
-)
 
-// getCtxWithInfo returns a new context with values that contain additional
-// information (ticker symbol, value base-10 exponent, genesis document's hash).
-func getCtxWithInfo(genesis *genesisAPI.Document) context.Context {
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenSymbol, genesis.Staking.TokenSymbol)
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueExponent, genesis.Staking.TokenValueExponent)
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyGenesisHash, genesis.Hash())
-	return ctx
-}
+	accountAllowCmd = &cobra.Command{
+		Use:   "gen_allow",
+		Short: "generate an allow transaction",
+		Run:   doAccountAllow,
+	}
+
+	accountWithdrawCmd = &cobra.Command{
+		Use:   "gen_withdraw",
+		Short: "generate a withdraw transaction",
+		Run:   doAccountWithdraw,
+	}
+)
 
 func doAccountInfo(cmd *cobra.Command, args []string) {
 	if err := cmdCommon.Init(); err != nil {
@@ -121,11 +146,96 @@ func doAccountInfo(cmd *cobra.Command, args []string) {
 
 	ctx := context.Background()
 	acct := getAccount(ctx, cmd, addr, client)
+	outgoingDelegationInfos := getDelegationInfosFor(ctx, cmd, addr, client)
+	incomingDelegations := getDelegationsTo(ctx, cmd, addr, client)
+	outgoingDebondingDelegationInfos := getDebondingDelegationInfosFor(ctx, cmd, addr, client)
+	incomingDebondingDelegations := getDebondingDelegationsTo(ctx, cmd, addr, client)
 	symbol := getTokenSymbol(ctx, cmd, client)
 	exp := getTokenValueExponent(ctx, cmd, client)
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenSymbol, symbol)
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueExponent, exp)
-	acct.PrettyPrint(ctx, "", os.Stdout)
+
+	fmt.Println("Balance:")
+	prettyPrintAccountBalanceAndDelegationsFrom(ctx, addr, acct.General, outgoingDelegationInfos, outgoingDebondingDelegationInfos, "  ", os.Stdout)
+	fmt.Println()
+
+	if len(acct.General.Allowances) > 0 {
+		fmt.Println("Allowances for this Account:")
+		prettyPrintAllowances(ctx, addr, acct.General.Allowances, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	if len(incomingDelegations) > 0 {
+		fmt.Println("Active Delegations to this Account:")
+		prettyPrintDelegationsTo(ctx, addr, acct.Escrow.Active, incomingDelegations, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	if len(incomingDebondingDelegations) > 0 {
+		fmt.Println("Debonding Delegations to this Account:")
+		prettyPrintDelegationsTo(ctx, addr, acct.Escrow.Debonding, incomingDebondingDelegations, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	cs := acct.Escrow.CommissionSchedule
+	if len(cs.Rates) > 0 || len(cs.Bounds) > 0 {
+		fmt.Println("Commission Schedule:")
+		cs.PrettyPrint(ctx, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	sa := acct.Escrow.StakeAccumulator
+	if len(sa.Claims) > 0 {
+		fmt.Println("Stake Accumulator:")
+		sa.PrettyPrint(ctx, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	fmt.Printf("Nonce: %d\n", acct.General.Nonce)
+}
+
+func doAccountNonce(cmd *cobra.Command, args []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	var addr api.Address
+	if err := addr.UnmarshalText([]byte(viper.GetString(CfgAccountAddr))); err != nil {
+		logger.Error("failed to parse account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	conn, client := doConnect(cmd)
+	defer conn.Close()
+
+	ctx := context.Background()
+	acct := getAccount(ctx, cmd, addr, client)
+	fmt.Println(acct.General.Nonce)
+}
+
+func doValidateAddress(cmd *cobra.Command, args []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	addrStr := viper.GetString(CfgAccountAddr)
+	var addr api.Address
+	err := addr.UnmarshalText([]byte(addrStr))
+
+	switch cmdFlags.Verbose() {
+	case true:
+		if err != nil {
+			fmt.Printf("account address '%s' is not valid: %v\n", addrStr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("account address '%s' is valid\n", addrStr)
+	default:
+		if err != nil {
+			os.Exit(1)
+		}
+	}
 }
 
 func doAccountTransfer(cmd *cobra.Command, args []string) {
@@ -153,7 +263,7 @@ func doAccountTransfer(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewTransferTx(nonce, fee, &xfer)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func doAccountBurn(cmd *cobra.Command, args []string) {
@@ -175,7 +285,7 @@ func doAccountBurn(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewBurnTx(nonce, fee, &burn)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func doAccountEscrow(cmd *cobra.Command, args []string) {
@@ -203,7 +313,7 @@ func doAccountEscrow(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewAddEscrowTx(nonce, fee, &escrow)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func doAccountReclaimEscrow(cmd *cobra.Command, args []string) {
@@ -231,7 +341,7 @@ func doAccountReclaimEscrow(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewReclaimEscrowTx(nonce, fee, &reclaim)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func scanRateStep(dst *api.CommissionRateStep, raw string) error {
@@ -309,22 +419,94 @@ func doAccountAmendCommissionSchedule(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewAmendCommissionScheduleTx(nonce, fee, &amendCommissionSchedule)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
+}
+
+func doAccountAllow(cmd *cobra.Command, args []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	genesis := cmdConsensus.InitGenesis()
+	cmdConsensus.AssertTxFileOK()
+
+	var allow api.Allow
+	if err := allow.Beneficiary.UnmarshalText([]byte(viper.GetString(CfgAllowBeneficiary))); err != nil {
+		logger.Error("failed to parse beneficiary account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	amountRaw := viper.GetString(CfgAllowAmountChange)
+	if len(amountRaw) < 1 {
+		logger.Error("malformed allowance change amount")
+		os.Exit(1)
+	}
+	if amountRaw[0] == '-' {
+		allow.Negative = true
+		amountRaw = amountRaw[1:]
+	}
+	if err := allow.AmountChange.UnmarshalText([]byte(amountRaw)); err != nil {
+		logger.Error("failed to parse allowance change amount",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	nonce, fee := cmdConsensus.GetTxNonceAndFee()
+	tx := api.NewAllowTx(nonce, fee, &allow)
+
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
+}
+
+func doAccountWithdraw(cmd *cobra.Command, args []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	genesis := cmdConsensus.InitGenesis()
+	cmdConsensus.AssertTxFileOK()
+
+	var withdraw api.Withdraw
+	if err := withdraw.From.UnmarshalText([]byte(viper.GetString(CfgWithdrawSource))); err != nil {
+		logger.Error("failed to parse source account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if err := withdraw.Amount.UnmarshalText([]byte(viper.GetString(CfgAmount))); err != nil {
+		logger.Error("failed to parse withdraw amount",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	nonce, fee := cmdConsensus.GetTxNonceAndFee()
+	tx := api.NewWithdrawTx(nonce, fee, &withdraw)
+
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func registerAccountCmd() {
 	for _, v := range []*cobra.Command{
 		accountInfoCmd,
+		accountNonceCmd,
+		accountValidateAddressCmd,
 		accountTransferCmd,
 		accountBurnCmd,
 		accountEscrowCmd,
 		accountReclaimEscrowCmd,
 		accountAmendCommissionScheduleCmd,
+		accountAllowCmd,
+		accountWithdrawCmd,
 	} {
 		accountCmd.AddCommand(v)
 	}
 
-	accountInfoCmd.Flags().AddFlagSet(accountInfoFlags)
+	accountInfoCmd.Flags().AddFlagSet(commonAccountFlags)
+	accountNonceCmd.Flags().AddFlagSet(commonAccountFlags)
+	accountValidateAddressCmd.Flags().AddFlagSet(commonAccountFlags)
+	accountValidateAddressCmd.Flags().AddFlagSet(cmdFlags.VerboseFlags)
 	accountTransferCmd.Flags().AddFlagSet(accountTransferFlags)
 	accountBurnCmd.Flags().AddFlagSet(accountBurnFlags)
 	accountEscrowCmd.Flags().AddFlagSet(commonEscrowFlags)
@@ -332,12 +514,14 @@ func registerAccountCmd() {
 	accountReclaimEscrowCmd.Flags().AddFlagSet(commonEscrowFlags)
 	accountReclaimEscrowCmd.Flags().AddFlagSet(sharesFlags)
 	accountAmendCommissionScheduleCmd.Flags().AddFlagSet(commissionScheduleFlags)
+	accountAllowCmd.Flags().AddFlagSet(accountAllowFlags)
+	accountWithdrawCmd.Flags().AddFlagSet(accountWithdrawFlags)
 }
 
 func init() {
-	accountInfoFlags.String(CfgAccountAddr, "", "account address")
-	_ = viper.BindPFlags(accountInfoFlags)
-	accountInfoFlags.AddFlagSet(cmdGrpc.ClientFlags)
+	commonAccountFlags.String(CfgAccountAddr, "", "account address")
+	_ = viper.BindPFlags(commonAccountFlags)
+	commonAccountFlags.AddFlagSet(cmdGrpc.ClientFlags)
 
 	amountFlags.String(CfgAmount, "0", "amount of stake (in base units) for the transaction")
 	_ = viper.BindPFlags(amountFlags)
@@ -374,4 +558,16 @@ func init() {
 	_ = viper.BindPFlags(commissionScheduleFlags)
 	commissionScheduleFlags.AddFlagSet(cmdConsensus.TxFlags)
 	commissionScheduleFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
+
+	accountAllowFlags.String(CfgAllowBeneficiary, "", "allowance beneficiary address")
+	accountAllowFlags.String(CfgAllowAmountChange, "0", "allowance change amount (in base units)")
+	_ = viper.BindPFlags(accountAllowFlags)
+	accountAllowFlags.AddFlagSet(cmdConsensus.TxFlags)
+	accountAllowFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
+
+	accountWithdrawFlags.String(CfgWithdrawSource, "", "withdraw source address")
+	_ = viper.BindPFlags(accountWithdrawFlags)
+	accountWithdrawFlags.AddFlagSet(cmdConsensus.TxFlags)
+	accountWithdrawFlags.AddFlagSet(amountFlags)
+	accountWithdrawFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
 }

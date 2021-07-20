@@ -25,6 +25,7 @@ docker_plugin_default_config: &docker_plugin_default_config
     - "LANG=C.UTF-8"
     - "CARGO_TARGET_DIR=/var/tmp/artifacts"
     - "CARGO_INSTALL_ROOT=/root/.cargo"
+    - "CARGO_INCREMENTAL=0"
     - "GOPROXY=https://proxy.golang.org/"
     - "SLACK_WEBHOOK_URL"
     - "METRICS_PUSH_ADDR"
@@ -51,19 +52,10 @@ steps:
   - label: Build Rust runtime loader
     command:
       - .buildkite/rust/build_generic.sh /workdir -p oasis-core-runtime-loader
-      - .buildkite/rust/build_generic.sh /workdir -p test-long-term-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-enc-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-ops-client
 
       # Upload the built artifacts.
       - cd /var/tmp/artifacts/default/debug
       - buildkite-agent artifact upload oasis-core-runtime-loader
-      # Clients for E2E tests.
-      - buildkite-agent artifact upload test-long-term-client
-      - buildkite-agent artifact upload simple-keyvalue-client
-      - buildkite-agent artifact upload simple-keyvalue-enc-client
-      - buildkite-agent artifact upload simple-keyvalue-ops-client
     plugins:
       <<: *docker_plugin
 
@@ -99,8 +91,7 @@ steps:
       # libp2p logging.
       IPFS_LOGGING: debug
     agents:
-      queue: default-daily
-      buildkite_agent_class: stable
+      daily: true
     # NOTE: we actually don't want to retry, but this is the only way that we
     # can execute the notify step only if tests failed.
     retry:

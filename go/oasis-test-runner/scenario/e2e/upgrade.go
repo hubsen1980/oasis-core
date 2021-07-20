@@ -2,24 +2,28 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"path"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/persistent"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epoch "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 	"github.com/oasisprotocol/oasis-core/go/upgrade/migrations"
 )
 
@@ -28,27 +32,18 @@ var (
 	NodeUpgrade scenario.Scenario = newNodeUpgradeImpl()
 
 	malformedDescriptor = []byte(`{
-		"name": "nifty upgrade",
+		"v": 1,
+		"handler": "nifty upgrade",
+		"target": "not a version",
 		"epoch": 1,
-		"method": "nifty",
-		"identifier": "this is a hash. i repeat. this is a hash, not a string."
 	}`)
 
-	// Warning: this string contains printf conversions, it's NOT directly usable as a descriptor.
-	nonexistentDescriptorTemplate = `{
-		"name": "nonexistent-handler",
-		"epoch": %d,
-		"method": "internal",
-		"identifier": "0000000000000000000000000000000000000000000000000000000000000000"
-	}`
-
-	// Warning: this string contains printf conversions, it's NOT directly usable as a descriptor.
-	validDescriptorTemplate = `{
-		"name": "%v",
-		"epoch": %d,
-		"method": "internal",
-		"identifier": "%v"
-	}`
+	baseDescriptor = upgrade.Descriptor{
+		Versioned: cbor.NewVersioned(upgrade.LatestDescriptorVersion),
+		Handler:   "base",
+		Target:    version.Versions,
+		Epoch:     beacon.EpochTime(1),
+	}
 )
 
 type nodeUpgradeImpl struct {
@@ -60,7 +55,7 @@ type nodeUpgradeImpl struct {
 	nodeCh <-chan *registry.NodeEvent
 
 	ctx          context.Context
-	currentEpoch epoch.EpochTime
+	currentEpoch beacon.EpochTime
 }
 
 func (sc *nodeUpgradeImpl) writeDescriptor(name string, content []byte) (string, error) {
@@ -78,7 +73,12 @@ func (sc *nodeUpgradeImpl) writeDescriptor(name string, content []byte) (string,
 func (sc *nodeUpgradeImpl) nextEpoch() error {
 	sc.currentEpoch++
 	if err := sc.Net.Controller().SetEpoch(sc.ctx, sc.currentEpoch); err != nil {
-		return fmt.Errorf("failed to set epoch to %d: %w", sc.currentEpoch, err)
+		// Errors can happen because an upgrade happens exactly during an epoch transition. So
+		// make sure to ignore them.
+		sc.Logger.Warn("failed to set epoch",
+			"epoch", sc.currentEpoch,
+			"err", err,
+		)
 	}
 	return nil
 }
@@ -128,10 +128,9 @@ func (sc *nodeUpgradeImpl) Fixture() (*oasis.NetworkFixture, error) {
 		return nil, err
 	}
 
-	return &oasis.NetworkFixture{
+	ff := &oasis.NetworkFixture{
 		Network: oasis.NetworkCfg{
-			NodeBinary:    f.Network.NodeBinary,
-			EpochtimeMock: true,
+			NodeBinary: f.Network.NodeBinary,
 			DefaultLogWatcherHandlerFactories: []log.WatcherHandlerFactory{
 				oasis.LogAssertUpgradeStartup(),
 				oasis.LogAssertUpgradeConsensus(),
@@ -142,16 +141,21 @@ func (sc *nodeUpgradeImpl) Fixture() (*oasis.NetworkFixture, error) {
 			{},
 		},
 		Validators: []oasis.ValidatorFixture{
-			{Entity: 1, AllowErrorTermination: true},
+			{Entity: 1, AllowErrorTermination: true, Consensus: oasis.ConsensusFixture{SupplementarySanityInterval: 1}},
 			{Entity: 1, AllowErrorTermination: true},
 			{Entity: 1, AllowErrorTermination: true},
 			{Entity: 1, AllowErrorTermination: true},
 		},
 		Seeds: []oasis.SeedFixture{{}},
-	}, nil
+	}
+
+	ff.Network.SetMockEpoch()
+	ff.Network.SetInsecureBeacon()
+
+	return ff, nil
 }
 
-func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
+func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	var err error
 	var descPath string
 
@@ -191,6 +195,12 @@ func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
 		return err
 	}
 
+	// Fetch initial consensus parameters.
+	initialParams, err := sc.Net.Controller().Consensus.GetParameters(sc.ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("can't get consensus parameters: %w", err)
+	}
+
 	// Try submitting an invalid update descriptor.
 	// This should return immediately and the node should still be running.
 	sc.Logger.Info("submitting invalid upgrade descriptor")
@@ -205,8 +215,15 @@ func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
 	// Try submitting a well formed descriptor but with an off hash, so no handlers are run.
 	// The node should exit immediately.
 	sc.Logger.Info("submitting descriptor with nonexistent upgrade handler")
-	nonexistentDescriptor := fmt.Sprintf(nonexistentDescriptorTemplate, sc.currentEpoch+1)
-	if descPath, err = sc.writeDescriptor("nonexistent", []byte(nonexistentDescriptor)); err != nil {
+	nonExistingDescriptor := baseDescriptor
+	nonExistingDescriptor.Handler = "nonexistent"
+	nonExistingDescriptor.Epoch = sc.currentEpoch + 1
+
+	desc, err := json.Marshal(nonExistingDescriptor)
+	if err != nil {
+		return fmt.Errorf("json.Marshal(nonExistingDescriptor): %w", err)
+	}
+	if descPath, err = sc.writeDescriptor("nonexistent", desc); err != nil {
 		return err
 	}
 
@@ -228,6 +245,17 @@ func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
 	}
 	<-sc.validator.Exit()
 
+	// Verify that the node exported a genesis file before halting for upgrade.
+	sc.Logger.Info("gathering exported genesis files")
+	dumpGlobPath := filepath.Join(sc.validator.ExportsPath(), "genesis-*.json")
+	globMatch, err := filepath.Glob(dumpGlobPath)
+	if err != nil {
+		return fmt.Errorf("glob failed: %s: %w", dumpGlobPath, err)
+	}
+	if len(globMatch) == 0 {
+		return fmt.Errorf("no exported genesis files found in: %s", dumpGlobPath)
+	}
+
 	// Remove the stored descriptor so we can restart and submit a proper one.
 	sc.Logger.Info("clearing stored upgrade descriptor")
 	store, err := persistent.NewCommonStore(sc.validator.DataDir())
@@ -239,25 +267,22 @@ func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
 		store.Close()
 		return fmt.Errorf("can't open upgraded node's upgrade module storage: %w", err)
 	}
-	if err = svcStore.Delete([]byte("descriptor")); err != nil {
+	if err = svcStore.Delete([]byte("descriptors")); err != nil {
 		svcStore.Close()
 		store.Close()
-		return fmt.Errorf("can't delete descripotor from upgraded node's persistent store: %w", err)
+		return fmt.Errorf("can't delete descriptor from upgraded node's persistent store: %w", err)
 	}
 	svcStore.Close()
 	store.Close()
 
-	// Generate a valid upgrade descriptor; this should exercise the test handlers in the node.
-	var nodeHash hash.Hash
-	nodeText, err := ioutil.ReadFile(sc.Net.Validators()[0].BinaryPath())
+	validDescriptor := baseDescriptor
+	validDescriptor.Handler = migrations.DummyUpgradeHandler
+	validDescriptor.Epoch = sc.currentEpoch + 1
+	desc, err = json.Marshal(validDescriptor)
 	if err != nil {
-		return fmt.Errorf("can't read node binary for hashing: %w", err)
+		return fmt.Errorf("json.Marshal(validDescriptor): %w", err)
 	}
-	nodeHash.FromBytes(nodeText)
-
-	validDescriptor := fmt.Sprintf(validDescriptorTemplate, migrations.DummyUpgradeName, sc.currentEpoch+1, nodeHash.String())
-
-	if descPath, err = sc.writeDescriptor("valid", []byte(validDescriptor)); err != nil {
+	if descPath, err = sc.writeDescriptor("valid", desc); err != nil {
 		return err
 	}
 
@@ -318,6 +343,18 @@ func (sc *nodeUpgradeImpl) Run(childEnv *env.Env) error {
 	_, err = sc.Net.Controller().Registry.GetEntity(sc.ctx, idQuery)
 	if err != nil {
 		return fmt.Errorf("can't get registered test entity: %w", err)
+	}
+
+	// Check updated consensus parameters.
+	newParams, err := sc.Net.Controller().Consensus.GetParameters(sc.ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("can't get consensus parameters: %w", err)
+	}
+	if newParams.Parameters.MaxTxSize != initialParams.Parameters.MaxTxSize+1 {
+		return fmt.Errorf("consensus parameter MaxTxSize not updated correctly (expected: %d actual: %d)",
+			initialParams.Parameters.MaxTxSize+1,
+			newParams.Parameters.MaxTxSize,
+		)
 	}
 
 	return sc.finishWithoutChild()

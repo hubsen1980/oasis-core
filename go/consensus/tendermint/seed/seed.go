@@ -28,14 +28,15 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	tmcommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	cmflags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
 
@@ -130,9 +131,9 @@ func (srv *seedService) SupportedFeatures() consensus.FeatureMask {
 // Implements Backend.
 func (srv *seedService) GetStatus(ctx context.Context) (*consensus.Status, error) {
 	status := &consensus.Status{
-		ConsensusVersion: version.ConsensusProtocol.String(),
-		Backend:          api.BackendName,
-		Features:         srv.SupportedFeatures(),
+		Version:  version.ConsensusProtocol,
+		Backend:  api.BackendName,
+		Features: srv.SupportedFeatures(),
 	}
 
 	// List of consensus peers.
@@ -153,6 +154,11 @@ func (srv *seedService) GetGenesisDocument(ctx context.Context) (*genesis.Docume
 }
 
 // Implements Backend.
+func (srv *seedService) GetChainContext(ctx context.Context) (string, error) {
+	return srv.doc.ChainContext(), nil
+}
+
+// Implements Backend.
 func (srv *seedService) GetAddresses() ([]node.ConsensusAddress, error) {
 	u, err := tmcommon.GetExternalAddress()
 	if err != nil {
@@ -166,6 +172,11 @@ func (srv *seedService) GetAddresses() ([]node.ConsensusAddress, error) {
 	addr.ID = srv.identity.P2PSigner.Public()
 
 	return []node.ConsensusAddress{addr}, nil
+}
+
+// Implements Backend.
+func (srv *seedService) Checkpointer() checkpoint.Checkpointer {
+	return nil
 }
 
 // Implements Backend.
@@ -185,16 +196,6 @@ func (srv *seedService) StateToGenesis(ctx context.Context, height int64) (*gene
 
 // Implements Backend.
 func (srv *seedService) EstimateGas(ctx context.Context, req *consensus.EstimateGasRequest) (transaction.Gas, error) {
-	return 0, consensus.ErrUnsupported
-}
-
-// Implements Backend.
-func (srv *seedService) WaitEpoch(ctx context.Context, epoch epochtime.EpochTime) error {
-	return consensus.ErrUnsupported
-}
-
-// Implements Backend.
-func (srv *seedService) GetEpoch(ctx context.Context, height int64) (epochtime.EpochTime, error) {
 	return 0, consensus.ErrUnsupported
 }
 
@@ -254,16 +255,13 @@ func (srv *seedService) SubmitTxNoWait(ctx context.Context, tx *transaction.Sign
 }
 
 // Implements Backend.
-func (srv *seedService) RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime)) {
+func (srv *seedService) RegisterHaltHook(consensus.HaltHook) {
 	panic(consensus.ErrUnsupported)
 }
 
 // Note: SupportedFeatures() indicates that the backend does not support
 // consensus services so the caller is at fault for not adhering to the
 // SupportedFeatures flag, in case any of the following methods is called.
-func (srv *seedService) EpochTime() epochtime.Backend {
-	panic(consensus.ErrUnsupported)
-}
 
 // Implements Backend.
 func (srv *seedService) Beacon() beacon.Backend {
@@ -292,6 +290,11 @@ func (srv *seedService) Staking() staking.Backend {
 
 // Implements Backend.
 func (srv *seedService) Scheduler() scheduler.Backend {
+	panic(consensus.ErrUnsupported)
+}
+
+// Implements Backend.
+func (srv *seedService) Governance() governance.Backend {
 	panic(consensus.ErrUnsupported)
 }
 

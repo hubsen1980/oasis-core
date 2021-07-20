@@ -62,10 +62,9 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 		return nil, err
 	}
 
-	return &oasis.NetworkFixture{
+	ff := &oasis.NetworkFixture{
 		Network: oasis.NetworkCfg{
-			NodeBinary:    f.Network.NodeBinary,
-			EpochtimeMock: true,
+			NodeBinary: f.Network.NodeBinary,
 			StakingGenesis: &staking.Genesis{
 				Parameters: staking.ConsensusParameters{
 					DebondingInterval: 1,
@@ -83,7 +82,7 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 				CommonPool:    *quantity.NewFromUint64(150),
 				LastBlockFees: *quantity.NewFromUint64(50),
 				Ledger: map[staking.Address]*staking.Account{
-					EntityAccount: {
+					TestEntityAccount: {
 						General: staking.GeneralAccount{
 							Balance: *quantity.NewFromUint64(1000),
 						},
@@ -107,12 +106,17 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 		Validators: []oasis.ValidatorFixture{
 			// Create three validators, each with its own entity so we can test
 			// if gas disbursement works correctly.
-			{Entity: 1, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{MinGasPrice: 1, SupplementarySanityInterval: 1}},
 			{Entity: 2, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
 			{Entity: 3, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
 		},
 		Seeds: []oasis.SeedFixture{{}},
-	}, nil
+	}
+
+	ff.Network.SetMockEpoch()
+	ff.Network.SetInsecureBeacon()
+
+	return ff, nil
 }
 
 func (sc *gasFeesImpl) Run(childEnv *env.Env) error {
@@ -128,7 +132,7 @@ func (sc *gasFeesImpl) Run(childEnv *env.Env) error {
 		if err != nil {
 			return err
 		}
-		if err := sc.DumpRestoreNetwork(childEnv, fixture, false); err != nil {
+		if err := sc.DumpRestoreNetwork(childEnv, fixture, false, nil); err != nil {
 			return err
 		}
 		if err := sc.runTests(ctx); err != nil {

@@ -1,6 +1,6 @@
 //! Runtime side of the worker-host protocol.
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{BufReader, BufWriter, Read, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -12,16 +12,16 @@ use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crossbeam::channel;
 use io_context::Context;
-use slog::Logger;
+use slog::{error, info, warn, Logger};
 use thiserror::Error;
 
 use crate::{
-    common::{cbor, logger::get_logger, runtime::RuntimeId, version::Version},
+    common::{logger::get_logger, namespace::Namespace, version::Version},
+    consensus::tendermint,
     dispatcher::Dispatcher,
     rak::RAK,
     storage::KeyValue,
-    tracing,
-    types::{Body, Message, MessageType},
+    types::{Body, Error, Message, MessageType},
     BUILD_INFO,
 };
 
@@ -44,8 +44,28 @@ pub enum ProtocolError {
     #[error("attestation required")]
     #[allow(unused)]
     AttestationRequired,
-    #[error("runtime id not set")]
-    RuntimeIDNotSet,
+    #[error("host environment information not configured")]
+    HostInfoNotConfigured,
+    #[error("incompatible consensus backend")]
+    IncompatibleConsensusBackend,
+}
+
+/// Information about the host environment.
+#[derive(Debug, Clone)]
+pub struct HostInfo {
+    /// Assigned runtime identifier of the loaded runtime.
+    pub runtime_id: Namespace,
+    /// Name of the consensus backend that is in use for the consensus layer.
+    pub consensus_backend: String,
+    /// Consensus protocol version that is in use for the consensus layer.
+    pub consensus_protocol_version: Version,
+    /// Consensus layer chain domain separation context.
+    pub consensus_chain_context: String,
+    /// Node-local runtime configuration.
+    ///
+    /// This configuration must not be used in any context which requires determinism across
+    /// replicated runtime instances.
+    pub local_config: BTreeMap<String, cbor::Value>,
 }
 
 /// Runtime part of the runtime host protocol.
@@ -65,10 +85,10 @@ pub struct Protocol {
     last_request_id: AtomicUsize,
     /// Pending outgoing requests.
     pending_out_requests: Mutex<HashMap<u64, channel::Sender<Body>>>,
-    /// Runtime identifier.
-    runtime_id: Mutex<Option<RuntimeId>>,
     /// Runtime version.
     runtime_version: Version,
+    /// Host environment information.
+    host_info: Mutex<Option<HostInfo>>,
 }
 
 impl Protocol {
@@ -89,21 +109,37 @@ impl Protocol {
             stream,
             last_request_id: AtomicUsize::new(0),
             pending_out_requests: Mutex::new(HashMap::new()),
-            runtime_id: Mutex::new(None),
             runtime_version: runtime_version,
+            host_info: Mutex::new(None),
         }
     }
 
-    /// Return the runtime identifier for this worker.
+    /// The runtime identifier for this instance.
     ///
     /// # Panics
     ///
-    /// Panics, if the runtime identifier is not set.
-    pub fn get_runtime_id(self: &Protocol) -> RuntimeId {
-        self.runtime_id
+    /// Panics, if the host environment information is not set.
+    pub fn get_runtime_id(self: &Protocol) -> Namespace {
+        self.host_info
             .lock()
             .unwrap()
-            .expect("runtime_id should be set")
+            .as_ref()
+            .expect("host environment information should be set")
+            .runtime_id
+    }
+
+    /// The host environment information for this instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics, if the host environment information is not set.
+    pub fn get_host_info(self: &Protocol) -> HostInfo {
+        self.host_info
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("host environment information should be set")
+            .clone()
     }
 
     /// Start the protocol handler loop.
@@ -125,13 +161,11 @@ impl Protocol {
     }
 
     /// Make a new request to the worker host and wait for the response.
-    pub fn make_request(&self, ctx: Context, body: Body) -> Result<Body> {
+    pub fn make_request(&self, _ctx: Context, body: Body) -> Result<Body> {
         let id = self.last_request_id.fetch_add(1, Ordering::SeqCst) as u64;
-        let span_context = tracing::get_span_context(&ctx).unwrap_or(&vec![]).clone();
         let message = Message {
             id,
             body,
-            span_context,
             message_type: MessageType::Request,
         };
 
@@ -146,7 +180,7 @@ impl Protocol {
         self.encode_message(message)?;
 
         match rx.recv()? {
-            Body::Error { message, .. } => Err(anyhow!("{}", message)),
+            Body::Error(Error { message, .. }) => Err(anyhow!("{}", message)),
             body => Ok(body),
         }
     }
@@ -156,7 +190,6 @@ impl Protocol {
         self.encode_message(Message {
             id,
             body,
-            span_context: vec![],
             message_type: MessageType::Response,
         })
     }
@@ -178,7 +211,7 @@ impl Protocol {
         let _guard = self.outgoing_mutex.lock().unwrap();
         let mut writer = BufWriter::new(&self.stream);
 
-        let buffer = cbor::to_vec(&message);
+        let buffer = cbor::to_vec(message);
         if buffer.len() > MAX_MESSAGE_SIZE {
             return Err(ProtocolError::MessageTooLarge.into());
         }
@@ -196,8 +229,7 @@ impl Protocol {
             MessageType::Request => {
                 // Incoming request.
                 let id = message.id;
-                let mut ctx = Context::background();
-                tracing::add_span_context(&mut ctx, message.span_context);
+                let ctx = Context::background();
 
                 let body = match self.handle_request(ctx, id, message.body) {
                     Ok(Some(result)) => result,
@@ -206,11 +238,9 @@ impl Protocol {
                         // is no need to do anything more.
                         return Ok(());
                     }
-                    Err(error) => Body::Error {
-                        module: "".to_owned(), // XXX: Error codes.
-                        code: 0,               // XXX: Error codes.
-                        message: format!("{}", error),
-                    },
+                    Err(error) => {
+                        Body::Error(Error::new("rhp/dispatcher", 1, &format!("{}", error)))
+                    }
                 };
 
                 // Send response back.
@@ -218,7 +248,6 @@ impl Protocol {
                     id,
                     message_type: MessageType::Response,
                     body,
-                    span_context: vec![],
                 })?;
             }
             MessageType::Response => {
@@ -252,15 +281,45 @@ impl Protocol {
         request: Body,
     ) -> Result<Option<Body>> {
         match request {
-            Body::RuntimeInfoRequest { runtime_id } => {
-                // Store the passed Runtime ID.
-                *self.runtime_id.lock().unwrap() = Some(runtime_id);
+            Body::RuntimeInfoRequest {
+                runtime_id,
+                consensus_backend,
+                consensus_protocol_version,
+                consensus_chain_context,
+                local_config,
+            } => {
+                info!(self.logger, "Received host environment information";
+                    "runtime_id" => ?runtime_id,
+                    "consensus_backend" => &consensus_backend,
+                    "consensus_protocol_version" => ?consensus_protocol_version,
+                    "consensus_chain_context" => &consensus_chain_context,
+                    "local_config" => ?local_config,
+                );
+
+                if tendermint::BACKEND_NAME != &consensus_backend {
+                    return Err(ProtocolError::IncompatibleConsensusBackend.into());
+                }
+                if !BUILD_INFO
+                    .consensus_version
+                    .is_compatible_with(&consensus_protocol_version)
+                {
+                    return Err(ProtocolError::IncompatibleConsensusBackend.into());
+                }
+
+                // Configure the host environment info.
+                *self.host_info.lock().unwrap() = Some(HostInfo {
+                    runtime_id,
+                    consensus_backend,
+                    consensus_protocol_version,
+                    consensus_chain_context,
+                    local_config,
+                });
 
                 self.dispatcher.start(self.clone());
 
                 Ok(Some(Body::RuntimeInfoResponse {
-                    protocol_version: BUILD_INFO.protocol_version.into(),
-                    runtime_version: self.runtime_version.into(),
+                    protocol_version: BUILD_INFO.protocol_version,
+                    runtime_version: self.runtime_version,
                 }))
             }
             Body::RuntimePingRequest {} => Ok(Some(Body::Empty {})),
@@ -334,6 +393,11 @@ impl Protocol {
                 self.dispatcher.queue_request(ctx, id, req)?;
                 Ok(None)
             }
+            req @ Body::RuntimeQueryRequest { .. } => {
+                self.can_handle_runtime_requests()?;
+                self.dispatcher.queue_request(ctx, id, req)?;
+                Ok(None)
+            }
             req => {
                 warn!(self.logger, "Received unsupported request"; "req" => format!("{:?}", req));
                 Err(ProtocolError::MethodNotSupported.into())
@@ -342,8 +406,8 @@ impl Protocol {
     }
 
     fn can_handle_runtime_requests(&self) -> Result<()> {
-        if self.runtime_id.lock().unwrap().is_none() {
-            return Err(ProtocolError::RuntimeIDNotSet.into());
+        if self.host_info.lock().unwrap().is_none() {
+            return Err(ProtocolError::HostInfoNotConfigured.into());
         }
 
         #[cfg(target_env = "sgx")]

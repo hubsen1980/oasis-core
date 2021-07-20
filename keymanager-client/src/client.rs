@@ -5,17 +5,14 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::Result;
-use futures::{future, prelude::*};
-#[cfg(not(target_env = "sgx"))]
-use grpcio::Channel;
+use futures::future::{self, BoxFuture};
 use io_context::Context;
 use lru::LruCache;
 
-use oasis_core_client::{create_rpc_api_client, BoxFuture, RpcClient};
+use oasis_core_client::RpcClient;
 use oasis_core_keymanager_api_common::*;
 use oasis_core_runtime::{
-    common::{cbor, runtime::RuntimeId, sgx::avr::EnclaveIdentity},
+    common::{namespace::Namespace, sgx::avr::EnclaveIdentity},
     enclave_rpc::session,
     protocol::Protocol,
     rak::RAK,
@@ -23,18 +20,14 @@ use oasis_core_runtime::{
 
 use super::KeyManagerClient;
 
-with_api! {
-    create_rpc_api_client!(Client, api);
-}
-
 /// Key manager RPC endpoint.
 const KEY_MANAGER_ENDPOINT: &'static str = "key-manager";
 
 struct Inner {
-    /// Runtime Id for which we are going to request keys.
-    runtime_id: RuntimeId,
+    /// Runtime identifier for which we are going to request keys.
+    runtime_id: Namespace,
     /// RPC client.
-    rpc_client: Client,
+    rpc_client: RpcClient,
     /// Local cache for the get_or_create_keys KeyManager endpoint.
     get_or_create_secret_keys_cache: RwLock<LruCache<KeyPairId, KeyPair>>,
     /// Local cache for the get_public_key KeyManager endpoint.
@@ -47,11 +40,11 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    fn new(runtime_id: RuntimeId, client: RpcClient, keys_cache_sizes: usize) -> Self {
+    fn new(runtime_id: Namespace, rpc_client: RpcClient, keys_cache_sizes: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
                 runtime_id,
-                rpc_client: Client::new(client),
+                rpc_client,
                 get_or_create_secret_keys_cache: RwLock::new(LruCache::new(keys_cache_sizes)),
                 get_public_key_cache: RwLock::new(LruCache::new(keys_cache_sizes)),
             }),
@@ -61,7 +54,7 @@ impl RemoteClient {
     /// Create a new key manager client with runtime-internal transport and explicit key manager
     /// enclave identities.
     pub fn new_runtime_with_enclave_identities(
-        runtime_id: RuntimeId,
+        runtime_id: Namespace,
         enclaves: Option<HashSet<EnclaveIdentity>>,
         protocol: Arc<Protocol>,
         rak: Arc<RAK>,
@@ -87,7 +80,7 @@ impl RemoteClient {
     /// method. In case of sgx, the session establishment will fail until the
     /// initial policies will be updated.
     pub fn new_runtime(
-        runtime_id: RuntimeId,
+        runtime_id: Namespace,
         protocol: Arc<Protocol>,
         rak: Arc<RAK>,
         keys_cache_sizes: usize,
@@ -113,34 +106,14 @@ impl RemoteClient {
         )
     }
 
-    /// Create a new key manager client with gRPC transport.
-    #[cfg(not(target_env = "sgx"))]
-    pub fn new_grpc(
-        runtime_id: RuntimeId,
-        enclaves: Option<HashSet<EnclaveIdentity>>,
-        channel: Channel,
-        keys_cache_sizes: usize,
-    ) -> Self {
-        Self::new(
-            runtime_id,
-            RpcClient::new_grpc(
-                session::Builder::new().remote_enclaves(enclaves),
-                channel,
-                runtime_id,
-                KEY_MANAGER_ENDPOINT,
-            ),
-            keys_cache_sizes,
-        )
-    }
-
     /// Set client allowed enclaves from key manager policy.
-    pub fn set_policy(&self, signed_policy_raw: Vec<u8>) -> Result<()> {
-        let untrusted_policy: SignedPolicySGX = cbor::from_slice(&signed_policy_raw)?;
+    pub fn set_policy(&self, signed_policy_raw: Vec<u8>) -> Result<(), KeyManagerError> {
+        let untrusted_policy: SignedPolicySGX =
+            cbor::from_slice(&signed_policy_raw).map_err(|_| KeyManagerError::PolicyInvalid)?;
         let policy = untrusted_policy.verify()?;
-        let client = &self.inner.rpc_client.rpc_client;
         let policies: HashSet<EnclaveIdentity> =
             HashSet::from_iter(policy.enclaves.keys().cloned());
-        client.update_enclaves(Some(policies));
+        self.inner.rpc_client.update_enclaves(Some(policies));
         Ok(())
     }
 }
@@ -158,61 +131,85 @@ impl KeyManagerClient for RemoteClient {
         drop(cache);
     }
 
-    fn get_or_create_keys(&self, ctx: Context, key_pair_id: KeyPairId) -> BoxFuture<KeyPair> {
+    fn get_or_create_keys(
+        &self,
+        ctx: Context,
+        key_pair_id: KeyPairId,
+    ) -> BoxFuture<Result<KeyPair, KeyManagerError>> {
         let mut cache = self.inner.get_or_create_secret_keys_cache.write().unwrap();
         if let Some(keys) = cache.get(&key_pair_id) {
-            return Box::new(future::ok(keys.clone()));
+            return Box::pin(future::ok(keys.clone()));
         }
 
         // No entry in cache, fetch from key manager.
         let inner = self.inner.clone();
-        Box::new(
-            self.inner
+        Box::pin(async move {
+            let keys: KeyPair = inner
                 .rpc_client
-                .get_or_create_keys(ctx, RequestIds::new(inner.runtime_id, key_pair_id))
-                .and_then(move |keys| {
-                    let mut cache = inner.get_or_create_secret_keys_cache.write().unwrap();
-                    cache.put(key_pair_id, keys.clone());
+                .call(
+                    ctx,
+                    METHOD_GET_OR_CREATE_KEYS,
+                    RequestIds::new(inner.runtime_id, key_pair_id),
+                )
+                .await
+                .map_err(|err| KeyManagerError::Other(err.into()))?;
 
-                    Ok(keys)
-                }),
-        )
+            // Cache key.
+            let mut cache = inner.get_or_create_secret_keys_cache.write().unwrap();
+            cache.put(key_pair_id, keys.clone());
+
+            Ok(keys)
+        })
     }
 
     fn get_public_key(
         &self,
         ctx: Context,
         key_pair_id: KeyPairId,
-    ) -> BoxFuture<Option<SignedPublicKey>> {
+    ) -> BoxFuture<Result<Option<SignedPublicKey>, KeyManagerError>> {
         let mut cache = self.inner.get_public_key_cache.write().unwrap();
         if let Some(key) = cache.get(&key_pair_id) {
-            return Box::new(future::ok(Some(key.clone())));
+            return Box::pin(future::ok(Some(key.clone())));
         }
 
         // No entry in cache, fetch from key manager.
         let inner = self.inner.clone();
-        Box::new(
-            self.inner
+        Box::pin(async move {
+            let key: Option<SignedPublicKey> = inner
                 .rpc_client
-                .get_public_key(ctx, RequestIds::new(inner.runtime_id, key_pair_id))
-                .and_then(move |key| match key {
-                    Some(key) => {
-                        let mut cache = inner.get_public_key_cache.write().unwrap();
-                        cache.put(key_pair_id, key.clone());
+                .call(
+                    ctx,
+                    METHOD_GET_PUBLIC_KEY,
+                    RequestIds::new(inner.runtime_id, key_pair_id),
+                )
+                .await
+                .map_err(|err| KeyManagerError::Other(err.into()))?;
 
-                        Ok(Some(key))
-                    }
-                    None => Ok(None),
-                }),
-        )
+            match key {
+                Some(key) => {
+                    // Cache key.
+                    let mut cache = inner.get_public_key_cache.write().unwrap();
+                    cache.put(key_pair_id, key.clone());
+
+                    Ok(Some(key))
+                }
+                None => Ok(None),
+            }
+        })
     }
 
-    fn replicate_master_secret(&self, ctx: Context) -> BoxFuture<Option<MasterSecret>> {
-        Box::new(
-            self.inner
+    fn replicate_master_secret(
+        &self,
+        ctx: Context,
+    ) -> BoxFuture<Result<Option<MasterSecret>, KeyManagerError>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let rsp: ReplicateResponse = inner
                 .rpc_client
-                .replicate_master_secret(ctx, ReplicateRequest {})
-                .and_then(move |rsp| Ok(Some(rsp.master_secret))),
-        )
+                .call(ctx, METHOD_REPLICATE_MASTER_SECRET, ReplicateRequest {})
+                .await
+                .map_err(|err| KeyManagerError::Other(err.into()))?;
+            Ok(Some(rsp.master_secret))
+        })
     }
 }

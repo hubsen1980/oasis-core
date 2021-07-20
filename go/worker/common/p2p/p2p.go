@@ -117,7 +117,7 @@ func (p *P2P) Publish(ctx context.Context, runtimeID common.Namespace, msg *Mess
 		return
 	}
 
-	if err := h.topic.Publish(h.ctx, rawMsg); err != nil {
+	if err := h.tryPublishing(rawMsg); err != nil {
 		h.logger.Error("failed to publish message to the network",
 			"err", err,
 		)
@@ -141,7 +141,11 @@ func (p *P2P) RegisterHandler(runtimeID common.Namespace, handler Handler) {
 			panic(fmt.Sprintf("worker/common/p2p: failed to initialize topic handler: %s", err))
 		}
 		p.topics[runtimeID] = h
-		_ = p.pubsub.RegisterTopicValidator(topicID, h.topicMessageValidator)
+		_ = p.pubsub.RegisterTopicValidator(
+			topicID,
+			h.topicMessageValidator,
+			pubsub.WithValidatorConcurrency(viper.GetInt(CfgP2PValidateConcurrency)),
+		)
 	default:
 		topic.handlersLock.Lock()
 		defer topic.handlersLock.Unlock()
@@ -213,6 +217,7 @@ func New(ctx context.Context, identity *identity.Identity, consensus consensus.B
 		pubsub.WithFloodPublish(true),
 		pubsub.WithPeerOutboundQueueSize(viper.GetInt(CfgP2PPeerOutboundQueueSize)),
 		pubsub.WithValidateQueueSize(viper.GetInt(CfgP2PValidateQueueSize)),
+		pubsub.WithValidateThrottle(viper.GetInt(CfgP2PValidateThrottle)),
 		pubsub.WithMessageIdFn(func(pmsg *pb.Message) string {
 			h := hash.NewFromBytes(pmsg.Data)
 			return string(h[:])

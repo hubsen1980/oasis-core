@@ -12,6 +12,15 @@ on:
   schedule:
     - cron: "0 0 * * *"
 
+# Global environment variables.
+env:
+  CURL_CMD: curl --proto =https --tlsv1.2 --location --silent --show-error --fail
+  GORELEASER_URL_PREFIX: https://github.com/goreleaser/goreleaser/releases/download/
+  GORELEASER_VERSION: 0.152.0
+  JEMALLOC_URL_PREFIX: https://github.com/jemalloc/jemalloc/releases/download/
+  JEMALLOC_VERSION: 5.2.1
+  JEMALLOC_CHECKSUM: 34330e5ce276099e2e8950d9335db5a875689a4c6a56751ef3b1d8c537f887f6
+
 jobs:
 
   build-code:
@@ -33,16 +42,33 @@ jobs:
           # Copy rust-toolchain file as it gets checked out into a subdir which is not
           # supported by actions-rs/toolchain.
           cp build${{ matrix.build_number }}/rust-toolchain .
-      - name: Set up Go 1.15
+      - name: Set up Go 1.16
         uses: actions/setup-go@v2.1.3
         with:
-          go-version: "1.15.x"
+          go-version: "1.16.x"
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
       - name: Install Oasis Node prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install make libseccomp-dev protobuf-compiler
+      - name: Install jemalloc
+        run: |
+          cd $(mktemp --directory /tmp/jemalloc.XXXXX)
+          ${CURL_CMD} ${JEMALLOC_URL_PREFIX}/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2 \
+            --output ${JEMALLOC_TARBALL}
+          echo "${JEMALLOC_CHECKSUM} ${JEMALLOC_TARBALL}" | sha256sum --check
+          tar -xf ${JEMALLOC_TARBALL}
+          cd jemalloc-${JEMALLOC_VERSION}
+          # Ensure reproducible jemalloc build.
+          # https://reproducible-builds.org/docs/build-path/
+          EXTRA_CXXFLAGS=-ffile-prefix-map=$(pwd -L)=. \
+            EXTRA_CFLAGS=-ffile-prefix-map=$(pwd -L)=. \
+            ./configure --with-jemalloc-prefix='je_' --with-malloc-conf='background_thread:true,metadata_thp:auto'
+          make
+          sudo make install
+        env:
+          JEMALLOC_TARBALL: jemalloc.tar.bz2
       - name: Install GoReleaser
         run: |
           cd $(mktemp --directory /tmp/goreleaser.XXXXX)
@@ -54,10 +80,7 @@ jobs:
           tar -xf ${GORELEASER_TARBALL}
           sudo mv goreleaser /usr/local/bin
         env:
-          GORELEASER_URL_PREFIX: https://github.com/goreleaser/goreleaser/releases/download/
-          GORELEASER_VERSION: 0.143.0
           GORELEASER_TARBALL: goreleaser_Linux_x86_64.tar.gz
-          CURL_CMD: curl --proto =https --tlsv1.2 -sSL
       - name: Build Oasis Node with Make
         run: |
           cd build${{ matrix.build_number }}/go
@@ -74,7 +97,7 @@ jobs:
           OASIS_NODE_MAKE_PATH: go/oasis-node/oasis-node
           OASIS_NODE_GORELEASER_PATH: dist/oasis-node_linux_amd64/oasis-node
       - name: Upload checksums
-        uses: actions/upload-artifact@v2.2.0
+        uses: actions/upload-artifact@v2.2.4
         with:
           name: oasis-node-SHA256SUMs-build${{ matrix.build_number }}
           path: oasis-node-SHA256SUMs
@@ -87,12 +110,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download checksums for build 1
-        uses: actions/download-artifact@v2.0.5
+        uses: actions/download-artifact@v2.0.10
         with:
           name: oasis-node-SHA256SUMs-build1
           path: oasis-node-SHA256SUMs-build1
       - name: Download checksum for build 2
-        uses: actions/download-artifact@v2.0.5
+        uses: actions/download-artifact@v2.0.10
         with:
           name: oasis-node-SHA256SUMs-build2
           path: oasis-node-SHA256SUMs-build2

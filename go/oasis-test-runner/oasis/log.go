@@ -65,6 +65,12 @@ func LogAssertPeerExchangeDisabled() log.WatcherHandlerFactory {
 	return LogAssertEvent(tendermint.LogEventPeerExchangeDisabled, "peer exchange not disabled")
 }
 
+// LogAssertUpgradeIncompatibleBinary returns a handler which checks whether the binary was deemed
+// incompatible with the upgrade based on JSON log output.
+func LogAssertUpgradeIncompatibleBinary() log.WatcherHandlerFactory {
+	return LogAssertEvent(upgrade.LogEventIncompatibleBinary, "expected binary to be incompatible")
+}
+
 // LogAssertUpgradeStartup returns a handler which checks whether a startup migration
 // handler was run based on JSON log output.
 func LogAssertUpgradeStartup() log.WatcherHandlerFactory {
@@ -75,6 +81,18 @@ func LogAssertUpgradeStartup() log.WatcherHandlerFactory {
 // handler was run based on JSON log output.
 func LogAssertUpgradeConsensus() log.WatcherHandlerFactory {
 	return LogAssertEvent(upgrade.LogEventConsensusUpgrade, "expected consensus upgrade did not run")
+}
+
+// LogAssertNoUpgradeStartup returns a handler which checks that no startup migration
+// handler was run based on JSON log output.
+func LogAssertNoUpgradeStartup() log.WatcherHandlerFactory {
+	return LogAssertNotEvent(upgrade.LogEventStartupUpgrade, "unexpected startup upgrade was run")
+}
+
+// LogAssertNoUpgradeConsensus returns a handler which checks that no consensus migration
+// handler was run based on JSON log output.
+func LogAssertNoUpgradeConsensus() log.WatcherHandlerFactory {
+	return LogAssertNotEvent(upgrade.LogEventConsensusUpgrade, "unexpected consensus upgrade was run")
 }
 
 // LogEventABCIPruneDelete returns a handler which checks whether a ABCI pruning delete

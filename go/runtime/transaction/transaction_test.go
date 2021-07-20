@@ -15,9 +15,10 @@ import (
 
 func TestTransaction(t *testing.T) {
 	ctx := context.Background()
-	store := mkvs.New(nil, nil)
+	store := mkvs.New(nil, nil, node.RootTypeState)
 
 	var emptyRoot node.Root
+	emptyRoot.Type = node.RootTypeState
 	emptyRoot.Empty()
 
 	tree := NewTree(store, emptyRoot)
@@ -135,7 +136,7 @@ func TestTransaction(t *testing.T) {
 	// NOTE: This root is synced with tests in runtime/src/transaction/tree.rs.
 	writeLog, rootHash, err := tree.Commit(ctx)
 	require.NoError(t, err, "Commit")
-	require.EqualValues(t, "c65f4e8bd5314c26f245337a859ad244f4b1544acf60ef334cf0d0eadb47363b", rootHash.String(), "transaction root should be stable")
+	require.EqualValues(t, "8399ffa753987b00ec6ab251337c6b88e40812662ed345468fcbf1dbdd16321c", rootHash.String(), "transaction root should be stable")
 
 	// Apply write log to tree and check if everything is still there.
 	err = store.ApplyWriteLog(ctx, writelog.NewStaticIterator(writeLog))
@@ -144,7 +145,7 @@ func TestTransaction(t *testing.T) {
 	require.NoError(t, err, "Commit")
 	require.EqualValues(t, rootHash, storeRootHash)
 
-	tree = NewTree(store, node.Root{Hash: storeRootHash})
+	tree = NewTree(store, node.Root{Type: node.RootTypeState, Hash: storeRootHash})
 	txns, err = tree.GetTransactions(ctx)
 	require.NoError(t, err, "GetTransactions")
 	require.Len(t, txns, len(testTxns)+1, "there should be some transactions")
@@ -162,7 +163,7 @@ func TestTransaction(t *testing.T) {
 
 func TestTransactionInvalidBatchOrder(t *testing.T) {
 	ctx := context.Background()
-	store := mkvs.New(nil, nil)
+	store := mkvs.New(nil, nil, node.RootTypeState)
 
 	var emptyRoot node.Root
 	emptyRoot.Empty()
@@ -179,4 +180,82 @@ func TestTransactionInvalidBatchOrder(t *testing.T) {
 
 	_, err = tree.GetInputBatch(ctx, 0, 0)
 	require.Error(t, err, "GetInputBatch should fail with inconsistent order")
+}
+
+func TestIOWriteLogValidation(t *testing.T) {
+	var (
+		err  error
+		hash hash.Hash
+	)
+
+	hash.Empty()
+
+	// Test garbage first.
+	err = ValidateIOWriteLog(
+		writelog.WriteLog{
+			{Key: []byte("malformed key"), Value: []byte("some value")},
+		},
+		1024,
+		1024,
+	)
+	require.EqualError(t, err, "transaction: invalid key format")
+
+	garbledArtifact := txnKeyFmt.Encode(&hash)
+	garbledArtifact = append(garbledArtifact, uint8(42))
+	err = ValidateIOWriteLog(
+		writelog.WriteLog{
+			{Key: garbledArtifact, Value: []byte("some value")},
+		},
+		1024,
+		1024,
+	)
+	require.Error(t, err, "Decoding an invalid artifact type should fail")
+
+	err = ValidateIOWriteLog(
+		writelog.WriteLog{
+			{Key: txnKeyFmt.Encode(&hash, kindInput), Value: []byte("some value")},
+			{Key: tagKeyFmt.Encode([]byte("tag"), &hash), Value: []byte("some value")},
+		},
+		1024,
+		1024,
+	)
+	require.NoError(t, err, "All writelog keys should be valid")
+
+	// Test limits.
+	cases := []struct {
+		inputs, outputs   int
+		maxCount, maxSize uint64
+		expectedError     string
+	}{
+		// Overflow artifact count.
+		{2, 2, 2, 1024, ""},
+		{3, 2, 2, 1024, "transaction: too many inputs or outputs"},
+		{2, 3, 2, 1024, "transaction: too many inputs or outputs"},
+
+		// Overflow total input size
+		{1, 0, 10, 64, ""},
+		{10, 0, 10, 64, "transaction: input set size exceeds configuration"},
+	}
+
+	for num, c := range cases {
+		wl := writelog.WriteLog{}
+		for kind, cnt := range map[artifactKind]int{
+			kindInput:  c.inputs,
+			kindOutput: c.outputs,
+		} {
+			for i := 0; i < cnt; i++ {
+				wl = append(wl, writelog.LogEntry{
+					Key:   txnKeyFmt.Encode(&hash, kind),
+					Value: []byte("some long-ish value"),
+				})
+			}
+		}
+
+		err = ValidateIOWriteLog(wl, c.maxCount, c.maxSize)
+		if len(c.expectedError) > 0 {
+			require.EqualError(t, err, c.expectedError, fmt.Sprintf("bulk case %d", num))
+		} else {
+			require.NoError(t, err, fmt.Sprintf("bulk case %d", num))
+		}
+	}
 }

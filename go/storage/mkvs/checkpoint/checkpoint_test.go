@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestFileCheckpointCreator(t *testing.T) {
 	require.NoError(err, "New")
 
 	ctx := context.Background()
-	tree := mkvs.New(nil, ndb)
+	tree := mkvs.New(nil, ndb, node.RootTypeState)
 	for i := 0; i < 1000; i++ {
 		err = tree.Insert(ctx, []byte(strconv.Itoa(i)), []byte(strconv.Itoa(i)))
 		require.NoError(err, "Insert")
@@ -51,6 +52,7 @@ func TestFileCheckpointCreator(t *testing.T) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   1,
+		Type:      node.RootTypeState,
 		Hash:      rootHash,
 	}
 
@@ -71,13 +73,12 @@ func TestFileCheckpointCreator(t *testing.T) {
 	require.NoError(err, "CreateCheckpoint")
 	require.EqualValues(1, cp.Version, "version should be correct")
 	require.EqualValues(root, cp.Root, "checkpoint root should be correct")
-	require.Len(cp.Chunks, 3, "there should be the correct number of chunks")
+	require.Len(cp.Chunks, 2, "there should be the correct number of chunks")
 
 	var expectedChunks []hash.Hash
 	for _, hh := range []string{
-		"620f318c245858b351602a8b21e708663b03cd2befd982210ffbaa3c56bf9358",
-		"37d38a95492038df4afee65b5b91bf8499f522dea346c0e553e03d3333bff394",
-		"df608e9821dc8d248a0f0d0ff4cb998d51f329767dfc8a7520c15e38c47be1e9",
+		"bd09a699c0737d8a9783129f896fb6f452d9b77e81869237312e3bd48fb4cbc7",
+		"e852d2312ab1fe51ab066cc8a7a687e483d9e73206c3e56fc5caaecf6c347c7f",
 	} {
 		var h hash.Hash
 		_ = h.UnmarshalHex(hh)
@@ -148,6 +149,8 @@ func TestFileCheckpointCreator(t *testing.T) {
 	// Make sure that the chunk integrity is correct.
 	bogusCp.Chunks[1].FromBytes(bogusChunk)
 
+	err = ndb2.StartMultipartInsert(bogusCp.Root.Version)
+	require.NoError(err, "StartMultipartInsert")
 	err = rs.StartRestore(ctx, bogusCp)
 	require.NoError(err, "StartRestore")
 	for i := 0; i < len(bogusCp.Chunks); i++ {
@@ -214,7 +217,7 @@ func TestFileCheckpointCreator(t *testing.T) {
 			require.True(errors.Is(err, ErrChunkAlreadyRestored))
 		}
 	}
-	err = ndb2.Finalize(ctx, root.Version, []hash.Hash{root.Hash})
+	err = ndb2.Finalize(ctx, []node.Root{root})
 	require.NoError(err, "Finalize")
 
 	// Verify that everything has been restored.
@@ -257,6 +260,52 @@ func TestFileCheckpointCreator(t *testing.T) {
 	require.Error(err, "CreateCheckpoint should fail for invalid root")
 }
 
+func TestOversizedChunks(t *testing.T) {
+	require := require.New(t)
+
+	// Generate some data.
+	dir, err := ioutil.TempDir("", "mkvs.checkpoint")
+	require.NoError(err, "TempDir")
+	defer os.RemoveAll(dir)
+
+	ndb, err := badgerDb.New(&db.Config{
+		DB:           filepath.Join(dir, "db"),
+		Namespace:    testNs,
+		MaxCacheSize: 16 * 1024 * 1024,
+	})
+	require.NoError(err, "New")
+
+	ctx := context.Background()
+	tree := mkvs.New(nil, ndb, node.RootTypeState)
+	for i := 0; i < 100; i++ {
+		err = tree.Insert(ctx,
+			[]byte(fmt.Sprintf("this is some key at index %d which is somewhat longish", i)),
+			[]byte(fmt.Sprintf("let's generate a somewhat long key at %d so that we try to overflow chunks", i)),
+		)
+		require.NoError(err, "Insert")
+	}
+
+	_, rootHash, err := tree.Commit(ctx, testNs, 0)
+	require.NoError(err, "Commit")
+	root := node.Root{
+		Namespace: testNs,
+		Version:   1,
+		Type:      node.RootTypeState,
+		Hash:      rootHash,
+	}
+
+	// Create a file-based checkpoint creator.
+	fc, err := NewFileCreator(filepath.Join(dir, "checkpoints"), ndb)
+	require.NoError(err, "NewFileCreator")
+
+	// Create a checkpoint and check that it has been created correctly.
+	cp, err := fc.CreateCheckpoint(ctx, root, 128)
+	require.NoError(err, "CreateCheckpoint")
+	require.EqualValues(1, cp.Version, "version should be correct")
+	require.EqualValues(root, cp.Root, "checkpoint root should be correct")
+	require.Len(cp.Chunks, 100, "there should be the correct number of chunks")
+}
+
 func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 	require := require.New(t)
 
@@ -283,6 +332,7 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 	}
 	root.Hash.Empty()
 
@@ -313,7 +363,13 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 		var rootHash1 hash.Hash
 		_, rootHash1, err = tree1.Commit(ctx, testNs, v)
 		require.NoError(err, "Commit")
-		err = ndb1.Finalize(ctx, v, []hash.Hash{rootHash1})
+		root1 := node.Root{
+			Namespace: testNs,
+			Version:   v,
+			Type:      node.RootTypeState,
+			Hash:      rootHash1,
+		}
+		err = ndb1.Finalize(ctx, []node.Root{root1})
 		require.NoError(err, "Finalize")
 		tree1.Close()
 
@@ -322,7 +378,13 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 			_, rootHash2, err = tree2.Commit(ctx, testNs, v)
 			require.NoError(err, "Commit")
 			require.EqualValues(rootHash1, rootHash2, "root hashes should be equal")
-			err = ndb2.Finalize(ctx, v, []hash.Hash{rootHash2})
+			root2 := node.Root{
+				Namespace: testNs,
+				Version:   v,
+				Type:      node.RootTypeState,
+				Hash:      rootHash2,
+			}
+			err = ndb2.Finalize(ctx, []node.Root{root2})
 			require.NoError(err, "Finalize")
 			tree2.Close()
 		}
@@ -343,6 +405,8 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 	rs, err := NewRestorer(ndb2)
 	require.NoError(err, "NewRestorer")
 
+	err = ndb2.StartMultipartInsert(cp.Root.Version)
+	require.NoError(err, "StartMultipartInsert")
 	err = rs.StartRestore(ctx, cp)
 	require.NoError(err, "StartRestore")
 	for i := 0; i < len(cp.Chunks); i++ {
@@ -357,7 +421,7 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 		_, err = rs.RestoreChunk(ctx, uint64(i), &buf)
 		require.NoError(err, "RestoreChunk")
 	}
-	err = ndb2.Finalize(ctx, root.Version, []hash.Hash{root.Hash})
+	err = ndb2.Finalize(ctx, []node.Root{root})
 	require.NoError(err, "Finalize")
 
 	// Now attempt to prune everything up to (but excluding) the current root.
@@ -383,7 +447,13 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 		var rootHash1 hash.Hash
 		_, rootHash1, err = tree1.Commit(ctx, testNs, v)
 		require.NoError(err, "Commit")
-		err = ndb1.Finalize(ctx, v, []hash.Hash{rootHash1})
+		root1 := node.Root{
+			Namespace: testNs,
+			Version:   v,
+			Type:      node.RootTypeState,
+			Hash:      rootHash1,
+		}
+		err = ndb1.Finalize(ctx, []node.Root{root1})
 		require.NoError(err, "Finalize")
 		tree1.Close()
 
@@ -391,7 +461,13 @@ func TestPruneGapAfterCheckpointRestore(t *testing.T) {
 		_, rootHash2, err = tree2.Commit(ctx, testNs, v)
 		require.NoError(err, "Commit")
 		require.EqualValues(rootHash1, rootHash2, "root hashes should be equal")
-		err = ndb2.Finalize(ctx, v, []hash.Hash{rootHash2})
+		root2 := node.Root{
+			Namespace: testNs,
+			Version:   v,
+			Type:      node.RootTypeState,
+			Hash:      rootHash2,
+		}
+		err = ndb2.Finalize(ctx, []node.Root{root2})
 		require.NoError(err, "Finalize")
 		tree2.Close()
 

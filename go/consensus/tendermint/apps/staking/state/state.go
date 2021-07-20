@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/keyformat"
@@ -14,7 +15,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	abciAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 )
@@ -22,15 +22,6 @@ import (
 var (
 	// AppName is the ABCI application name.
 	AppName = "100_staking"
-	// KeyAddEscrow is an ABCI event attribute key for AddEscrow calls
-	// (value is an api.AddEscrowEvent).
-	KeyAddEscrow = []byte("add_escrow")
-	// KeyTakeEscrow is an ABCI event attribute key for TakeEscrow calls
-	// (value is an app.TakeEscrowEvent).
-	KeyTakeEscrow = []byte("take_escrow")
-	// KeyTransfer is an ABCI event attribute key for Transfers (value is
-	// an app.TransferEvent).
-	KeyTransfer = []byte("transfer")
 
 	// accountKeyFmt is the key format used for accounts (account addresses).
 	//
@@ -50,15 +41,15 @@ var (
 	// Value is CBOR-serialized delegation.
 	delegationKeyFmt = keyformat.New(0x53, &staking.Address{}, &staking.Address{})
 	// debondingDelegationKeyFmt is the key format used for debonding delegations
-	// (delegator address, escrow address, seq no).
+	// (delegator address, escrow address, epoch).
 	//
 	// Value is CBOR-serialized debonding delegation.
 	debondingDelegationKeyFmt = keyformat.New(0x54, &staking.Address{}, &staking.Address{}, uint64(0))
-	// debondingQueueKeyFmt is the debonding queue key format (epoch,
-	// delegator address, escrow address, seq no).
+	// debondingQueueKeyFmt is the debonding queue key format
+	// (epoch, delegator address, escrow address).
 	//
 	// Value is empty.
-	debondingQueueKeyFmt = keyformat.New(0x55, uint64(0), &staking.Address{}, &staking.Address{}, uint64(0))
+	debondingQueueKeyFmt = keyformat.New(0x55, uint64(0), &staking.Address{}, &staking.Address{})
 	// parametersKeyFmt is the key format used for consensus parameters.
 	//
 	// Value is CBOR-serialized staking.ConsensusParameters.
@@ -71,6 +62,10 @@ var (
 	//
 	// Value is CBOR-serialized EpochSigning.
 	epochSigningKeyFmt = keyformat.New(0x58)
+	// governanceDepositsKeyFmt is the key format used for the governance deposits balance.
+	//
+	// Value is a CBOR-serialized quantity.
+	governanceDepositsKeyFmt = keyformat.New(0x59)
 
 	logger = logging.GetLogger("tendermint/staking")
 )
@@ -80,8 +75,8 @@ type ImmutableState struct {
 	is *abciAPI.ImmutableState
 }
 
-func (s *ImmutableState) TotalSupply(ctx context.Context) (*quantity.Quantity, error) {
-	value, err := s.is.Get(ctx, totalSupplyKeyFmt.Encode())
+func (s *ImmutableState) loadStoredBalance(ctx context.Context, key *keyformat.KeyFormat) (*quantity.Quantity, error) {
+	value, err := s.is.Get(ctx, key.Encode())
 	if err != nil {
 		return nil, abciAPI.UnavailableStateError(err)
 	}
@@ -90,29 +85,23 @@ func (s *ImmutableState) TotalSupply(ctx context.Context) (*quantity.Quantity, e
 	}
 
 	var q quantity.Quantity
-	if err := cbor.Unmarshal(value, &q); err != nil {
+	if err = cbor.Unmarshal(value, &q); err != nil {
 		return nil, abciAPI.UnavailableStateError(err)
 	}
 	return &q, nil
+}
+
+// TotalSupply returns the total supply balance.
+func (s *ImmutableState) TotalSupply(ctx context.Context) (*quantity.Quantity, error) {
+	return s.loadStoredBalance(ctx, totalSupplyKeyFmt)
 }
 
 // CommonPool returns the balance of the global common pool.
 func (s *ImmutableState) CommonPool(ctx context.Context) (*quantity.Quantity, error) {
-	value, err := s.is.Get(ctx, commonPoolKeyFmt.Encode())
-	if err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
-	}
-	if value == nil {
-		return &quantity.Quantity{}, nil
-	}
-
-	var q quantity.Quantity
-	if err := cbor.Unmarshal(value, &q); err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
-	}
-	return &q, nil
+	return s.loadStoredBalance(ctx, commonPoolKeyFmt)
 }
 
+// ConsensusParameters returns the consensus parameters.
 func (s *ImmutableState) ConsensusParameters(ctx context.Context) (*staking.ConsensusParameters, error) {
 	raw, err := s.is.Get(ctx, parametersKeyFmt.Encode())
 	if err != nil {
@@ -129,10 +118,10 @@ func (s *ImmutableState) ConsensusParameters(ctx context.Context) (*staking.Cons
 	return &params, nil
 }
 
-func (s *ImmutableState) DebondingInterval(ctx context.Context) (epochtime.EpochTime, error) {
+func (s *ImmutableState) DebondingInterval(ctx context.Context) (beacon.EpochTime, error) {
 	params, err := s.ConsensusParameters(ctx)
 	if err != nil {
-		return epochtime.EpochInvalid, err
+		return beacon.EpochInvalid, err
 	}
 
 	return params.DebondingInterval, nil
@@ -166,6 +155,7 @@ func (s *ImmutableState) Thresholds(ctx context.Context) (map[staking.ThresholdK
 	return params.Thresholds, nil
 }
 
+// Addresses returns the non-empty addresses from the staking ledger.
 func (s *ImmutableState) Addresses(ctx context.Context) ([]staking.Address, error) {
 	it := s.is.NewIterator(ctx)
 	defer it.Close()
@@ -215,6 +205,7 @@ func (s *ImmutableState) EscrowBalance(ctx context.Context, address staking.Addr
 	return &account.Escrow.Active.Balance, nil
 }
 
+// Delegations returns all active delegations.
 func (s *ImmutableState) Delegations(
 	ctx context.Context,
 ) (map[staking.Address]map[staking.Address]*staking.Delegation, error) {
@@ -245,6 +236,7 @@ func (s *ImmutableState) Delegations(
 	return delegations, nil
 }
 
+// Delegation returns the delegation descriptor.
 func (s *ImmutableState) Delegation(
 	ctx context.Context,
 	delegatorAddr, escrowAddr staking.Address,
@@ -295,6 +287,37 @@ func (s *ImmutableState) DelegationsFor(
 	return delegations, nil
 }
 
+func (s *ImmutableState) DelegationsTo(
+	ctx context.Context,
+	destAddr staking.Address,
+) (map[staking.Address]*staking.Delegation, error) {
+	it := s.is.NewIterator(ctx)
+	defer it.Close()
+
+	delegations := make(map[staking.Address]*staking.Delegation)
+	for it.Seek(delegationKeyFmt.Encode()); it.Valid(); it.Next() {
+		var escrowAddr staking.Address
+		var delegatorAddr staking.Address
+		if !delegationKeyFmt.Decode(it.Key(), &escrowAddr, &delegatorAddr) {
+			break
+		}
+		if !escrowAddr.Equal(destAddr) {
+			continue
+		}
+
+		var del staking.Delegation
+		if err := cbor.Unmarshal(it.Value(), &del); err != nil {
+			return nil, abciAPI.UnavailableStateError(err)
+		}
+
+		delegations[delegatorAddr] = &del
+	}
+	if it.Err() != nil {
+		return nil, abciAPI.UnavailableStateError(it.Err())
+	}
+	return delegations, nil
+}
+
 func (s *ImmutableState) DebondingDelegations(
 	ctx context.Context,
 ) (map[staking.Address]map[staking.Address][]*staking.DebondingDelegation, error) {
@@ -323,6 +346,26 @@ func (s *ImmutableState) DebondingDelegations(
 		return nil, abciAPI.UnavailableStateError(it.Err())
 	}
 	return delegations, nil
+}
+
+func (s *ImmutableState) DebondingDelegation(
+	ctx context.Context,
+	delegatorAddr, escrowAddr staking.Address,
+	epoch beacon.EpochTime,
+) (*staking.DebondingDelegation, error) {
+	value, err := s.is.Get(ctx, debondingDelegationKeyFmt.Encode(&delegatorAddr, &escrowAddr, uint64(epoch)))
+	if err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	if value == nil {
+		return &staking.DebondingDelegation{}, nil
+	}
+
+	var deb staking.DebondingDelegation
+	if err = cbor.Unmarshal(value, &deb); err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	return &deb, nil
 }
 
 func (s *ImmutableState) DebondingDelegationsFor(
@@ -356,56 +399,65 @@ func (s *ImmutableState) DebondingDelegationsFor(
 	return delegations, nil
 }
 
-func (s *ImmutableState) DebondingDelegation(
+func (s *ImmutableState) DebondingDelegationsTo(
 	ctx context.Context,
-	delegatorAddr, escrowAddr staking.Address,
-	seq uint64,
-) (*staking.DebondingDelegation, error) {
-	value, err := s.is.Get(ctx, debondingDelegationKeyFmt.Encode(&delegatorAddr, &escrowAddr, seq))
-	if err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
-	}
-	if value == nil {
-		return &staking.DebondingDelegation{}, nil
-	}
+	destAddr staking.Address,
+) (map[staking.Address][]*staking.DebondingDelegation, error) {
+	it := s.is.NewIterator(ctx)
+	defer it.Close()
 
-	var deb staking.DebondingDelegation
-	if err = cbor.Unmarshal(value, &deb); err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
+	delegations := make(map[staking.Address][]*staking.DebondingDelegation)
+	for it.Seek(debondingDelegationKeyFmt.Encode()); it.Valid(); it.Next() {
+		var escrowAddr staking.Address
+		var delegatorAddr staking.Address
+		if !debondingDelegationKeyFmt.Decode(it.Key(), &delegatorAddr, &escrowAddr) {
+			break
+		}
+		if !escrowAddr.Equal(destAddr) {
+			continue
+		}
+
+		var deb staking.DebondingDelegation
+		if err := cbor.Unmarshal(it.Value(), &deb); err != nil {
+			return nil, abciAPI.UnavailableStateError(err)
+		}
+
+		delegations[delegatorAddr] = append(delegations[delegatorAddr], &deb)
 	}
-	return &deb, nil
+	if it.Err() != nil {
+		return nil, abciAPI.UnavailableStateError(it.Err())
+	}
+	return delegations, nil
 }
 
 type DebondingQueueEntry struct {
-	Epoch         epochtime.EpochTime
+	Epoch         beacon.EpochTime
 	DelegatorAddr staking.Address
 	EscrowAddr    staking.Address
-	Seq           uint64
 	Delegation    *staking.DebondingDelegation
 }
 
-func (s *ImmutableState) ExpiredDebondingQueue(ctx context.Context, epoch epochtime.EpochTime) ([]*DebondingQueueEntry, error) {
+func (s *ImmutableState) ExpiredDebondingQueue(ctx context.Context, epoch beacon.EpochTime) ([]*DebondingQueueEntry, error) {
 	it := s.is.NewIterator(ctx)
 	defer it.Close()
 
 	var entries []*DebondingQueueEntry
 	for it.Seek(debondingQueueKeyFmt.Encode()); it.Valid(); it.Next() {
-		var decEpoch, seq uint64
+		var decEpoch uint64
 		var escrowAddr staking.Address
 		var delegatorAddr staking.Address
-		if !debondingQueueKeyFmt.Decode(it.Key(), &decEpoch, &delegatorAddr, &escrowAddr, &seq) || decEpoch > uint64(epoch) {
+		if !debondingQueueKeyFmt.Decode(it.Key(), &decEpoch, &delegatorAddr, &escrowAddr) || decEpoch > uint64(epoch) {
 			break
 		}
 
-		deb, err := s.DebondingDelegation(ctx, delegatorAddr, escrowAddr, seq)
+		deb, err := s.DebondingDelegation(ctx, delegatorAddr, escrowAddr, beacon.EpochTime(decEpoch))
 		if err != nil {
 			return nil, err
 		}
 		entries = append(entries, &DebondingQueueEntry{
-			Epoch:         epochtime.EpochTime(decEpoch),
+			Epoch:         beacon.EpochTime(decEpoch),
 			DelegatorAddr: delegatorAddr,
 			EscrowAddr:    escrowAddr,
-			Seq:           seq,
 			Delegation:    deb,
 		})
 	}
@@ -420,24 +472,21 @@ func (s *ImmutableState) Slashing(ctx context.Context) (map[staking.SlashReason]
 	if err != nil {
 		return nil, err
 	}
+	if params.Slashing == nil {
+		return make(map[staking.SlashReason]staking.Slash), nil
+	}
 
 	return params.Slashing, nil
 }
 
+// LastBlockFees returns the last block fees balance.
 func (s *ImmutableState) LastBlockFees(ctx context.Context) (*quantity.Quantity, error) {
-	value, err := s.is.Get(ctx, lastBlockFeesKeyFmt.Encode())
-	if err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
-	}
-	if value == nil {
-		return &quantity.Quantity{}, nil
-	}
+	return s.loadStoredBalance(ctx, lastBlockFeesKeyFmt)
+}
 
-	var q quantity.Quantity
-	if err = cbor.Unmarshal(value, &q); err != nil {
-		return nil, abciAPI.UnavailableStateError(err)
-	}
-	return &q, nil
+// GovernanceDeposits returns the governance deposits balance.
+func (s *ImmutableState) GovernanceDeposits(ctx context.Context) (*quantity.Quantity, error) {
+	return s.loadStoredBalance(ctx, governanceDepositsKeyFmt)
 }
 
 type EpochSigning struct {
@@ -534,7 +583,13 @@ func (s *MutableState) SetCommonPool(ctx context.Context, q *quantity.Quantity) 
 	return abciAPI.UnavailableStateError(err)
 }
 
+// SetConsensusParameters sets staking consensus parameters.
+//
+// NOTE: This method must only be called from InitChain/EndBlock contexts.
 func (s *MutableState) SetConsensusParameters(ctx context.Context, params *staking.ConsensusParameters) error {
+	if err := s.is.CheckContextMode(ctx, []abciAPI.ContextMode{abciAPI.ContextInitChain, abciAPI.ContextEndBlock}); err != nil {
+		return err
+	}
 	err := s.ms.Insert(ctx, parametersKeyFmt.Encode(), cbor.Marshal(params))
 	return abciAPI.UnavailableStateError(err)
 }
@@ -557,15 +612,38 @@ func (s *MutableState) SetDelegation(
 func (s *MutableState) SetDebondingDelegation(
 	ctx context.Context,
 	delegatorAddr, escrowAddr staking.Address,
-	seq uint64,
+	epoch beacon.EpochTime,
 	d *staking.DebondingDelegation,
 ) error {
-	key := debondingDelegationKeyFmt.Encode(&delegatorAddr, &escrowAddr, seq)
+	key := debondingDelegationKeyFmt.Encode(&delegatorAddr, &escrowAddr, uint64(epoch))
 
 	if d == nil {
 		// Remove descriptor.
 		err := s.ms.Remove(ctx, key)
 		return abciAPI.UnavailableStateError(err)
+	}
+
+	// Create a copy so we don't modify the passed in object in case we are merging
+	// it with an existing delegation.
+	debDel := staking.DebondingDelegation{
+		Shares:        *d.Shares.Clone(),
+		DebondEndTime: d.DebondEndTime,
+	}
+
+	// If a debonding delegation for the account and same end epoch already exists,
+	// merge the debonding delegations.
+	value, err := s.is.Get(ctx, key)
+	if err != nil {
+		return abciAPI.UnavailableStateError(err)
+	}
+	if value != nil {
+		var deb staking.DebondingDelegation
+		if err = cbor.Unmarshal(value, &deb); err != nil {
+			return abciAPI.UnavailableStateError(err)
+		}
+		if err = debDel.Merge(deb); err != nil {
+			return fmt.Errorf("error merging debonding delegations: %w", err)
+		}
 	}
 
 	// Add to debonding queue.
@@ -574,14 +652,13 @@ func (s *MutableState) SetDebondingDelegation(
 		debondingQueueKeyFmt.Encode(uint64(d.DebondEndTime),
 			&delegatorAddr,
 			&escrowAddr,
-			seq,
 		),
 		[]byte{},
 	); err != nil {
 		return abciAPI.UnavailableStateError(err)
 	}
 	// Add descriptor.
-	if err := s.ms.Insert(ctx, key, cbor.Marshal(d)); err != nil {
+	if err := s.ms.Insert(ctx, key, cbor.Marshal(debDel)); err != nil {
 		return abciAPI.UnavailableStateError(err)
 	}
 	return nil
@@ -589,11 +666,10 @@ func (s *MutableState) SetDebondingDelegation(
 
 func (s *MutableState) RemoveFromDebondingQueue(
 	ctx context.Context,
-	epoch epochtime.EpochTime,
+	epoch beacon.EpochTime,
 	delegatorAddr, escrowAddr staking.Address,
-	seq uint64,
 ) error {
-	err := s.ms.Remove(ctx, debondingQueueKeyFmt.Encode(uint64(epoch), &delegatorAddr, &escrowAddr, seq))
+	err := s.ms.Remove(ctx, debondingQueueKeyFmt.Encode(uint64(epoch), &delegatorAddr, &escrowAddr))
 	return abciAPI.UnavailableStateError(err)
 }
 
@@ -612,7 +688,16 @@ func (s *MutableState) ClearEpochSigning(ctx context.Context) error {
 	return abciAPI.UnavailableStateError(err)
 }
 
+func (s *MutableState) SetGovernanceDeposits(ctx context.Context, q *quantity.Quantity) error {
+	err := s.ms.Insert(ctx, governanceDepositsKeyFmt.Encode(), cbor.Marshal(q))
+	return abciAPI.UnavailableStateError(err)
+}
+
 func slashPool(dst *quantity.Quantity, p *staking.SharePool, amount, total *quantity.Quantity) error {
+	if total.IsZero() {
+		// Nothing to slash.
+		return nil
+	}
 	// slashAmount = amount * p.Balance / total
 	slashAmount := p.Balance.Clone()
 	if err := slashAmount.Mul(amount); err != nil {
@@ -631,7 +716,7 @@ func slashPool(dst *quantity.Quantity, p *staking.SharePool, amount, total *quan
 
 // SlashEscrow slashes the escrow balance and the escrow-but-undergoing-debonding
 // balance of the account, transferring it to the global common pool, returning
-// true iff the amount actually slashed is > 0.
+// the amount actually slashed.
 //
 // WARNING: This is an internal routine to be used to implement staking policy,
 // and MUST NOT be exposed outside of backend implementations.
@@ -639,63 +724,66 @@ func (s *MutableState) SlashEscrow(
 	ctx *abciAPI.Context,
 	fromAddr staking.Address,
 	amount *quantity.Quantity,
-) (bool, error) {
+) (*quantity.Quantity, error) {
+	var slashed quantity.Quantity
+
 	commonPool, err := s.CommonPool(ctx)
 	if err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed to query common pool for slash: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed to query common pool for slash: %w", err)
 	}
 
 	from, err := s.Account(ctx, fromAddr)
 	if err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed to query account %s: %w", fromAddr, err)
+		return nil, fmt.Errorf("tendermint/staking: failed to query account %s: %w", fromAddr, err)
 	}
 
 	// Compute the amount we need to slash each pool. The amount is split
 	// between the pools based on relative total balance.
 	total := from.Escrow.Active.Balance.Clone()
 	if err = total.Add(&from.Escrow.Debonding.Balance); err != nil {
-		return false, fmt.Errorf("tendermint/staking: compute total balance: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: account total balance: %w", err)
 	}
-
-	var slashed quantity.Quantity
 	if err = slashPool(&slashed, &from.Escrow.Active, amount, total); err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed slashing active escrow: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed slashing active escrow: %w", err)
 	}
 	if err = slashPool(&slashed, &from.Escrow.Debonding, amount, total); err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed slashing debonding escrow: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed slashing debonding escrow: %w", err)
 	}
-
+	// Nothing was slashed.
 	if slashed.IsZero() {
-		return false, nil
+		return &slashed, nil
 	}
 
 	totalSlashed := slashed.Clone()
 
 	if err = quantity.Move(commonPool, &slashed, totalSlashed); err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed moving stake to common pool: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed moving stake to common pool: %w", err)
 	}
 
 	if err = s.SetCommonPool(ctx, commonPool); err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed to set common pool: %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed to set common pool: %w", err)
 	}
 	if err = s.SetAccount(ctx, fromAddr, from); err != nil {
-		return false, fmt.Errorf("tendermint/staking: failed to set account. %w", err)
+		return nil, fmt.Errorf("tendermint/staking: failed to set account: %w", err)
 	}
 
 	if !ctx.IsCheckOnly() {
-		ev := cbor.Marshal(&staking.TakeEscrowEvent{
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TakeEscrowEvent{
 			Owner:  fromAddr,
 			Amount: *totalSlashed,
-		})
-		ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyTakeEscrow, ev))
+		}))
 	}
 
-	return true, nil
+	return totalSlashed, nil
 }
 
 // TransferFromCommon transfers up to the amount from the global common pool
 // to the general balance of the account, returning true iff the
 // amount transferred is > 0.
+//
+// If the escrow flag is true then the amount is escrowed instead of being
+// transferred. The escrow operation takes the entity's commission rate into
+// account and the rest is distributed to all delegators equally.
 //
 // WARNING: This is an internal routine to be used to implement incentivization
 // policy, and MUST NOT be exposed outside of backend implementations.
@@ -703,12 +791,14 @@ func (s *MutableState) TransferFromCommon(
 	ctx *abciAPI.Context,
 	toAddr staking.Address,
 	amount *quantity.Quantity,
+	escrow bool,
 ) (bool, error) {
 	commonPool, err := s.CommonPool(ctx)
 	if err != nil {
 		return false, fmt.Errorf("tendermint/staking: failed to query common pool for transfer: %w", err)
 	}
 
+	// Transfer up to the given amount from the common pool to the general account balance.
 	to, err := s.Account(ctx, toAddr)
 	if err != nil {
 		return false, fmt.Errorf("tendermint/staking: failed to query account %s: %w", toAddr, err)
@@ -717,27 +807,230 @@ func (s *MutableState) TransferFromCommon(
 	if err != nil {
 		return false, fmt.Errorf("tendermint/staking: failed to transfer from common pool: %w", err)
 	}
+	if transferred.IsZero() {
+		// Common pool has been depleated, nothing to transfer.
+		return false, nil
+	}
 
-	ret := !transferred.IsZero()
-	if ret {
-		if err = s.SetCommonPool(ctx, commonPool); err != nil {
-			return false, fmt.Errorf("tendermint/staking: failed to set common pool: %w", err)
-		}
-		if err = s.SetAccount(ctx, toAddr, to); err != nil {
-			return false, fmt.Errorf("tendermint/staking: failed to set account %s: %w", toAddr, err)
+	switch escrow {
+	case true:
+		// If escrow is requested, escrow the transferred stake immediately.
+		var com *quantity.Quantity
+		switch to.Escrow.Active.TotalShares.IsZero() {
+		case false:
+			// Compute commission.
+			var epoch beacon.EpochTime
+			epoch, err = ctx.AppState().GetCurrentEpoch(ctx)
+			if err != nil {
+				return false, fmt.Errorf("tendermint/staking: failed to get current epoch: %w", err)
+			}
+
+			rate := to.Escrow.CommissionSchedule.CurrentRate(epoch)
+			if rate != nil {
+				com = transferred.Clone()
+				// Multiply first.
+				if err = com.Mul(rate); err != nil {
+					return false, fmt.Errorf("tendermint/staking: failed multiplying by commission rate: %w", err)
+				}
+				if err = com.Quo(staking.CommissionRateDenominator); err != nil {
+					return false, fmt.Errorf("tendermint/staking: failed dividing by commission rate denominator: %w", err)
+				}
+
+				if err = transferred.Sub(com); err != nil {
+					return false, fmt.Errorf("tendermint/staking: failed subtracting commission: %w", err)
+				}
+			}
+
+			// Escrow everything except the commission (increases value of all shares).
+			if err = quantity.Move(&to.Escrow.Active.Balance, &to.General.Balance, transferred); err != nil {
+				return false, fmt.Errorf("tendermint/staking: failed transferring to active escrow balance from common pool: %w", err)
+			}
+
+			// Emit non commissioned reward event.
+			if !ctx.IsCheckOnly() {
+				ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
+					Owner:  staking.CommonPoolAddress,
+					Escrow: toAddr,
+					Amount: *transferred,
+					// No new shares as this is the reward. As a result existing share price increases.
+					NewShares: quantity.Quantity{},
+				}))
+			}
+		case true:
+			// If nothing has been escrowed before, everything counts as commission.
+			com = transferred.Clone()
 		}
 
+		// Escrow commission.
+		if com != nil && !com.IsZero() {
+			var delegation *staking.Delegation
+			delegation, err = s.Delegation(ctx, toAddr, toAddr)
+			if err != nil {
+				return false, fmt.Errorf("tendermint/staking: failed to query delegation: %w", err)
+			}
+
+			var obtainedShares *quantity.Quantity
+			obtainedShares, err = to.Escrow.Active.Deposit(&delegation.Shares, &to.General.Balance, com)
+			if err != nil {
+				return false, fmt.Errorf("tendermint/staking: failed to deposit to escrow: %w", err)
+			}
+
+			if err = s.SetDelegation(ctx, toAddr, toAddr, delegation); err != nil {
+				return false, fmt.Errorf("tendermint/staking: failed to set delegation: %w", err)
+			}
+
+			// Emit events.
+			// Commission was transferred to the account, and automatically escrowed.
+			if !ctx.IsCheckOnly() {
+				ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+					From:   staking.CommonPoolAddress,
+					To:     toAddr,
+					Amount: *com,
+				}))
+
+				ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
+					Owner:     toAddr,
+					Escrow:    toAddr,
+					Amount:    *com,
+					NewShares: *obtainedShares,
+				}))
+			}
+		}
+	case false:
 		if !ctx.IsCheckOnly() {
-			ev := cbor.Marshal(&staking.TransferEvent{
+			ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
 				From:   staking.CommonPoolAddress,
 				To:     toAddr,
 				Amount: *transferred,
-			})
-			ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyTransfer, ev))
+			}))
 		}
+
 	}
 
-	return ret, nil
+	if err = s.SetCommonPool(ctx, commonPool); err != nil {
+		return false, fmt.Errorf("tendermint/staking: failed to set common pool: %w", err)
+	}
+	if err = s.SetAccount(ctx, toAddr, to); err != nil {
+		return false, fmt.Errorf("tendermint/staking: failed to set account %s: %w", toAddr, err)
+	}
+
+	return true, nil
+}
+
+// TransferToGovernanceDeposits transfers the amount from the submitter to the
+// governance deposits pool.
+func (s *MutableState) TransferToGovernanceDeposits(
+	ctx *api.Context,
+	fromAddr staking.Address,
+	amount *quantity.Quantity,
+) error {
+	from, err := s.Account(ctx, fromAddr)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query account %s: %w", fromAddr, err)
+	}
+
+	deposits, err := s.GovernanceDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query governance deposit for deposit %w", err)
+	}
+
+	if err = quantity.Move(deposits, &from.General.Balance, amount); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to transfer to governance deposits, from: %s: %w", fromAddr, err)
+	}
+
+	if err = s.SetAccount(ctx, fromAddr, from); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set governance deposit submitter account: %w", err)
+	}
+	if err = s.SetGovernanceDeposits(ctx, deposits); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set governance deposits: %w", err)
+	}
+
+	if !ctx.IsCheckOnly() {
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+			From:   fromAddr,
+			To:     staking.GovernanceDepositsAddress,
+			Amount: *amount,
+		}))
+	}
+
+	return nil
+}
+
+// TransferFromGovernanceDeposits transfers the amount from the governance
+// deposits pool to the specified address.
+func (s *MutableState) TransferFromGovernanceDeposits(
+	ctx *api.Context,
+	toAddr staking.Address,
+	amount *quantity.Quantity,
+) error {
+	to, err := s.Account(ctx, toAddr)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query account %s: %w", toAddr, err)
+	}
+
+	deposits, err := s.GovernanceDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query governance deposit %w", err)
+	}
+
+	if err = quantity.Move(&to.General.Balance, deposits, amount); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to transfer from governance deposits, to: %s: %w", toAddr, err)
+	}
+
+	if err = s.SetAccount(ctx, toAddr, to); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set governance deposit submitter account: %w", err)
+	}
+	if err = s.SetGovernanceDeposits(ctx, deposits); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set governance deposits: %w", err)
+	}
+
+	if !ctx.IsCheckOnly() {
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+			From:   staking.GovernanceDepositsAddress,
+			To:     toAddr,
+			Amount: *amount,
+		}))
+	}
+
+	return nil
+}
+
+// DiscardGovernanceDeposit discards the amount from the governance
+// deposits pool to the common pool.
+func (s *MutableState) DiscardGovernanceDeposit(
+	ctx *api.Context,
+	amount *quantity.Quantity,
+) error {
+	commonPool, err := s.CommonPool(ctx)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query common pool for transfer: %w", err)
+	}
+
+	deposits, err := s.GovernanceDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("tendermint/staking: failed to query governance deposit %w", err)
+	}
+
+	if err = quantity.Move(commonPool, deposits, amount); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to transfer from governance deposits, to common pool: %w", err)
+	}
+
+	if err = s.SetGovernanceDeposits(ctx, deposits); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set governance deposits: %w", err)
+	}
+	if err = s.SetCommonPool(ctx, commonPool); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set common pool: %w", err)
+	}
+
+	if !ctx.IsCheckOnly() {
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+			From:   staking.GovernanceDepositsAddress,
+			To:     staking.CommonPoolAddress,
+			Amount: *amount,
+		}))
+	}
+
+	return nil
 }
 
 // AddRewards computes and transfers a staking reward to active escrow accounts.
@@ -748,7 +1041,7 @@ func (s *MutableState) TransferFromCommon(
 // there.
 func (s *MutableState) AddRewards(
 	ctx *abciAPI.Context,
-	time epochtime.EpochTime,
+	time beacon.EpochTime,
 	factor *quantity.Quantity,
 	addresses []staking.Address,
 ) error {
@@ -817,12 +1110,13 @@ func (s *MutableState) AddRewards(
 			if err = quantity.Move(&ent.Escrow.Active.Balance, commonPool, q); err != nil {
 				return fmt.Errorf("tendermint/staking: failed transferring to active escrow balance from common pool: %w", err)
 			}
-			ev := cbor.Marshal(&staking.AddEscrowEvent{
+			ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
 				Owner:  staking.CommonPoolAddress,
 				Escrow: addr,
 				Amount: *q,
-			})
-			ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyAddEscrow, ev))
+				// No new shares as this is the reward. As a result existing share price increases.
+				NewShares: quantity.Quantity{},
+			}))
 		}
 
 		if com != nil && !com.IsZero() {
@@ -832,7 +1126,9 @@ func (s *MutableState) AddRewards(
 				return fmt.Errorf("tendermint/staking: failed to query delegation: %w", err)
 			}
 
-			if err = ent.Escrow.Active.Deposit(&delegation.Shares, commonPool, com); err != nil {
+			var obtainedShares *quantity.Quantity
+			obtainedShares, err = ent.Escrow.Active.Deposit(&delegation.Shares, commonPool, com)
+			if err != nil {
 				return fmt.Errorf("tendermint/staking: depositing commission: %w", err)
 			}
 
@@ -840,12 +1136,21 @@ func (s *MutableState) AddRewards(
 				return fmt.Errorf("tendermint/staking: failed to set delegation: %w", err)
 			}
 
-			ev := cbor.Marshal(&staking.AddEscrowEvent{
-				Owner:  staking.CommonPoolAddress,
-				Escrow: addr,
+			// Above, we directly desposit from the common pool into the delegation,
+			// which is a shorthand for transferring to the account and immediately
+			// escrowing it. Explicitly emit both events.
+			ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+				From:   staking.CommonPoolAddress,
+				To:     addr,
 				Amount: *com,
-			})
-			ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyAddEscrow, ev))
+			}))
+
+			ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
+				Owner:     addr,
+				Escrow:    addr,
+				Amount:    *com,
+				NewShares: *obtainedShares,
+			}))
 		}
 
 		if err = s.SetAccount(ctx, addr, ent); err != nil {
@@ -863,7 +1168,7 @@ func (s *MutableState) AddRewards(
 // AddRewardSingleAttenuated computes, scales, and transfers a staking reward to an active escrow account.
 func (s *MutableState) AddRewardSingleAttenuated(
 	ctx *abciAPI.Context,
-	time epochtime.EpochTime,
+	time beacon.EpochTime,
 	factor *quantity.Quantity,
 	attenuationNumerator, attenuationDenominator int,
 	address staking.Address,
@@ -945,12 +1250,13 @@ func (s *MutableState) AddRewardSingleAttenuated(
 		if err = quantity.Move(&acct.Escrow.Active.Balance, commonPool, q); err != nil {
 			return fmt.Errorf("tendermint/staking: failed transferring to active escrow balance from common pool: %w", err)
 		}
-		ev := cbor.Marshal(&staking.AddEscrowEvent{
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
 			Owner:  staking.CommonPoolAddress,
 			Escrow: address,
 			Amount: *q,
-		})
-		ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyAddEscrow, ev))
+			// No new shares as this is the reward. As a result existing share price increases.
+			NewShares: quantity.Quantity{},
+		}))
 	}
 
 	if com != nil && !com.IsZero() {
@@ -960,7 +1266,9 @@ func (s *MutableState) AddRewardSingleAttenuated(
 			return fmt.Errorf("tendermint/staking: failed to query delegation: %w", err)
 		}
 
-		if err = acct.Escrow.Active.Deposit(&delegation.Shares, commonPool, com); err != nil {
+		var obtainedShares *quantity.Quantity
+		obtainedShares, err = acct.Escrow.Active.Deposit(&delegation.Shares, commonPool, com)
+		if err != nil {
 			return fmt.Errorf("tendermint/staking: failed depositing commission: %w", err)
 		}
 
@@ -968,12 +1276,21 @@ func (s *MutableState) AddRewardSingleAttenuated(
 			return fmt.Errorf("tendermint/staking: failed to set delegation: %w", err)
 		}
 
-		ev := cbor.Marshal(&staking.AddEscrowEvent{
-			Owner:  staking.CommonPoolAddress,
-			Escrow: address,
+		// Above, we directly desposit from the common pool into the delegation,
+		// which is a shorthand for transferring to the account and immediately
+		// escrowing it. Explicitly emit both events.
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.TransferEvent{
+			From:   staking.CommonPoolAddress,
+			To:     address,
 			Amount: *com,
-		})
-		ctx.EmitEvent(api.NewEventBuilder(AppName).Attribute(KeyAddEscrow, ev))
+		}))
+
+		ctx.EmitEvent(api.NewEventBuilder(AppName).TypedAttribute(&staking.AddEscrowEvent{
+			Owner:     address,
+			Escrow:    address,
+			Amount:    *com,
+			NewShares: *obtainedShares,
+		}))
 	}
 
 	if err = s.SetAccount(ctx, address, acct); err != nil {

@@ -8,15 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-	opentracingExt "github.com/opentracing/opentracing-go/ext"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
-	"github.com/oasisprotocol/oasis-core/go/common/tracing"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/metrics"
 )
@@ -27,8 +24,8 @@ const (
 	connWriteTimeout = 5 * time.Second
 )
 
-// ErrNotReady is the error reported when the Runtime Host Protocol is not initialized.
 var (
+	// ErrNotReady is the error reported when the Runtime Host Protocol is not initialized.
 	ErrNotReady = errors.New(moduleName, 1, "rhp: not ready")
 
 	rhpLatency = prometheus.NewSummaryVec(
@@ -105,13 +102,49 @@ type Connection interface {
 	// Only one of InitHost/InitGuest can be called otherwise the method may panic.
 	//
 	// Returns the self-reported runtime version.
-	InitHost(ctx context.Context, conn net.Conn) (*version.Version, error)
+	InitHost(ctx context.Context, conn net.Conn, hi *HostInfo) (*version.Version, error)
 
 	// InitGuest performs initialization in guest mode and transitions the connection to Ready
 	// state.
 	//
 	// Only one of InitHost/InitGuest can be called otherwise the method may panic.
 	InitGuest(ctx context.Context, conn net.Conn) error
+}
+
+// HostInfo contains the information about the host environment that is sent to the runtime during
+// connection initialization.
+type HostInfo struct {
+	// ConsensusBackend is the name of the consensus backend that is in use for the consensus layer.
+	ConsensusBackend string
+	// ConsensusProtocolVersion is the consensus protocol version that is in use for the consensus
+	// layer.
+	ConsensusProtocolVersion version.Version
+	// ConsensusChainContext is the consensus layer chain domain separation context.
+	ConsensusChainContext string
+
+	// LocalConfig is the node-local runtime configuration.
+	//
+	// This configuration must not be used in any context which requires determinism across
+	// replicated runtime instances.
+	LocalConfig map[string]interface{}
+}
+
+// Clone returns a copy of the HostInfo structure.
+func (hi *HostInfo) Clone() *HostInfo {
+	var localConfig map[string]interface{}
+	if hi.LocalConfig != nil {
+		localConfig = make(map[string]interface{})
+		for k, v := range hi.LocalConfig {
+			localConfig[k] = v
+		}
+	}
+
+	return &HostInfo{
+		ConsensusBackend:         hi.ConsensusBackend,
+		ConsensusProtocolVersion: hi.ConsensusProtocolVersion,
+		ConsensusChainContext:    hi.ConsensusChainContext,
+		LocalConfig:              localConfig,
+	}
 }
 
 // state is the connection state.
@@ -258,10 +291,7 @@ func (c *connection) call(ctx context.Context, body *Body) (result *Body, err er
 
 		if resp.Error != nil {
 			// Decode error.
-			err = errors.FromCode(resp.Error.Module, resp.Error.Code)
-			if err == nil {
-				err = fmt.Errorf("%s", resp.Error.Message)
-			}
+			err = errors.FromCode(resp.Error.Module, resp.Error.Code, resp.Error.Message)
 			return nil, err
 		}
 
@@ -281,23 +311,10 @@ func (c *connection) makeRequest(ctx context.Context, body *Body) (<-chan *Body,
 	c.pendingRequests[id] = ch
 	c.Unlock()
 
-	span := opentracing.SpanFromContext(ctx)
-	scBinary := []byte{}
-	var err error
-	if span != nil {
-		scBinary, err = tracing.SpanContextToBinary(span.Context())
-		if err != nil {
-			c.logger.Error("error while marshalling span context",
-				"err", err,
-			)
-		}
-	}
-
 	msg := Message{
 		ID:          id,
 		MessageType: MessageRequest,
 		Body:        *body,
-		SpanContext: scBinary,
 	}
 
 	// Queue the message.
@@ -349,12 +366,12 @@ func (c *connection) workerOutgoing() {
 }
 
 func errorToBody(err error) *Body {
-	module, code := errors.Code(err)
+	module, code, context := errors.Code(err)
 	return &Body{
 		Error: &Error{
 			Module:  module,
 			Code:    code,
-			Message: err.Error(),
+			Message: context,
 		},
 	}
 }
@@ -364,7 +381,6 @@ func newResponseMessage(req *Message, body *Body) *Message {
 		ID:          req.ID,
 		MessageType: MessageResponse,
 		Body:        *body,
-		SpanContext: cbor.FixSliceForSerde(nil),
 	}
 }
 
@@ -390,21 +406,6 @@ func (c *connection) handleMessage(ctx context.Context, message *Message) {
 			)
 			_ = c.sendMessage(ctx, newResponseMessage(message, errorToBody(ErrNotReady)))
 			return
-		}
-
-		// Import runtime-provided span.
-		if len(message.SpanContext) != 0 {
-			sc, err := tracing.SpanContextFromBinary(message.SpanContext)
-			if err != nil {
-				c.logger.Error("error while unmarshalling span context",
-					"err", err,
-				)
-			} else {
-				span := opentracing.StartSpan("RHP", opentracingExt.RPCServerOption(sc))
-				defer span.Finish()
-
-				ctx = opentracing.ContextWithSpan(ctx, span)
-			}
 		}
 
 		// Call actual handler.
@@ -511,12 +512,16 @@ func (c *connection) InitGuest(ctx context.Context, conn net.Conn) error {
 }
 
 // Implements Connection.
-func (c *connection) InitHost(ctx context.Context, conn net.Conn) (*version.Version, error) {
+func (c *connection) InitHost(ctx context.Context, conn net.Conn, hi *HostInfo) (*version.Version, error) {
 	c.initConn(conn)
 
 	// Check Runtime Host Protocol version.
 	rsp, err := c.call(ctx, &Body{RuntimeInfoRequest: &RuntimeInfoRequest{
-		RuntimeID: c.runtimeID,
+		RuntimeID:                c.runtimeID,
+		ConsensusBackend:         hi.ConsensusBackend,
+		ConsensusProtocolVersion: hi.ConsensusProtocolVersion,
+		ConsensusChainContext:    hi.ConsensusChainContext,
+		LocalConfig:              hi.LocalConfig,
 	}})
 	switch {
 	default:
@@ -530,18 +535,18 @@ func (c *connection) InitHost(ctx context.Context, conn net.Conn) (*version.Vers
 	}
 
 	info := rsp.RuntimeInfoResponse
-	if ver := version.FromU64(info.ProtocolVersion); ver.Major != version.RuntimeHostProtocol.Major {
+	if info.ProtocolVersion.Major != version.RuntimeHostProtocol.Major {
 		c.logger.Error("runtime has incompatible protocol version",
-			"version", ver,
+			"version", info.ProtocolVersion,
 			"expected_version", version.RuntimeHostProtocol,
 		)
 		return nil, fmt.Errorf("rhp: incompatible protocol version (expected: %s got: %s)",
 			version.RuntimeHostProtocol,
-			ver,
+			info.ProtocolVersion,
 		)
 	}
 
-	rtVersion := version.FromU64(info.RuntimeVersion)
+	rtVersion := info.RuntimeVersion
 	c.logger.Info("runtime host protocol initialized", "runtime_version", rtVersion)
 
 	// Transition the protocol state to Ready.

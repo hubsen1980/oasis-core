@@ -1,11 +1,12 @@
 //! Key manager API common types and functions.
-use anyhow::Result;
-use lazy_static::lazy_static;
-use oasis_core_runtime::common::{cbor, crypto::signature::PublicKey as OasisPublicKey};
 use std::{
     collections::HashSet,
     sync::{Mutex, Once},
 };
+
+use lazy_static::lazy_static;
+
+use oasis_core_runtime::common::crypto::signature::PublicKey as OasisPublicKey;
 
 #[macro_use]
 pub mod api;
@@ -35,14 +36,14 @@ const POLICY_SIGN_CONTEXT: &'static [u8] = b"oasis-core/keymanager: policy";
 
 impl SignedPolicySGX {
     /// Verify the signatures and return the PolicySGX, if the signatures are correct.
-    pub fn verify(&self) -> Result<PolicySGX> {
+    pub fn verify(&self) -> Result<PolicySGX, KeyManagerError> {
         // Verify the signatures.
-        let untrusted_policy_raw = cbor::to_vec(&self.policy);
+        let untrusted_policy_raw = cbor::to_vec(self.policy.clone());
         let mut signers: HashSet<OasisPublicKey> = HashSet::new();
         for sig in &self.signatures {
             let public_key = match sig.public_key {
                 Some(public_key) => public_key,
-                None => return Err(KeyManagerError::PolicyInvalid.into()),
+                None => return Err(KeyManagerError::PolicyInvalid),
             };
 
             if !sig
@@ -50,7 +51,7 @@ impl SignedPolicySGX {
                 .verify(&public_key, &POLICY_SIGN_CONTEXT, &untrusted_policy_raw)
                 .is_ok()
             {
-                return Err(KeyManagerError::PolicyInvalidSignature.into());
+                return Err(KeyManagerError::PolicyInvalidSignature);
             }
             signers.insert(public_key);
         }
@@ -62,8 +63,8 @@ impl SignedPolicySGX {
             Some(_) => 2,
             None => trusted_signers.threshold,
         };
-        if signers.len() < multisig_threshold {
-            return Err(KeyManagerError::PolicyInsufficientSignatures.into());
+        if signers.len() < multisig_threshold as usize {
+            return Err(KeyManagerError::PolicyInsufficientSignatures);
         }
 
         Ok(self.policy.clone())

@@ -25,7 +25,7 @@ func (h *testHandler) Handle(ctx context.Context, body *Body) (*Body, error) {
 		return &Body{
 			RuntimeInfoResponse: &RuntimeInfoResponse{
 				// Need to use the correct version.
-				ProtocolVersion: version.RuntimeHostProtocol.ToU64(),
+				ProtocolVersion: version.RuntimeHostProtocol,
 			},
 		}, nil
 	}
@@ -60,12 +60,12 @@ func TestEchoRequestResponse(t *testing.T) {
 
 	err = protoA.InitGuest(context.Background(), connA)
 	require.NoError(err, "A.InitGuest()")
-	_, err = protoB.InitHost(context.Background(), connB)
+	_, err = protoB.InitHost(context.Background(), connB, &HostInfo{})
 	require.NoError(err, "B.InitHost()")
 
-	require.Panics(func() { _, _ = protoA.InitHost(context.Background(), connA) }, "connection reinit should panic")
+	require.Panics(func() { _, _ = protoA.InitHost(context.Background(), connA, &HostInfo{}) }, "connection reinit should panic")
 	require.Panics(func() { _ = protoA.InitGuest(context.Background(), connA) }, "connection reinit should panic")
-	require.Panics(func() { _, _ = protoB.InitHost(context.Background(), connB) }, "connection reinit should panic")
+	require.Panics(func() { _, _ = protoB.InitHost(context.Background(), connB, &HostInfo{}) }, "connection reinit should panic")
 	require.Panics(func() { _ = protoB.InitGuest(context.Background(), connB) }, "connection reinit should panic")
 
 	reqA := Body{Empty: &Empty{}}
@@ -90,9 +90,9 @@ func TestEchoRequestResponse(t *testing.T) {
 	_, err = protoB.Call(context.Background(), &reqB)
 	require.Error(err, "B.Call() must error when connection is closed")
 
-	require.Panics(func() { _, _ = protoA.InitHost(context.Background(), connA) }, "connection reinit should panic")
+	require.Panics(func() { _, _ = protoA.InitHost(context.Background(), connA, &HostInfo{}) }, "connection reinit should panic")
 	require.Panics(func() { _ = protoA.InitGuest(context.Background(), connA) }, "connection reinit should panic")
-	require.Panics(func() { _, _ = protoB.InitHost(context.Background(), connB) }, "connection reinit should panic")
+	require.Panics(func() { _, _ = protoB.InitHost(context.Background(), connB, &HostInfo{}) }, "connection reinit should panic")
 	require.Panics(func() { _ = protoB.InitGuest(context.Background(), connB) }, "connection reinit should panic")
 }
 
@@ -111,7 +111,7 @@ func TestBigMessage(t *testing.T) {
 
 	err = protoA.InitGuest(context.Background(), connA)
 	require.NoError(err, "A.InitGuest()")
-	_, err = protoB.InitHost(context.Background(), connB)
+	_, err = protoB.InitHost(context.Background(), connB, &HostInfo{})
 	require.NoError(err, "B.InitHost()")
 
 	rq := make([]byte, 2000000)

@@ -3,11 +3,10 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
@@ -21,26 +20,28 @@ import (
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	runtimeTransaction "github.com/oasisprotocol/oasis-core/go/runtime/transaction"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/database"
 )
 
 const (
-	cfgClientBinaryDir  = "client.binary_dir"
-	cfgRuntimeBinaryDir = "runtime.binary_dir"
-	cfgRuntimeLoader    = "runtime.loader"
-	cfgTEEHardware      = "tee_hardware"
-	cfgIasMock          = "ias.mock"
-	cfgEpochInterval    = "epoch.interval"
+	cfgRuntimeBinaryDirDefault  = "runtime.binary_dir.default"
+	cfgRuntimeBinaryDirIntelSGX = "runtime.binary_dir.intel-sgx"
+	cfgRuntimeLoader            = "runtime.loader"
+	cfgTEEHardware              = "tee_hardware"
+	cfgIasMock                  = "ias.mock"
+	cfgEpochInterval            = "epoch.interval"
 )
 
 var (
 	// RuntimeParamsDummy is a dummy instance of runtimeImpl used to register global e2e/runtime flags.
-	RuntimeParamsDummy *runtimeImpl = newRuntimeImpl("", "", []string{})
+	RuntimeParamsDummy *runtimeImpl = newRuntimeImpl("", nil)
 
 	// Runtime is the basic network + client test case with runtime support.
-	Runtime scenario.Scenario = newRuntimeImpl("runtime", "simple-keyvalue-client", nil)
+	Runtime scenario.Scenario = newRuntimeImpl("runtime", BasicKVTestClient)
 	// RuntimeEncryption is the basic network + client with encryption test case.
-	RuntimeEncryption scenario.Scenario = newRuntimeImpl("runtime-encryption", "simple-keyvalue-enc-client", nil)
+	RuntimeEncryption scenario.Scenario = newRuntimeImpl("runtime-encryption", BasicKVEncTestClient)
 
 	// DefaultRuntimeLogWatcherHandlerFactories is a list of default log watcher
 	// handler factories for the basic scenario.
@@ -60,11 +61,10 @@ var (
 type runtimeImpl struct {
 	e2e.E2E
 
-	clientBinary string
-	clientArgs   []string
+	testClient TestClient
 }
 
-func newRuntimeImpl(name, clientBinary string, clientArgs []string) *runtimeImpl {
+func newRuntimeImpl(name string, testClient TestClient) *runtimeImpl {
 	// Empty scenario name is used for registering global parameters only.
 	fullName := "runtime"
 	if name != "" {
@@ -72,12 +72,11 @@ func newRuntimeImpl(name, clientBinary string, clientArgs []string) *runtimeImpl
 	}
 
 	sc := &runtimeImpl{
-		E2E:          *e2e.NewE2E(fullName),
-		clientBinary: clientBinary,
-		clientArgs:   clientArgs,
+		E2E:        *e2e.NewE2E(fullName),
+		testClient: testClient,
 	}
-	sc.Flags.String(cfgClientBinaryDir, "", "path to the client binaries directory")
-	sc.Flags.String(cfgRuntimeBinaryDir, "", "path to the runtime binaries directory")
+	sc.Flags.String(cfgRuntimeBinaryDirDefault, "", "(no-TEE) path to the runtime binaries directory")
+	sc.Flags.String(cfgRuntimeBinaryDirIntelSGX, "", "(Intel SGX) path to the runtime binaries directory")
 	sc.Flags.String(cfgRuntimeLoader, "oasis-core-runtime-loader", "path to the runtime loader")
 	sc.Flags.String(cfgTEEHardware, "", "TEE hardware to use")
 	sc.Flags.Bool(cfgIasMock, true, "if mock IAS service should be used")
@@ -87,10 +86,13 @@ func newRuntimeImpl(name, clientBinary string, clientArgs []string) *runtimeImpl
 }
 
 func (sc *runtimeImpl) Clone() scenario.Scenario {
+	var testClient TestClient
+	if sc.testClient != nil {
+		testClient = sc.testClient.Clone()
+	}
 	return &runtimeImpl{
-		E2E:          sc.E2E.Clone(),
-		clientBinary: sc.clientBinary,
-		clientArgs:   sc.clientArgs,
+		E2E:        sc.E2E.Clone(),
+		testClient: testClient,
 	}
 }
 
@@ -112,18 +114,11 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 	if tee == node.TEEHardwareIntelSGX {
 		mrSigner = &sgx.FortanixDummyMrSigner
 	}
-	keyManagerBinary, err := sc.resolveDefaultKeyManagerBinary()
-	if err != nil {
-		return nil, err
-	}
-	runtimeBinary, err := sc.resolveRuntimeBinary("simple-keyvalue")
-	if err != nil {
-		return nil, err
-	}
+	keyManagerBinary := "simple-keymanager"
+	runtimeBinary := "simple-keyvalue"
 	runtimeLoader, _ := sc.Flags.GetString(cfgRuntimeLoader)
 	iasMock, _ := sc.Flags.GetBool(cfgIasMock)
-	epochInterval, _ := sc.Flags.GetInt64(cfgEpochInterval)
-	return &oasis.NetworkFixture{
+	ff := &oasis.NetworkFixture{
 		TEE: oasis.TEEFixture{
 			Hardware: tee,
 			MrSigner: mrSigner,
@@ -136,7 +131,6 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 			IAS: oasis.IASCfg{
 				Mock: iasMock,
 			},
-			EpochtimeTendermintInterval: epochInterval,
 		},
 		Entities: []oasis.EntityCfg{
 			{IsDebugTestEntity: true},
@@ -152,7 +146,8 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 				},
-				Binaries: []string{keyManagerBinary},
+				Binaries:        sc.resolveRuntimeBinaries([]string{keyManagerBinary}),
+				GovernanceModel: registry.GovernanceEntity,
 			},
 			// Compute runtime.
 			{
@@ -160,11 +155,12 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 				Kind:       registry.KindCompute,
 				Entity:     0,
 				Keymanager: 0,
-				Binaries:   []string{runtimeBinary},
+				Binaries:   sc.resolveRuntimeBinaries([]string{runtimeBinary}),
 				Executor: registry.ExecutorParameters{
 					GroupSize:       2,
 					GroupBackupSize: 1,
 					RoundTimeout:    20,
+					MaxMessages:     128,
 				},
 				TxnScheduler: registry.TxnSchedulerParameters{
 					Algorithm:         registry.TxnSchedulerSimple,
@@ -182,10 +178,32 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 				},
+				Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+					scheduler.KindComputeExecutor: {
+						scheduler.RoleWorker: {
+							MinPoolSize: &registry.MinPoolSizeConstraint{
+								Limit: 2,
+							},
+						},
+						scheduler.RoleBackupWorker: {
+							MinPoolSize: &registry.MinPoolSizeConstraint{
+								Limit: 1,
+							},
+						},
+					},
+					scheduler.KindStorage: {
+						scheduler.RoleWorker: {
+							MinPoolSize: &registry.MinPoolSizeConstraint{
+								Limit: 2,
+							},
+						},
+					},
+				},
+				GovernanceModel: registry.GovernanceEntity,
 			},
 		},
 		Validators: []oasis.ValidatorFixture{
-			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true, SupplementarySanityInterval: 1}},
 			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
 			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
 		},
@@ -201,33 +219,34 @@ func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
 		},
 		ComputeWorkers: []oasis.ComputeWorkerFixture{
 			{Entity: 1, Runtimes: []int{1}},
-			{Entity: 1, Runtimes: []int{1}},
+			{Entity: 1, Runtimes: []int{1}, RuntimeConfig: map[int]map[string]interface{}{
+				1: {
+					"core": map[string]interface{}{
+						"min_gas_price": 1, // Just to test support for runtime configuration.
+					},
+				},
+			}},
 			{Entity: 1, Runtimes: []int{1}},
 		},
 		Sentries: []oasis.SentryFixture{},
 		Seeds:    []oasis.SeedFixture{{}},
 		Clients: []oasis.ClientFixture{
-			{},
+			{Runtimes: []int{1}},
 		},
-	}, nil
-}
-
-func (sc *runtimeImpl) start(childEnv *env.Env) (<-chan error, *exec.Cmd, error) {
-	var err error
-	if err = sc.Net.Start(); err != nil {
-		return nil, nil, err
 	}
 
-	cmd, err := sc.startClient(childEnv)
-	if err != nil {
-		return nil, nil, err
+	if epochInterval, _ := sc.Flags.GetInt64(cfgEpochInterval); epochInterval > 0 {
+		ff.Network.Beacon.InsecureParameters = &beacon.InsecureParameters{
+			Interval: epochInterval,
+		}
+		ff.Network.Beacon.PVSSParameters = &beacon.PVSSParameters{
+			CommitInterval:  epochInterval / 2,
+			RevealInterval:  (epochInterval / 2) - 4,
+			TransitionDelay: 4,
+		}
 	}
 
-	clientErrCh := make(chan error)
-	go func() {
-		clientErrCh <- cmd.Wait()
-	}()
-	return clientErrCh, cmd, nil
+	return ff, nil
 }
 
 // getTEEHardware returns the configured TEE hardware.
@@ -240,101 +259,82 @@ func (sc *runtimeImpl) getTEEHardware() (node.TEEHardware, error) {
 	return tee, nil
 }
 
-func (sc *runtimeImpl) resolveClientBinary(clientBinary string) string {
-	cbDir, _ := sc.Flags.GetString(cfgClientBinaryDir)
-	return filepath.Join(cbDir, clientBinary)
+func (sc *runtimeImpl) resolveRuntimeBinaries(runtimeBinaries []string) map[node.TEEHardware][]string {
+	binaries := make(map[node.TEEHardware][]string)
+	for _, tee := range []node.TEEHardware{
+		node.TEEHardwareInvalid,
+		node.TEEHardwareIntelSGX,
+	} {
+		for _, binary := range runtimeBinaries {
+			binaries[tee] = append(binaries[tee], sc.resolveRuntimeBinary(binary, tee))
+		}
+	}
+	return binaries
 }
 
-func (sc *runtimeImpl) resolveRuntimeBinary(runtimeBinary string) (string, error) {
-	tee, err := sc.getTEEHardware()
-	if err != nil {
-		return "", err
-	}
-
-	var runtimeExt string
+func (sc *runtimeImpl) resolveRuntimeBinary(runtimeBinary string, tee node.TEEHardware) string {
+	var runtimeExt, path string
 	switch tee {
 	case node.TEEHardwareInvalid:
 		runtimeExt = ""
+		path, _ = sc.Flags.GetString(cfgRuntimeBinaryDirDefault)
 	case node.TEEHardwareIntelSGX:
 		runtimeExt = ".sgxs"
+		path, _ = sc.Flags.GetString(cfgRuntimeBinaryDirIntelSGX)
 	}
 
-	rtBinDir, _ := sc.Flags.GetString(cfgRuntimeBinaryDir)
-	return filepath.Join(rtBinDir, runtimeBinary+runtimeExt), nil
+	return filepath.Join(path, runtimeBinary+runtimeExt)
 }
 
-func (sc *runtimeImpl) resolveDefaultKeyManagerBinary() (string, error) {
-	return sc.resolveRuntimeBinary("simple-keymanager")
+func (sc *runtimeImpl) startNetworkAndTestClient(ctx context.Context, childEnv *env.Env) error {
+	// Start the network
+	if err := sc.startNetworkAndWaitForClientSync(ctx); err != nil {
+		return fmt.Errorf("failed to initialize network: %w", err)
+	}
+
+	return sc.startTestClientOnly(ctx, childEnv)
 }
 
-func (sc *runtimeImpl) startClient(childEnv *env.Env) (*exec.Cmd, error) {
-	clients := sc.Net.Clients()
-	if len(clients) == 0 {
-		return nil, fmt.Errorf("scenario/e2e: network has no client nodes")
+func (sc *runtimeImpl) startTestClientOnly(ctx context.Context, childEnv *env.Env) error {
+	if err := sc.testClient.Init(sc); err != nil {
+		return fmt.Errorf("failed to initialize test client: %w", err)
 	}
 
-	d, err := childEnv.NewSubDir("client")
-	if err != nil {
-		return nil, err
-	}
-
-	w, err := d.NewLogWriter("client.log")
-	if err != nil {
-		return nil, err
-	}
-
-	args := []string{
-		"--node-address", "unix:" + clients[0].SocketPath(),
-		"--runtime-id", runtimeID.String(),
-	}
-	args = append(args, sc.clientArgs...)
-
-	binary := sc.resolveClientBinary(sc.clientBinary)
-	cmd := exec.Command(binary, args...)
-	cmd.SysProcAttr = env.CmdAttrs
-	cmd.Stdout = w
-	cmd.Stderr = w
-
-	sc.Logger.Info("launching client",
-		"binary", binary,
-		"args", strings.Join(args, " "),
-	)
-
-	if err = cmd.Start(); err != nil {
-		return nil, fmt.Errorf("scenario/e2e: failed to start client: %w", err)
-	}
-
-	return cmd, nil
-}
-
-func (sc *runtimeImpl) waitClient(childEnv *env.Env, cmd *exec.Cmd, clientErrCh <-chan error) error {
-	var err error
-	select {
-	case err = <-sc.Net.Errors():
-		_ = cmd.Process.Kill()
-	case err = <-clientErrCh:
-	}
-	if err != nil {
-		return err
+	if err := sc.testClient.Start(ctx, childEnv); err != nil {
+		return fmt.Errorf("failed to start test client: %w", err)
 	}
 
 	return nil
 }
 
-func (sc *runtimeImpl) wait(childEnv *env.Env, cmd *exec.Cmd, clientErrCh <-chan error) error {
-	if err := sc.waitClient(childEnv, cmd, clientErrCh); err != nil {
-		return err
-	}
+func (sc *runtimeImpl) waitTestClientOnly() error {
+	return sc.testClient.Wait()
+}
+
+func (sc *runtimeImpl) checkTestClientLogs() error {
+	// Wait for logs to be fully processed before checking them. When
+	// the client exits very quickly the log watchers may not have
+	// processed the relevant logs yet.
+	//
+	// TODO: Find a better way to synchronize log watchers.
+	time.Sleep(1 * time.Second)
+
 	return sc.Net.CheckLogWatchers()
 }
 
-func (sc *runtimeImpl) Run(childEnv *env.Env) error {
-	clientErrCh, cmd, err := sc.start(childEnv)
-	if err != nil {
+func (sc *runtimeImpl) waitTestClient() error {
+	if err := sc.waitTestClientOnly(); err != nil {
 		return err
 	}
+	return sc.checkTestClientLogs()
+}
 
-	return sc.wait(childEnv, cmd, clientErrCh)
+func (sc *runtimeImpl) Run(childEnv *env.Env) error {
+	ctx := context.Background()
+	if err := sc.startNetworkAndTestClient(ctx, childEnv); err != nil {
+		return err
+	}
+	return sc.waitTestClient()
 }
 
 func (sc *runtimeImpl) submitRuntimeTx(ctx context.Context, id common.Namespace, method string, args interface{}) (cbor.RawMessage, error) {
@@ -361,15 +361,46 @@ func (sc *runtimeImpl) submitRuntimeTx(ctx context.Context, id common.Namespace,
 	return rsp.Success, nil
 }
 
-func (sc *runtimeImpl) submitKeyValueRuntimeInsertTx(ctx context.Context, id common.Namespace, key, value string) error {
-	_, err := sc.submitRuntimeTx(ctx, id, "insert", struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+func (sc *runtimeImpl) submitConsensusXferTx(
+	ctx context.Context,
+	id common.Namespace,
+	xfer staking.Transfer,
+	nonce uint64,
+) error {
+	_, err := sc.submitRuntimeTx(ctx, runtimeID, "consensus_transfer", struct {
+		Transfer staking.Transfer `json:"transfer"`
+		Nonce    uint64           `json:"nonce"`
 	}{
-		Key:   key,
-		Value: value,
+		Transfer: xfer,
+		Nonce:    nonce,
 	})
 	return err
+}
+
+func (sc *runtimeImpl) waitForClientSync(ctx context.Context) error {
+	clients := sc.Net.Clients()
+	if len(clients) == 0 {
+		return fmt.Errorf("scenario/e2e: network has no client nodes")
+	}
+
+	sc.Logger.Info("ensuring client node is synced")
+	ctrl, err := oasis.NewController(clients[0].SocketPath())
+	if err != nil {
+		return fmt.Errorf("failed to create controller for client: %w", err)
+	}
+	if err = ctrl.WaitSync(ctx); err != nil {
+		return fmt.Errorf("client-0 failed to sync: %w", err)
+	}
+
+	return nil
+}
+
+func (sc *runtimeImpl) startNetworkAndWaitForClientSync(ctx context.Context) error {
+	if err := sc.Net.Start(); err != nil {
+		return err
+	}
+
+	return sc.waitForClientSync(ctx)
 }
 
 func (sc *runtimeImpl) waitNodesSynced() error {
@@ -391,22 +422,22 @@ func (sc *runtimeImpl) waitNodesSynced() error {
 	sc.Logger.Info("waiting for all nodes to be synced")
 
 	for _, n := range sc.Net.Validators() {
-		if err := checkSynced(&n.Node); err != nil {
+		if err := checkSynced(n.Node); err != nil {
 			return err
 		}
 	}
 	for _, n := range sc.Net.StorageWorkers() {
-		if err := checkSynced(&n.Node); err != nil {
+		if err := checkSynced(n.Node); err != nil {
 			return err
 		}
 	}
 	for _, n := range sc.Net.ComputeWorkers() {
-		if err := checkSynced(&n.Node); err != nil {
+		if err := checkSynced(n.Node); err != nil {
 			return err
 		}
 	}
 	for _, n := range sc.Net.Clients() {
-		if err := checkSynced(&n.Node); err != nil {
+		if err := checkSynced(n.Node); err != nil {
 			return err
 		}
 	}
@@ -509,6 +540,11 @@ func RegisterScenarios() error {
 		// Runtime test.
 		Runtime,
 		RuntimeEncryption,
+		RuntimeGovernance,
+		RuntimeMessage,
+		// Single node with multiple workers tests.
+		MultihostDouble,
+		MultihostTriple,
 		// Byzantine executor node.
 		ByzantineExecutorHonest,
 		ByzantineExecutorSchedulerHonest,
@@ -523,8 +559,11 @@ func RegisterScenarios() error {
 		ByzantineStorageFailApply,
 		ByzantineStorageFailApplyBatch,
 		ByzantineStorageFailRead,
+		ByzantineStorageCorruptGetDiff,
 		// Storage sync test.
 		StorageSync,
+		StorageSyncFromRegistered,
+		StorageSyncInconsistent,
 		// Sentry test.
 		Sentry,
 		SentryEncryption,
@@ -534,12 +573,19 @@ func RegisterScenarios() error {
 		KeymanagerReplicate,
 		// Dump/restore test.
 		DumpRestore,
+		DumpRestoreRuntimeRoundAdvance,
 		// Halt test.
 		HaltRestore,
+		HaltRestoreSuspended,
+		// Consensus upgrade tests.
+		GovernanceConsensusUpgrade,
+		GovernanceConsensusFailUpgrade,
+		GovernanceConsensusCancelUpgrade,
 		// Multiple runtimes test.
 		MultipleRuntimes,
 		// Node shutdown test.
 		NodeShutdown,
+		OffsetRestart,
 		// Gas fees tests.
 		GasFeesRuntimes,
 		// Runtime prune test.
@@ -568,6 +614,10 @@ func RegisterScenarios() error {
 	for _, s := range []scenario.Scenario{
 		// Transaction source test. Non-default, because it runs for ~6 hours.
 		TxSourceMulti,
+		// SGX version of the txsource-multi-short test. Non-default, because
+		// it is identical to the txsource-multi-short, only using fewer nodes
+		// due to SGX CI instance resource constrains.
+		TxSourceMultiShortSGX,
 	} {
 		if err := cmd.RegisterNondefault(s); err != nil {
 			return err

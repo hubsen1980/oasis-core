@@ -5,6 +5,7 @@ import (
 	"context"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
@@ -12,7 +13,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
@@ -45,8 +45,8 @@ type NodeController interface {
 	// and shut down.
 	UpgradeBinary(ctx context.Context, descriptor *upgrade.Descriptor) error
 
-	// CancelUpgrade cancels a pending upgrade, unless it is already in progress.
-	CancelUpgrade(ctx context.Context) error
+	// CancelUpgrade cancels the specific pending upgrade, unless it is already in progress.
+	CancelUpgrade(ctx context.Context, descriptor *upgrade.Descriptor) error
 
 	// GetStatus returns the current status overview of the node.
 	GetStatus(ctx context.Context) (*Status, error)
@@ -68,6 +68,9 @@ type Status struct {
 
 	// Registration is the node's registration status.
 	Registration RegistrationStatus `json:"registration"`
+
+	// PendingUpgrades are the node's pending upgrades.
+	PendingUpgrades []*upgrade.PendingUpgrade `json:"pending_upgrades"`
 }
 
 // IdentityStatus is the current node identity status, listing all the public keys that identify
@@ -95,6 +98,9 @@ type RegistrationStatus struct {
 	// Descriptor is the node descriptor that the node successfully registered with. In case the
 	// node did not successfully register yet, it will be nil.
 	Descriptor *node.Node `json:"descriptor,omitempty"`
+
+	// NodeStatus is the registry live status of the node.
+	NodeStatus *registry.NodeStatus `json:"node_status,omitempty"`
 }
 
 // RuntimeStatus is the per-runtime status overview.
@@ -139,12 +145,15 @@ type ControlledNode interface {
 
 	// GetRuntimeStatus returns the node's current per-runtime status.
 	GetRuntimeStatus(ctx context.Context) (map[common.Namespace]RuntimeStatus, error)
+
+	// GetPendingUpgrade returns the node's pending upgrades.
+	GetPendingUpgrades(ctx context.Context) ([]*upgrade.PendingUpgrade, error)
 }
 
 // DebugModuleName is the module name for the debug controller service.
 const DebugModuleName = "control/debug"
 
-// ErrIncompatibleBackend is the error raised when the current epochtime
+// ErrIncompatibleBackend is the error raised when the current beacon
 // backend does not support manually setting the current epoch.
 var ErrIncompatibleBackend = errors.New(DebugModuleName, 1, "debug: incompatible backend")
 
@@ -152,9 +161,9 @@ var ErrIncompatibleBackend = errors.New(DebugModuleName, 1, "debug: incompatible
 type DebugController interface {
 	// SetEpoch manually sets the current epoch to the given epoch.
 	//
-	// NOTE: This only works with a mock epochtime backend and will otherwise
+	// NOTE: This only works with a mock beacon backend and will otherwise
 	//       return an error.
-	SetEpoch(ctx context.Context, epoch epochtime.EpochTime) error
+	SetEpoch(ctx context.Context, epoch beacon.EpochTime) error
 
 	// WaitNodesRegistered waits for the given number of nodes to register.
 	WaitNodesRegistered(ctx context.Context, count int) error

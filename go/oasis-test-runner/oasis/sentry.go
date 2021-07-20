@@ -11,7 +11,7 @@ import (
 
 // Sentry is an Oasis sentry node.
 type Sentry struct {
-	Node
+	*Node
 
 	validatorIndices  []int
 	storageIndices    []int
@@ -54,7 +54,7 @@ func (sentry *Sentry) GetSentryControlAddress() string {
 	return fmt.Sprintf("127.0.0.1:%d", sentry.controlPort)
 }
 
-func (sentry *Sentry) startNode() error {
+func (sentry *Sentry) AddArgs(args *argBuilder) error {
 	validators, err := resolveValidators(sentry.net, sentry.validatorIndices)
 	if err != nil {
 		return err
@@ -70,39 +70,37 @@ func (sentry *Sentry) startNode() error {
 		return err
 	}
 
-	args := newArgBuilder().
-		debugDontBlameOasis().
+	args.debugDontBlameOasis().
 		debugAllowTestKeys().
+		debugEnableProfiling(sentry.Node.pprofPort).
 		workerCertificateRotation(false).
 		workerSentryEnabled().
 		workerSentryControlPort(sentry.controlPort).
 		tendermintCoreAddress(sentry.consensusPort).
 		tendermintPrune(sentry.consensus.PruneNumKept).
 		tendermintRecoverCorruptedWAL(sentry.consensus.TendermintRecoverCorruptedWAL).
+		configureDebugCrashPoints(sentry.crashPointsProbability).
+		tendermintSupplementarySanity(sentry.supplementarySanityInterval).
 		appendNetwork(sentry.net).
 		appendSeedNodes(sentry.net.seeds).
 		internalSocketAddress(sentry.net.validators[0].SocketPath())
 
 	if len(validators) > 0 {
-		args = args.addValidatorsAsSentryUpstreams(validators)
+		args.addValidatorsAsSentryUpstreams(validators)
 	}
 
 	if len(storageWorkers) > 0 || len(keymanagerWorkers) > 0 {
-		args = args.workerGrpcSentryEnabled().
+		args.workerGrpcSentryEnabled().
 			workerSentryGrpcClientAddress([]string{fmt.Sprintf("127.0.0.1:%d", sentry.sentryPort)}).
 			workerSentryGrpcClientPort(sentry.sentryPort)
 	}
 
 	if len(storageWorkers) > 0 {
-		args = args.addSentryStorageWorkers(storageWorkers)
+		args.addSentryStorageWorkers(storageWorkers)
 	}
 
 	if len(keymanagerWorkers) > 0 {
-		args = args.addSentryKeymanagerWorkers(keymanagerWorkers)
-	}
-
-	if err = sentry.net.startOasisNode(&sentry.Node, nil, args); err != nil {
-		return fmt.Errorf("oasis/sentry: failed to launch node %s: %w", sentry.Name, err)
+		args.addSentryKeymanagerWorkers(keymanagerWorkers)
 	}
 
 	return nil
@@ -111,20 +109,15 @@ func (sentry *Sentry) startNode() error {
 // NewSentry provisions a new sentry node and adds it to the network.
 func (net *Network) NewSentry(cfg *SentryCfg) (*Sentry, error) {
 	sentryName := fmt.Sprintf("sentry-%d", len(net.sentries))
-
-	sentryDir, err := net.baseDir.NewSubDir(sentryName)
+	host, err := net.GetNamedNode(sentryName, &cfg.NodeCfg)
 	if err != nil {
-		net.logger.Error("failed to create sentry subdir",
-			"err", err,
-			"sentry_name", sentryName,
-		)
-		return nil, fmt.Errorf("oasis/sentry: failed to create sentry subdir: %w", err)
+		return nil, err
 	}
 
 	// Pre-provision node's identity to pass the sentry node's consensus
 	// address to the validator so it can configure the sentry node's consensus
 	// address as its consensus address.
-	signerFactory, err := fileSigner.NewFactory(sentryDir.String(), signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	signerFactory, err := fileSigner.NewFactory(host.dir.String(), signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
 	if err != nil {
 		net.logger.Error("failed to create sentry signer factory",
 			"err", err,
@@ -132,7 +125,7 @@ func (net *Network) NewSentry(cfg *SentryCfg) (*Sentry, error) {
 		)
 		return nil, fmt.Errorf("oasis/sentry: failed to create sentry file signer: %w", err)
 	}
-	sentryIdentity, err := identity.LoadOrGenerate(sentryDir.String(), signerFactory, true)
+	sentryIdentity, err := identity.LoadOrGenerate(host.dir.String(), signerFactory, true)
 	if err != nil {
 		net.logger.Error("failed to provision sentry identity",
 			"err", err,
@@ -144,35 +137,20 @@ func (net *Network) NewSentry(cfg *SentryCfg) (*Sentry, error) {
 	sentryTLSPublicKey := sentryIdentity.GetTLSSigner().Public()
 
 	sentry := &Sentry{
-		Node: Node{
-			Name:                                     sentryName,
-			net:                                      net,
-			dir:                                      sentryDir,
-			disableDefaultLogWatcherHandlerFactories: cfg.DisableDefaultLogWatcherHandlerFactories,
-			logWatcherHandlerFactories:               cfg.LogWatcherHandlerFactories,
-		},
+		Node:              host,
 		validatorIndices:  cfg.ValidatorIndices,
 		storageIndices:    cfg.StorageIndices,
 		keymanagerIndices: cfg.KeymanagerIndices,
 		p2pPublicKey:      sentryP2PPublicKey,
 		tlsPublicKey:      sentryTLSPublicKey,
 		tmAddress:         crypto.PublicKeyToTendermint(&sentryP2PPublicKey).Address().String(),
-		consensusPort:     net.nextNodePort,
-		controlPort:       net.nextNodePort + 1,
-		sentryPort:        net.nextNodePort + 2,
+		consensusPort:     host.getProvisionedPort(nodePortConsensus),
+		controlPort:       host.getProvisionedPort("sentry-control"),
+		sentryPort:        host.getProvisionedPort("sentry-client"),
 	}
-	sentry.doStartNode = sentry.startNode
 
 	net.sentries = append(net.sentries, sentry)
-	net.nextNodePort += 3
-
-	if err := net.AddLogWatcher(&sentry.Node); err != nil {
-		net.logger.Error("failed to add log watcher",
-			"err", err,
-			"sentry_name", sentryName,
-		)
-		return nil, fmt.Errorf("oasis/sentry: failed to add log watcher for %s: %w", sentryName, err)
-	}
+	host.features = append(host.features, sentry)
 
 	return sentry, nil
 }

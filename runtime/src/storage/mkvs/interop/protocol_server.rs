@@ -4,23 +4,24 @@
 //! This should only be used for testing.
 use std::{
     any::Any,
+    fmt,
     process::{Child, Command},
-    sync::Arc,
+    thread, time,
 };
 
 use anyhow::Result;
-use grpcio::{ChannelBuilder, EnvBuilder};
 use io_context::Context;
 use tempfile::{self, TempDir};
 
 use super::{rpc, Driver};
 use crate::{
-    common::{crypto::hash::Hash, roothash::Namespace},
-    storage::mkvs::{sync::*, WriteLog},
+    common::{crypto::hash::Hash, namespace::Namespace},
+    storage::mkvs::{sync::*, tree::RootType, WriteLog},
 };
 
 /// Location of the protocol server binary.
-const PROTOCOL_SERVER_BINARY: &'static str = env!("OASIS_STORAGE_PROTOCOL_SERVER_BINARY");
+static PROTOCOL_SERVER_BINARY: Option<&'static str> =
+    option_env!("OASIS_STORAGE_PROTOCOL_SERVER_BINARY");
 
 /// Interoperability protocol server for testing storage.
 pub struct ProtocolServer {
@@ -34,9 +35,24 @@ struct ProtocolServerReadSyncer {
     client: rpc::StorageClient,
 }
 
+/// Interoperability protocol server fixtures.
+pub enum Fixture {
+    None,
+    ConsensusMock,
+}
+
+impl fmt::Display for Fixture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Fixture::ConsensusMock => write!(f, "consensus_mock"),
+            _ => write!(f, ""),
+        }
+    }
+}
+
 impl ProtocolServer {
     /// Create a new protocol server for testing.
-    pub fn new() -> Self {
+    pub fn new(fixture: Option<Fixture>) -> Self {
         let datadir = tempfile::Builder::new()
             .prefix("oasis-test-storage-protocol-server")
             .tempdir()
@@ -44,22 +60,24 @@ impl ProtocolServer {
         let socket_path = datadir.path().join("socket");
 
         // Start protocol server.
-        let server_process = Command::new(PROTOCOL_SERVER_BINARY)
+        let server_binary = PROTOCOL_SERVER_BINARY.expect("no server binary configured");
+        let mut server_cmd = Command::new(server_binary);
+        server_cmd
             .arg("proto-server")
             .arg("--datadir")
             .arg(datadir.path())
             .arg("--socket")
             .arg(socket_path.clone())
-            .spawn()
-            .expect("protocol server failed to start");
+            .arg("--fixture")
+            .arg(fixture.unwrap_or(Fixture::None).to_string());
+        let server_process = server_cmd.spawn().expect("protocol server failed to start");
+
+        // Wait for the server to initialize, because the client is too
+        // stupid to attempt to reconnect if it can't the first time around.
+        thread::sleep(time::Duration::from_secs(5));
 
         // Create connection with the protocol server.
-        let env = Arc::new(EnvBuilder::new().build());
-        let channel = ChannelBuilder::new(env)
-            .max_receive_message_len(i32::max_value())
-            .max_send_message_len(i32::max_value())
-            .connect(&format!("unix:{}", socket_path.to_str().unwrap()));
-        let client = rpc::StorageClient::new(channel);
+        let client = rpc::StorageClient::new(socket_path.clone());
 
         Self {
             server_process,
@@ -100,6 +118,7 @@ impl Driver for ProtocolServer {
         self.client
             .apply(&rpc::ApplyRequest {
                 namespace,
+                root_type: RootType::State, // Doesn't matter for tests.
                 src_round: version,
                 src_root: existing_root,
                 dst_round: version,

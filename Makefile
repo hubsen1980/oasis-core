@@ -1,5 +1,3 @@
-#!/usr/bin/env gmake
-
 include common.mk
 
 # List of runtimes to build.
@@ -35,7 +33,7 @@ build-rust:
 	@$(ECHO) "$(MAGENTA)*** Building Rust libraries and runtime loader...$(OFF)"
 	@CARGO_TARGET_DIR=target/default cargo build
 
-build-go go:
+build-go:
 	@$(MAKE) -C go build
 
 build: $(build-targets)
@@ -65,20 +63,16 @@ fmt-go:
 fmt: $(fmt-targets)
 
 # Lint code, commits and documentation.
-lint-targets := lint-go lint-git lint-md lint-changelog lint-docs
+lint-targets := lint-go lint-git lint-md lint-changelog lint-docs lint-go-mod-tidy
 
 lint-go:
 	@$(MAKE) -C go lint
 
-# NOTE: gitlint internally uses git rev-list, where A..B is asymmetric difference, which is kind of the opposite of
-# how git diff interprets A..B vs A...B.
-lint-git: fetch-git
-	@COMMIT_SHA=`git rev-parse $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)` && \
-	echo "Running gitlint for commits from $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH) ($${COMMIT_SHA:0:7})..."; \
-	gitlint --commits $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)..HEAD
+lint-git:
+	@$(CHECK_GITLINT)
 
 lint-md:
-	@npx markdownlint-cli '**/*.md' --ignore .changelog/
+	@npx markdownlint-cli@$(MARKDOWNLINT_CLI_VERSION) '**/*.md' --ignore .changelog/
 
 lint-changelog:
 	@$(CHECK_CHANGELOG_FRAGMENTS)
@@ -86,6 +80,9 @@ lint-changelog:
 # Check whether docs are synced with source code.
 lint-docs:
 	@$(MAKE) -C docs check
+
+lint-go-mod-tidy:
+	@$(MAKE) -C go lint-mod-tidy
 
 lint: $(lint-targets)
 
@@ -132,14 +129,13 @@ clean: $(clean-targets)
 # Fetch all the latest changes (including tags) from the canonical upstream git
 # repository.
 fetch-git:
-	@$(ECHO) "Fetching the latest changes (including tags) from $(OASIS_CORE_GIT_ORIGIN_REMOTE) remote..."
-	@git fetch $(OASIS_CORE_GIT_ORIGIN_REMOTE) --tags
+	@$(ECHO) "Fetching the latest changes (including tags) from $(GIT_ORIGIN_REMOTE) remote..."
+	@git fetch $(GIT_ORIGIN_REMOTE) --tags
 
 # Private target for bumping project's version using the Punch tool.
 # NOTE: It should not be invoked directly.
 _version-bump: fetch-git
 	@$(ENSURE_VALID_RELEASE_BRANCH_NAME)
-	@$(ENSURE_GIT_VERSION_FROM_TAG_EQUALS_PUNCH_VERSION)
 	@$(PUNCH_BUMP_VERSION)
 	@git add $(PUNCH_VERSION_FILE)
 
@@ -165,14 +161,14 @@ release-tag: fetch-git
 	@$(ENSURE_RELEASE_TAG_DOES_NOT_EXIST)
 	@$(ENSURE_NO_CHANGELOG_FRAGMENTS)
 	@$(ENSURE_NEXT_RELEASE_IN_CHANGELOG)
-	@$(ECHO) "All checks have passed. Proceeding with tagging the $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)'s HEAD with tags:\n- $(RELEASE_TAG)\n- $(RELEASE_TAG_GO)"
+	@$(ECHO) "All checks have passed. Proceeding with tagging the $(GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)'s HEAD with tags:\n- $(RELEASE_TAG)\n- $(RELEASE_TAG_GO)"
 	@$(CONFIRM_ACTION)
 	@$(ECHO) "If this appears to be stuck, you might need to touch your security key for GPG sign operation."
-	@git tag --sign --message="Version $(PUNCH_VERSION)" $(RELEASE_TAG) $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)
+	@git tag --sign --message="Version $(PUNCH_VERSION)" $(RELEASE_TAG) $(GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)
 	@$(ECHO) "If this appears to be stuck, you might need to touch your security key for GPG sign operation."
-	@git tag --sign --message="Version $(PUNCH_VERSION)" $(RELEASE_TAG_GO) $(OASIS_CORE_GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)
-	@git push $(OASIS_CORE_GIT_ORIGIN_REMOTE) $(RELEASE_TAG) $(RELEASE_TAG_GO)
-	@$(ECHO) "$(CYAN)*** The following tags have been successfully pushed to $(OASIS_CORE_GIT_ORIGIN_REMOTE) remote:\n- $(RELEASE_TAG)\n- $(RELEASE_TAG_GO)$(OFF)"
+	@git tag --sign --message="Version $(PUNCH_VERSION)" $(RELEASE_TAG_GO) $(GIT_ORIGIN_REMOTE)/$(RELEASE_BRANCH)
+	@git push $(GIT_ORIGIN_REMOTE) $(RELEASE_TAG) $(RELEASE_TAG_GO)
+	@$(ECHO) "$(CYAN)*** The following tags have been successfully pushed to $(GIT_ORIGIN_REMOTE) remote:\n- $(RELEASE_TAG)\n- $(RELEASE_TAG_GO)$(OFF)"
 
 # Create and push a stable branch for the current release.
 release-stable-branch: fetch-git
@@ -180,11 +176,11 @@ release-stable-branch: fetch-git
 	@$(ENSURE_VALID_STABLE_BRANCH)
 	@$(ENSURE_RELEASE_TAG_EXISTS)
 	@$(ENSURE_STABLE_BRANCH_DOES_NOT_EXIST)
-	@$(ECHO) "All checks have passed. Proceeding with creating the '$(STABLE_BRANCH)' branch on $(OASIS_CORE_GIT_ORIGIN_REMOTE) remote."
+	@$(ECHO) "All checks have passed. Proceeding with creating the '$(STABLE_BRANCH)' branch on $(GIT_ORIGIN_REMOTE) remote."
 	@$(CONFIRM_ACTION)
 	@git branch $(STABLE_BRANCH) $(RELEASE_TAG)
-	@git push $(OASIS_CORE_GIT_ORIGIN_REMOTE) $(STABLE_BRANCH)
-	@$(ECHO) "$(CYAN)*** Branch '$(STABLE_BRANCH)' has been sucessfully pushed to $(OASIS_CORE_GIT_ORIGIN_REMOTE) remote.$(OFF)"
+	@git push $(GIT_ORIGIN_REMOTE) $(STABLE_BRANCH)
+	@$(ECHO) "$(CYAN)*** Branch '$(STABLE_BRANCH)' has been sucessfully pushed to $(GIT_ORIGIN_REMOTE) remote.$(OFF)"
 
 # Build and publish the next release.
 release-build:
@@ -212,7 +208,8 @@ docker-shell:
 
 # List of targets that are not actual files.
 .PHONY: \
-	$(build-targets) go build \
+	all \
+	$(build-targets) build \
 	build-helpers-go build-helpers build-go-generate \
 	update-docs \
 	$(fmt-targets) fmt \
@@ -220,7 +217,6 @@ docker-shell:
 	$(test-unit-targets) $(test-targets) test \
 	$(clean-targets) clean \
 	fetch-git \
-	_version_bump _changelog changelog \
+	_version-bump _changelog changelog \
 	release-tag release-stable-branch release-build \
-	docker-shell \
-	all
+	docker-shell

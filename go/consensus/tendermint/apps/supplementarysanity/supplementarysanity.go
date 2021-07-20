@@ -6,11 +6,11 @@ import (
 
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 )
 
@@ -55,19 +55,19 @@ func (app *supplementarySanityApplication) QueryFactory() interface{} {
 	return nil
 }
 
-func (app *supplementarySanityApplication) OnRegister(state api.ApplicationState) {
+func (app *supplementarySanityApplication) OnRegister(state api.ApplicationState, md api.MessageDispatcher) {
 	app.state = state
 }
 
 func (app *supplementarySanityApplication) OnCleanup() {
 }
 
-func (app *supplementarySanityApplication) ExecuteTx(*api.Context, *transaction.Transaction) error {
-	return fmt.Errorf("tendermint/supplementarysanity: unexpected transaction")
+func (app *supplementarySanityApplication) ExecuteMessage(ctx *api.Context, kind, msg interface{}) error {
+	return fmt.Errorf("supplementarysanity: unexpected message")
 }
 
-func (app *supplementarySanityApplication) ForeignExecuteTx(*api.Context, api.Application, *transaction.Transaction) error {
-	return nil
+func (app *supplementarySanityApplication) ExecuteTx(*api.Context, *transaction.Transaction) error {
+	return fmt.Errorf("supplementarysanity: unexpected transaction")
 }
 
 func (app *supplementarySanityApplication) InitChain(*api.Context, types.RequestInitChain, *genesis.Document) error {
@@ -112,7 +112,7 @@ func (app *supplementarySanityApplication) endBlockImpl(ctx *api.Context, reques
 	}
 	for _, tt := range []struct {
 		name    string
-		checker func(ctx *api.Context, now epochtime.EpochTime) error
+		checker func(ctx *api.Context, now beacon.EpochTime) error
 	}{
 		{"checkEpochTime", checkEpochTime},
 		{"checkRegistry", checkRegistry},
@@ -122,6 +122,7 @@ func (app *supplementarySanityApplication) endBlockImpl(ctx *api.Context, reques
 		{"checkScheduler", checkScheduler},
 		{"checkBeacon", checkBeacon},
 		{"checkConsensus", checkConsensus},
+		{"checkGovernance", checkGovernance},
 		{"checkHalt", checkHalt},
 		{"checkStakeClaims", checkStakeClaims},
 	} {

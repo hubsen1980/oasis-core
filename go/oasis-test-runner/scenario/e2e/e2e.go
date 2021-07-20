@@ -3,8 +3,13 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	goHash "hash"
+	"io"
+	"io/ioutil"
+	"os"
 	"path/filepath"
 
 	flag "github.com/spf13/pflag"
@@ -12,9 +17,8 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
+	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
-	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
-	cmdNode "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/node"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/cmd"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
@@ -102,7 +106,7 @@ func (sc *E2E) Fixture() (*oasis.NetworkFixture, error) {
 			{},
 		},
 		Validators: []oasis.ValidatorFixture{
-			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true, SupplementarySanityInterval: 1}},
 			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
 			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
 		},
@@ -116,50 +120,109 @@ func (sc *E2E) Init(childEnv *env.Env, net *oasis.Network) error {
 	return nil
 }
 
+// GetExportedGenesisFiles gathers exported genesis files and ensures
+// all exported genesis files match.
+func (sc *E2E) GetExportedGenesisFiles(skipCompute bool) ([]string, error) {
+	dumpGlob := "genesis-*.json"
+
+	// Gather all nodes.
+	var nodes []interface {
+		ExportsPath() string
+	}
+	for _, v := range sc.Net.Validators() {
+		nodes = append(nodes, v)
+	}
+	if !skipCompute {
+		for _, n := range sc.Net.ComputeWorkers() {
+			nodes = append(nodes, n)
+		}
+	}
+	for _, n := range sc.Net.StorageWorkers() {
+		nodes = append(nodes, n)
+	}
+	for _, n := range sc.Net.Keymanagers() {
+		nodes = append(nodes, n)
+	}
+
+	// Gather all genesis files.
+	var files []string
+	for _, node := range nodes {
+		dumpGlobPath := filepath.Join(node.ExportsPath(), dumpGlob)
+		globMatch, err := filepath.Glob(dumpGlobPath)
+		if err != nil {
+			return nil, fmt.Errorf("glob failed: %s: %w", dumpGlobPath, err)
+		}
+		if len(globMatch) == 0 {
+			return nil, fmt.Errorf("genesis file not found in: %s", dumpGlobPath)
+		}
+		if len(globMatch) > 1 {
+			return nil, fmt.Errorf("more than one genesis file found in: %s", dumpGlobPath)
+		}
+		files = append(files, globMatch[0])
+	}
+
+	// Assert all exported files match.
+	var firstHash goHash.Hash
+	for _, file := range files {
+		// Compute hash.
+		f, err := os.Open(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %s: %w", file, err)
+		}
+		defer f.Close()
+		hnew := sha256.New()
+		if _, err := io.Copy(hnew, f); err != nil {
+			return nil, fmt.Errorf("sha256 failed on: %s: %w", file, err)
+		}
+		if firstHash == nil {
+			firstHash = hnew
+		}
+
+		// Compare hash with first hash.
+		if !bytes.Equal(firstHash.Sum(nil), hnew.Sum(nil)) {
+			return nil, fmt.Errorf("exported genesis files do not match %s, %s", files[0], file)
+		}
+	}
+
+	return files, nil
+}
+
 // ResetConsensusState removes all consensus state, preserving runtime storage and node-local
 // storage databases.
 func (sc *E2E) ResetConsensusState(childEnv *env.Env) error {
-	doClean := func(dataDir string, cleanArgs []string) error {
-		args := append([]string{
-			"unsafe-reset",
-			"--" + cmdCommon.CfgDataDir, dataDir,
-		}, cleanArgs...)
-
-		return cli.RunSubCommand(childEnv, sc.Logger, "unsafe-reset", sc.Net.Config().NodeBinary, args)
-	}
-
+	cli := cli.New(childEnv, sc.Net, sc.Logger)
 	for _, val := range sc.Net.Validators() {
-		if err := doClean(val.DataDir(), nil); err != nil {
+		if err := cli.UnsafeReset(val.DataDir(), false, false); err != nil {
 			return err
 		}
 	}
 	for _, cw := range sc.Net.ComputeWorkers() {
-		if err := doClean(cw.DataDir(), nil); err != nil {
+		if err := cli.UnsafeReset(cw.DataDir(), false, false); err != nil {
 			return err
 		}
 	}
 	for _, cl := range sc.Net.Clients() {
-		if err := doClean(cl.DataDir(), nil); err != nil {
+		if err := cli.UnsafeReset(cl.DataDir(), false, false); err != nil {
 			return err
 		}
 	}
 	for _, bz := range sc.Net.Byzantine() {
-		if err := doClean(bz.DataDir(), nil); err != nil {
+		if err := cli.UnsafeReset(bz.DataDir(), false, false); err != nil {
 			return err
 		}
 	}
 	for _, se := range sc.Net.Sentries() {
-		if err := doClean(se.DataDir(), nil); err != nil {
+		if err := cli.UnsafeReset(se.DataDir(), false, false); err != nil {
 			return err
 		}
 	}
 	for _, sw := range sc.Net.StorageWorkers() {
-		if err := doClean(sw.DataDir(), []string{"--" + cmdNode.CfgPreserveMKVSDatabase}); err != nil {
+		if err := cli.UnsafeReset(sw.DataDir(), true, false); err != nil {
 			return err
 		}
 	}
 	for _, kw := range sc.Net.Keymanagers() {
-		if err := doClean(kw.DataDir(), []string{"--" + cmdNode.CfgPreserveLocalStorage}); err != nil {
+		if err := cli.UnsafeReset(kw.DataDir(), false, true); err != nil {
 			return err
 		}
 	}
@@ -168,7 +231,12 @@ func (sc *E2E) ResetConsensusState(childEnv *env.Env) error {
 }
 
 // DumpRestoreNetwork first dumps the current network state and then attempts to restore it.
-func (sc *E2E) DumpRestoreNetwork(childEnv *env.Env, fixture *oasis.NetworkFixture, doDbDump bool) error {
+func (sc *E2E) DumpRestoreNetwork(
+	childEnv *env.Env,
+	fixture *oasis.NetworkFixture,
+	doDbDump bool,
+	genesisMapFn func(*genesis.Document),
+) error {
 	// Dump-restore network.
 	sc.Logger.Info("dumping network state",
 		"child", childEnv,
@@ -214,6 +282,30 @@ func (sc *E2E) DumpRestoreNetwork(childEnv *env.Env, fixture *oasis.NetworkFixtu
 	// Reset all the state back to the vanilla state.
 	if err := sc.ResetConsensusState(childEnv); err != nil {
 		return fmt.Errorf("scenario/e2e/dump_restore: failed to clean tendemint storage: %w", err)
+	}
+
+	// Apply optional mapping function to the genesis document.
+	if genesisMapFn != nil {
+		// Load the existing export.
+		fp, err := genesisFile.NewFileProvider(dumpPath)
+		if err != nil {
+			return fmt.Errorf("failed to instantiate genesis document file provider: %w", err)
+		}
+		doc, err := fp.GetGenesisDocument()
+		if err != nil {
+			return fmt.Errorf("failed to get genesis document: %w", err)
+		}
+
+		genesisMapFn(doc)
+
+		// Write back the updated document.
+		buf, err := json.Marshal(doc)
+		if err != nil {
+			return fmt.Errorf("failed to marshal updated genesis document: %w", err)
+		}
+		if err = ioutil.WriteFile(dumpPath, buf, 0o600); err != nil {
+			return fmt.Errorf("failed to write updated genesis document: %w", err)
+		}
 	}
 
 	// Start the network and the client again.
@@ -279,7 +371,7 @@ func (sc *E2E) dumpDatabase(childEnv *env.Env, fixture *oasis.NetworkFixture, ex
 
 	// Compare the two documents for approximate equality.  Note: Certain
 	// fields will be different, so those are fixed up before the comparison.
-	dbDoc.EpochTime.Base = exportedDoc.EpochTime.Base
+	dbDoc.Beacon.Base = exportedDoc.Beacon.Base
 	dbDoc.Time = exportedDoc.Time
 	dbRaw, err := json.Marshal(dbDoc)
 	if err != nil {
@@ -331,12 +423,17 @@ func RegisterScenarios() error {
 		Debond,
 		// Early query test.
 		EarlyQuery,
+		EarlyQueryInitHeight,
 		// Consensus state sync.
 		ConsensusStateSync,
 		// Multiple seeds test.
 		MultipleSeeds,
 		// Seed API test.
 		SeedAPI,
+		// Byzantine beacon tests.
+		ByzantineBeaconHonest,
+		ByzantineBeaconCommitStraggler,
+		ByzantineBeaconRevealStraggler,
 	} {
 		if err := cmd.Register(s); err != nil {
 			return err

@@ -39,16 +39,10 @@ func createChunk(
 			err = ctx.Err()
 			return
 		}
-
-		nextOffset = it.Key()
 	}
 	if it.Err() != nil {
 		err = fmt.Errorf("chunk: failed to iterate: %w", it.Err())
 		return
-	}
-	if !it.Valid() {
-		// We have finished iterating.
-		nextOffset = nil
 	}
 
 	// Build our chunk.
@@ -57,6 +51,10 @@ func createChunk(
 		err = fmt.Errorf("chunk: failed to build proof: %w", err)
 		return
 	}
+
+	// Determine the next offset (not included in proof).
+	it.Next()
+	nextOffset = it.Key()
 
 	hb := hash.NewBuilder()
 	sw := snappy.NewBufferedWriter(io.MultiWriter(w, hb))
@@ -133,6 +131,7 @@ func restoreChunk(ctx context.Context, ndb db.NodeDB, chunk *ChunkMetadata, r io
 	emptyRoot := node.Root{
 		Namespace: chunk.Root.Namespace,
 		Version:   chunk.Root.Version,
+		Type:      chunk.Root.Type,
 	}
 	emptyRoot.Hash.Empty()
 

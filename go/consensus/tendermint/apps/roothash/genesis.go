@@ -12,7 +12,7 @@ import (
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
 	roothashState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/state"
 	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
-	"github.com/oasisprotocol/oasis-core/go/registry/api"
+	registryAPI "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothashAPI "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
@@ -38,8 +38,17 @@ func (app *rootHashApplication) InitChain(ctx *abciAPI.Context, request types.Re
 		ctx.Logger().Info("InitChain: allocating per-runtime state",
 			"runtime", v.ID,
 		)
-		if err := app.onNewRuntime(ctx, v, &st); err != nil {
+		if err := app.onNewRuntime(ctx, v, &st, false); err != nil {
 			return fmt.Errorf("failed to initialize runtime %s state: %w", v.ID, err)
+		}
+	}
+	suspendedRuntimes, _ := regState.SuspendedRuntimes(ctx)
+	for _, v := range suspendedRuntimes {
+		ctx.Logger().Info("InitChain: allocating per-runtime state",
+			"runtime", v.ID,
+		)
+		if err := app.onNewRuntime(ctx, v, &st, true); err != nil {
+			return fmt.Errorf("failed to initialize (suspended) runtime %s state: %w", v.ID, err)
 		}
 	}
 
@@ -53,14 +62,16 @@ func (rq *rootHashQuerier) Genesis(ctx context.Context) (*roothashAPI.Genesis, e
 	}
 
 	// Get per-runtime states.
-	rtStates := make(map[common.Namespace]*api.RuntimeGenesis)
+	rtStates := make(map[common.Namespace]*roothashAPI.GenesisRuntimeState)
 	for _, rt := range runtimes {
-		rtState := api.RuntimeGenesis{
-			StateRoot: rt.CurrentBlock.Header.StateRoot,
-			// State is always empty in Genesis regardless of StateRoot.
-			State:           storageAPI.WriteLog{},
-			StorageReceipts: []signature.Signature{},
-			Round:           rt.CurrentBlock.Header.Round,
+		rtState := roothashAPI.GenesisRuntimeState{
+			RuntimeGenesis: registryAPI.RuntimeGenesis{
+				StateRoot: rt.CurrentBlock.Header.StateRoot,
+				// State is always empty in Genesis regardless of StateRoot.
+				State:           storageAPI.WriteLog{},
+				StorageReceipts: []signature.Signature{},
+				Round:           rt.CurrentBlock.Header.Round,
+			},
 		}
 
 		rtStates[rt.Runtime.ID] = &rtState

@@ -2,25 +2,26 @@
 package roothash
 
 import (
-	"bytes"
-	"errors"
 	"fmt"
 
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	tmapi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	registryapp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry"
+	beaconapp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/beacon"
+	registryApi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/api"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
+	roothashApi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/api"
 	roothashState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/state"
 	schedulerapp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/scheduler"
 	schedulerState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/scheduler/state"
 	stakingapp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
@@ -33,6 +34,7 @@ var _ tmapi.Application = (*rootHashApplication)(nil)
 
 type rootHashApplication struct {
 	state tmapi.ApplicationState
+	md    tmapi.MessageDispatcher
 }
 
 func (app *rootHashApplication) Name() string {
@@ -55,27 +57,51 @@ func (app *rootHashApplication) Dependencies() []string {
 	return []string{schedulerapp.AppName, stakingapp.AppName}
 }
 
-func (app *rootHashApplication) OnRegister(state tmapi.ApplicationState) {
+func (app *rootHashApplication) OnRegister(state tmapi.ApplicationState, md tmapi.MessageDispatcher) {
 	app.state = state
+	app.md = md
+
+	// Subscribe to messages emitted by other apps.
+	md.Subscribe(registryApi.MessageNewRuntimeRegistered, app)
+	md.Subscribe(registryApi.MessageRuntimeUpdated, app)
+	md.Subscribe(registryApi.MessageRuntimeResumed, app)
+	md.Subscribe(roothashApi.RuntimeMessageNoop, app)
 }
 
 func (app *rootHashApplication) OnCleanup() {
 }
 
 func (app *rootHashApplication) BeginBlock(ctx *tmapi.Context, request types.RequestBeginBlock) error {
+	// Check if the beacon has failed in a way that runtimes should be
+	// disabled.
+	beaconFailed := ctx.HasEvent(beaconapp.AppName, beaconapp.KeyDisableRuntimes)
 	// Check if rescheduling has taken place.
 	rescheduled := ctx.HasEvent(schedulerapp.AppName, schedulerapp.KeyElected)
 	// Check if there was an epoch transition.
 	epochChanged, epoch := app.state.EpochChanged(ctx)
 
-	if epochChanged || rescheduled {
-		return app.onCommitteeChanged(ctx, epoch)
+	state := roothashState.NewMutableState(ctx.State())
+
+	switch {
+	case beaconFailed:
+		ctx.Logger().Warn("disabling all transactions, beacon failed")
+
+		if err := state.SetRejectTransactions(ctx); err != nil {
+			return fmt.Errorf("failed to set tx disable: %w", err)
+		}
+	case epochChanged:
+		if err := state.ClearRejectTransactions(ctx); err != nil {
+			return fmt.Errorf("failed to clear tx disable: %w", err)
+		}
+		fallthrough
+	case rescheduled:
+		return app.onCommitteeChanged(ctx, state, epoch)
 	}
+
 	return nil
 }
 
-func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, epoch epochtime.EpochTime) error {
-	state := roothashState.NewMutableState(ctx.State())
+func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, state *roothashState.MutableState, epoch beacon.EpochTime) error {
 	schedState := schedulerState.NewMutableState(ctx.State())
 	regState := registryState.NewMutableState(ctx.State())
 	runtimes, _ := regState.Runtimes(ctx)
@@ -107,6 +133,20 @@ func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, epoch epo
 			return fmt.Errorf("failed to fetch runtime state: %w", err)
 		}
 
+		// Expire past evidence of runtime node misbehaviour.
+		if rtState.CurrentBlock != nil {
+			if round := rtState.CurrentBlock.Header.Round; round > params.MaxEvidenceAge {
+				ctx.Logger().Debug("removing expired runtime evidence",
+					"runtime", rt.ID,
+					"round", round,
+					"max_evidence_age", params.MaxEvidenceAge,
+				)
+				if err = state.RemoveExpiredEvidence(ctx, rt.ID, round-params.MaxEvidenceAge); err != nil {
+					return fmt.Errorf("failed to remove expired runtime evidence: %s %w", rt.ID, err)
+				}
+			}
+		}
+
 		// Since the runtime is in the list of active runtimes in the registry we
 		// can safely clear the suspended flag.
 		rtState.Suspended = false
@@ -124,13 +164,22 @@ func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, epoch epo
 		// cover the entity and runtime deposits (this check is skipped if the runtime would be
 		// suspended anyway due to nobody being there to pay maintenance fees).
 		sufficientStake := true
-		if !empty && !params.DebugBypassStake {
-			acctAddr := staking.NewAddress(rt.EntityID)
-			if err = stakeAcc.CheckStakeClaims(acctAddr); err != nil {
+		if !empty && !params.DebugBypassStake && rt.GovernanceModel != registry.GovernanceConsensus {
+			acctAddr := rt.StakingAddress()
+			if acctAddr == nil {
+				// This should never happen.
+				ctx.Logger().Error("unknown runtime governance model",
+					"rt_id", rt.ID,
+					"gov_model", rt.GovernanceModel,
+				)
+				return fmt.Errorf("unknown runtime governance model on runtime %s: %s", rt.ID, rt.GovernanceModel)
+			}
+
+			if err = stakeAcc.CheckStakeClaims(*acctAddr); err != nil {
 				ctx.Logger().Warn("insufficient stake for runtime operation",
 					"err", err,
 					"entity", rt.EntityID,
-					"account", acctAddr,
+					"account", *acctAddr,
 				)
 				sufficientStake = false
 			}
@@ -161,6 +210,7 @@ func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, epoch epo
 
 			// Set the executor pool.
 			rtState.ExecutorPool = executorPool
+			rtState.ExecutorPool.Round = rtState.CurrentBlock.Header.Round
 		}
 
 		// Update the runtime descriptor to the latest per-epoch value.
@@ -176,7 +226,7 @@ func (app *rootHashApplication) onCommitteeChanged(ctx *tmapi.Context, epoch epo
 
 func (app *rootHashApplication) suspendUnpaidRuntime(
 	ctx *tmapi.Context,
-	rtState *roothashState.RuntimeState,
+	rtState *roothash.RuntimeState,
 	regState *registryState.MutableState,
 ) error {
 	ctx.Logger().Warn("maintenance fees not paid for runtime or owner debonded, suspending",
@@ -200,8 +250,8 @@ func (app *rootHashApplication) suspendUnpaidRuntime(
 
 func (app *rootHashApplication) prepareNewCommittees(
 	ctx *tmapi.Context,
-	epoch epochtime.EpochTime,
-	rtState *roothashState.RuntimeState,
+	epoch beacon.EpochTime,
+	rtState *roothash.RuntimeState,
 	schedState *schedulerState.MutableState,
 	regState *registryState.MutableState,
 ) (
@@ -234,11 +284,12 @@ func (app *rootHashApplication) prepareNewCommittees(
 	return
 }
 
-func (app *rootHashApplication) emitEmptyBlock(ctx *tmapi.Context, runtime *roothashState.RuntimeState, hdrType block.HeaderType) error {
+func (app *rootHashApplication) emitEmptyBlock(ctx *tmapi.Context, runtime *roothash.RuntimeState, hdrType block.HeaderType) error {
 	blk := block.NewEmptyBlock(runtime.CurrentBlock, uint64(ctx.Now().Unix()), hdrType)
 
 	runtime.CurrentBlock = blk
-	runtime.CurrentBlockHeight = ctx.BlockHeight()
+	runtime.CurrentBlockHeight = ctx.BlockHeight() + 1 // Current height is ctx.BlockHeight() + 1
+	// Do not update LastNormal{Round,Height} as empty blocks are not emitted by the runtime.
 	if runtime.ExecutorPool != nil {
 		// Clear timeout if there was one scheduled.
 		if runtime.ExecutorPool.NextTimeout != commitment.TimeoutNever {
@@ -247,12 +298,14 @@ func (app *rootHashApplication) emitEmptyBlock(ctx *tmapi.Context, runtime *root
 				return fmt.Errorf("failed to clear round timeout: %w", err)
 			}
 		}
-		runtime.ExecutorPool.ResetCommitments()
+		runtime.ExecutorPool.ResetCommitments(blk.Header.Round)
 	}
 
 	tagV := ValueFinalized{
-		ID:    runtime.Runtime.ID,
-		Round: blk.Header.Round,
+		ID: runtime.Runtime.ID,
+		Event: roothash.FinalizedEvent{
+			Round: blk.Header.Round,
+		},
 	}
 	ctx.EmitEvent(
 		tmapi.NewEventBuilder(app.Name()).
@@ -262,60 +315,89 @@ func (app *rootHashApplication) emitEmptyBlock(ctx *tmapi.Context, runtime *root
 	return nil
 }
 
+func (app *rootHashApplication) ExecuteMessage(ctx *tmapi.Context, kind, msg interface{}) error {
+	switch kind {
+	case registryApi.MessageNewRuntimeRegistered:
+		// A new runtime has been registered.
+		if ctx.IsInitChain() {
+			// Ignore messages emitted during InitChain as we handle these separately.
+			return nil
+		}
+		rt := msg.(*registry.Runtime)
+
+		ctx.Logger().Debug("ExecuteMessage: new runtime",
+			"runtime", rt.ID,
+		)
+
+		return app.onNewRuntime(ctx, rt, nil, false)
+	case registryApi.MessageRuntimeUpdated:
+		// A runtime registration has been updated or a new runtime has been registered.
+		if ctx.IsInitChain() {
+			// Ignore messages emitted during InitChain as we handle these separately.
+			return nil
+		}
+		return app.verifyRuntimeUpdate(ctx, msg.(*registry.Runtime))
+	case registryApi.MessageRuntimeResumed:
+		// A previously suspended runtime has been resumed.
+		return nil
+	case roothashApi.RuntimeMessageNoop:
+		// Noop message always succeeds.
+		return nil
+	default:
+		return roothash.ErrInvalidArgument
+	}
+}
+
+func (app *rootHashApplication) verifyRuntimeUpdate(ctx *tmapi.Context, rt *registry.Runtime) error {
+	state := roothashState.NewMutableState(ctx.State())
+
+	params, err := state.ConsensusParameters(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get consensus parameters: %w", err)
+	}
+
+	return roothash.VerifyRuntimeParameters(ctx.Logger(), rt, params)
+}
+
 func (app *rootHashApplication) ExecuteTx(ctx *tmapi.Context, tx *transaction.Transaction) error {
 	state := roothashState.NewMutableState(ctx.State())
+
+	rejectTransactions, err := state.RejectTransactions(ctx)
+	if err != nil {
+		return err
+	}
+	if rejectTransactions {
+		return fmt.Errorf("roothash: refusing to process transactions, beacon failed")
+	}
 
 	switch tx.Method {
 	case roothash.MethodExecutorCommit:
 		var xc roothash.ExecutorCommit
-		if err := cbor.Unmarshal(tx.Body, &xc); err != nil {
+		if err = cbor.Unmarshal(tx.Body, &xc); err != nil {
 			return err
 		}
 
 		return app.executorCommit(ctx, state, &xc)
 	case roothash.MethodExecutorProposerTimeout:
 		var xc roothash.ExecutorProposerTimeoutRequest
-		if err := cbor.Unmarshal(tx.Body, &xc); err != nil {
+		if err = cbor.Unmarshal(tx.Body, &xc); err != nil {
 			return err
 		}
 
 		return app.executorProposerTimeout(ctx, state, &xc)
+	case roothash.MethodEvidence:
+		var ev roothash.Evidence
+		if err := cbor.Unmarshal(tx.Body, &ev); err != nil {
+			return err
+		}
+
+		return app.submitEvidence(ctx, state, &ev)
 	default:
 		return roothash.ErrInvalidArgument
 	}
 }
 
-func (app *rootHashApplication) ForeignExecuteTx(ctx *tmapi.Context, other tmapi.Application, tx *transaction.Transaction) error {
-	switch other.Name() {
-	case registryapp.AppName:
-		for _, ev := range ctx.GetEvents() {
-			if ev.Type != registryapp.EventType {
-				continue
-			}
-
-			for _, pair := range ev.Attributes {
-				if bytes.Equal(pair.GetKey(), registryapp.KeyRuntimeRegistered) {
-					var rt registry.Runtime
-					if err := cbor.Unmarshal(pair.GetValue(), &rt); err != nil {
-						return fmt.Errorf("roothash: failed to deserialize new runtime: %w", err)
-					}
-
-					ctx.Logger().Debug("ForeignDeliverTx: new runtime",
-						"runtime", rt.ID,
-					)
-
-					if err := app.onNewRuntime(ctx, &rt, nil); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func (app *rootHashApplication) onNewRuntime(ctx *tmapi.Context, runtime *registry.Runtime, genesis *roothash.Genesis) error {
+func (app *rootHashApplication) onNewRuntime(ctx *tmapi.Context, runtime *registry.Runtime, genesis *roothash.Genesis, suspended bool) error {
 	if !runtime.IsCompute() {
 		ctx.Logger().Warn("onNewRuntime: ignoring non-compute runtime",
 			"runtime", runtime,
@@ -347,19 +429,42 @@ func (app *rootHashApplication) onNewRuntime(ctx *tmapi.Context, runtime *regist
 	genesisBlock.Header.StorageSignatures = runtime.Genesis.StorageReceipts
 	if ctx.IsInitChain() {
 		// NOTE: Outside InitChain the genesis argument will be nil.
-		genesisRts := genesis.RuntimeStates[runtime.ID]
-		if genesisRts != nil {
+		if genesisRts := genesis.RuntimeStates[runtime.ID]; genesisRts != nil {
 			genesisBlock.Header.Round = genesisRts.Round
 			genesisBlock.Header.StateRoot = genesisRts.StateRoot
 			genesisBlock.Header.StorageSignatures = runtime.Genesis.StorageReceipts
+			if suspended {
+				genesisBlock.Header.HeaderType = block.Suspended
+			}
+
+			// Emit any message results now (will be deferred to the first block).
+			ctx.Logger().Debug("emitting message results",
+				"runtime_id", runtime.ID,
+				"num_results", len(genesisRts.MessageResults),
+			)
+
+			for _, msg := range genesisRts.MessageResults {
+				evV := ValueMessage{
+					ID:    runtime.ID,
+					Event: *msg,
+				}
+				ctx.EmitEvent(
+					tmapi.NewEventBuilder(app.Name()).
+						Attribute(KeyMessage, cbor.Marshal(evV)).
+						Attribute(KeyRuntimeID, ValueRuntimeID(evV.ID)),
+				)
+			}
 		}
 	}
 
 	// Create new state containing the genesis block.
-	err = state.SetRuntimeState(ctx, &roothashState.RuntimeState{
-		Runtime:      runtime,
-		CurrentBlock: genesisBlock,
-		GenesisBlock: genesisBlock,
+	err = state.SetRuntimeState(ctx, &roothash.RuntimeState{
+		Runtime:            runtime,
+		CurrentBlock:       genesisBlock,
+		CurrentBlockHeight: ctx.BlockHeight() + 1, // Current height is ctx.BlockHeight() + 1
+		LastNormalRound:    genesisBlock.Header.Round,
+		LastNormalHeight:   ctx.BlockHeight() + 1, // Current height is ctx.BlockHeight() + 1
+		GenesisBlock:       genesisBlock,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to set runtime state: %w", err)
@@ -371,8 +476,10 @@ func (app *rootHashApplication) onNewRuntime(ctx *tmapi.Context, runtime *regist
 
 	// This transaction now also includes a new block for the given runtime.
 	tagV := ValueFinalized{
-		ID:    runtime.ID,
-		Round: genesisBlock.Header.Round,
+		ID: runtime.ID,
+		Event: roothash.FinalizedEvent{
+			Round: genesisBlock.Header.Round,
+		},
 	}
 	ctx.EmitEvent(
 		tmapi.NewEventBuilder(app.Name()).
@@ -436,43 +543,17 @@ func (app *rootHashApplication) processRoundTimeout(ctx *tmapi.Context, state *r
 // The caller must take care of clearing and scheduling the round timeouts.
 func (app *rootHashApplication) tryFinalizeExecutorCommits(
 	ctx *tmapi.Context,
-	rtState *roothashState.RuntimeState,
+	rtState *roothash.RuntimeState,
 	forced bool,
-) (*block.Block, error) {
+) error {
 	runtime := rtState.Runtime
-	blockNr := rtState.CurrentBlock.Header.Round
+	round := rtState.CurrentBlock.Header.Round + 1
+	pool := rtState.ExecutorPool
 
-	commit, err := rtState.ExecutorPool.TryFinalize(ctx.BlockHeight(), runtime.Executor.RoundTimeout, forced, true)
-	switch err {
-	case nil:
-		// Round has been finalized.
-		ctx.Logger().Debug("finalized round",
-			"round", blockNr,
-		)
-
-		// Generate the final block.
-		hdr := commit.ToDDResult().(commitment.ComputeResultsHeader)
-
-		blk := block.NewEmptyBlock(rtState.CurrentBlock, uint64(ctx.Now().Unix()), block.Normal)
-		blk.Header.IORoot = *hdr.IORoot
-		blk.Header.StateRoot = *hdr.StateRoot
-		// Messages omitted on purpose.
-
-		// Timeout will be cleared by caller.
-		rtState.ExecutorPool.ResetCommitments()
-
-		return blk, nil
-	case commitment.ErrStillWaiting:
-		// Need more commits.
-		ctx.Logger().Debug("insufficient commitments for finality, waiting",
-			"round", blockNr,
-		)
-
-		return nil, nil
-	case commitment.ErrDiscrepancyDetected:
-		// Discrepancy has been detected.
+	commit, err := pool.TryFinalize(ctx.BlockHeight(), runtime.Executor.RoundTimeout, forced, true)
+	if err == commitment.ErrDiscrepancyDetected {
 		ctx.Logger().Warn("executor discrepancy detected",
-			"round", blockNr,
+			"round", round,
 			logging.LogEvent, roothash.LogEventExecutionDiscrepancyDetected,
 		)
 
@@ -487,71 +568,132 @@ func (app *rootHashApplication) tryFinalizeExecutorCommits(
 				Attribute(KeyExecutionDiscrepancyDetected, cbor.Marshal(tagV)).
 				Attribute(KeyRuntimeID, ValueRuntimeID(runtime.ID)),
 		)
-		return nil, nil
+
+		// We may also be able to already perform discrepancy resolution, check if this is possible
+		// by retrying finalization. We must make sure to not affect the computed timeout.
+		nextTimeout := pool.NextTimeout
+		commit, err = pool.TryFinalize(ctx.BlockHeight(), runtime.Executor.RoundTimeout, false, false)
+		pool.NextTimeout = nextTimeout
+	}
+
+	switch err {
+	case nil:
+		// Round has been finalized.
+		ctx.Logger().Debug("finalized round",
+			"round", round,
+		)
+
+		body := commit.ToDDResult().(*commitment.ComputeBody)
+		hdr := &body.Header
+
+		// Process any runtime messages.
+		if err = app.processRuntimeMessages(ctx, rtState, body.Messages); err != nil {
+			return fmt.Errorf("failed to process runtime messages: %w", err)
+		}
+
+		var (
+			goodComputeNodes []signature.PublicKey
+			badComputeNodes  []signature.PublicKey
+		)
+		commitments := pool.ExecuteCommitments
+		seen := make(map[signature.PublicKey]bool)
+		for _, n := range pool.Committee.Members {
+			c, ok := commitments[n.PublicKey]
+			if !ok || c.IsIndicatingFailure() || seen[n.PublicKey] {
+				continue
+			}
+			// Make sure to not include nodes in multiple roles multiple times.
+			seen[n.PublicKey] = true
+
+			switch commit.MostlyEqual(c) {
+			case true:
+				// Correct commit.
+				goodComputeNodes = append(goodComputeNodes, n.PublicKey)
+			case false:
+				// Incorrect commit.
+				badComputeNodes = append(badComputeNodes, n.PublicKey)
+			}
+		}
+
+		// If there was a discrepancy, slash nodes for incorrect results if configured.
+		if pool.Discrepancy {
+			ctx.Logger().Debug("executor pool discrepancy",
+				"slashing", runtime.Staking.Slashing,
+			)
+			if penalty, ok := rtState.Runtime.Staking.Slashing[staking.SlashRuntimeIncorrectResults]; ok && !penalty.Amount.IsZero() {
+				// Slash for incorrect results.
+				if err = onRuntimeIncorrectResults(
+					ctx,
+					badComputeNodes,
+					goodComputeNodes,
+					runtime,
+					&penalty.Amount,
+				); err != nil {
+					return fmt.Errorf("failed to slash for incorrect results: %w", err)
+				}
+			}
+		}
+
+		// Generate the final block.
+		blk := block.NewEmptyBlock(rtState.CurrentBlock, uint64(ctx.Now().Unix()), block.Normal)
+		blk.Header.IORoot = *hdr.IORoot
+		blk.Header.StateRoot = *hdr.StateRoot
+		blk.Header.MessagesHash = *hdr.MessagesHash
+
+		// Timeout will be cleared by caller.
+		pool.ResetCommitments(blk.Header.Round)
+
+		// All good. Hook up the new block.
+		rtState.CurrentBlock = blk
+		rtState.CurrentBlockHeight = ctx.BlockHeight() + 1 // Current height is ctx.BlockHeight() + 1
+		rtState.LastNormalRound = blk.Header.Round
+		rtState.LastNormalHeight = ctx.BlockHeight() + 1
+
+		tagV := ValueFinalized{
+			ID: rtState.Runtime.ID,
+			Event: roothash.FinalizedEvent{
+				Round:            blk.Header.Round,
+				GoodComputeNodes: goodComputeNodes,
+				BadComputeNodes:  badComputeNodes,
+			},
+		}
+		ctx.EmitEvent(
+			tmapi.NewEventBuilder(app.Name()).
+				Attribute(KeyFinalized, cbor.Marshal(tagV)).
+				Attribute(KeyRuntimeID, ValueRuntimeID(rtState.Runtime.ID)),
+		)
+
+		return nil
+	case commitment.ErrStillWaiting:
+		// Need more commits.
+		ctx.Logger().Debug("insufficient commitments for finality, waiting",
+			"round", round,
+		)
+
+		return nil
+	case commitment.ErrDiscrepancyDetected:
+		// This was already handled above, so it should not happen.
+		return nil
 	default:
 	}
 
 	// Something else went wrong, emit empty error block.
 	ctx.Logger().Error("round failed",
-		"round", blockNr,
+		"round", round,
 		"err", err,
 		logging.LogEvent, roothash.LogEventRoundFailed,
 	)
 
 	if err := app.emitEmptyBlock(ctx, rtState, block.RoundFailed); err != nil {
-		return nil, fmt.Errorf("failed to emit empty block: %w", err)
+		return fmt.Errorf("failed to emit empty block: %w", err)
 	}
 
-	return nil, nil
-}
-
-func (app *rootHashApplication) postProcessFinalizedBlock(ctx *tmapi.Context, rtState *roothashState.RuntimeState, blk *block.Block) error {
-	sc := ctx.StartCheckpoint()
-	defer sc.Close()
-
-	for _, message := range blk.Header.Messages {
-		// Currently there are no valid roothash messages, so any message
-		// is treated as unsatisfactory. This is the place which would
-		// otherwise contain message handlers.
-		unsat := errors.New("tendermint/roothash: message is invalid")
-
-		if unsat != nil {
-			ctx.Logger().Error("handler not satisfied with message",
-				"err", unsat,
-				"message", message,
-				logging.LogEvent, roothash.LogEventMessageUnsat,
-			)
-
-			// Substitute empty block.
-			if err := app.emitEmptyBlock(ctx, rtState, block.RoundFailed); err != nil {
-				return fmt.Errorf("failed to emit empty block: %w", err)
-			}
-
-			return nil
-		}
-	}
-
-	sc.Commit()
-
-	// All good. Hook up the new block.
-	rtState.CurrentBlock = blk
-	rtState.CurrentBlockHeight = ctx.BlockHeight()
-
-	tagV := ValueFinalized{
-		ID:    rtState.Runtime.ID,
-		Round: blk.Header.Round,
-	}
-	ctx.EmitEvent(
-		tmapi.NewEventBuilder(app.Name()).
-			Attribute(KeyFinalized, cbor.Marshal(tagV)).
-			Attribute(KeyRuntimeID, ValueRuntimeID(rtState.Runtime.ID)),
-	)
 	return nil
 }
 
 func (app *rootHashApplication) tryFinalizeBlock(
 	ctx *tmapi.Context,
-	rtState *roothashState.RuntimeState,
+	rtState *roothash.RuntimeState,
 	forced bool,
 ) (err error) {
 	defer func(previousTimeout int64) {
@@ -590,18 +732,7 @@ func (app *rootHashApplication) tryFinalizeBlock(
 		}
 	}(rtState.ExecutorPool.NextTimeout)
 
-	finalizedBlock, err := app.tryFinalizeExecutorCommits(ctx, rtState, forced)
-	if err != nil {
-		return fmt.Errorf("failed to finalize executor commits: %w", err)
-	}
-	if finalizedBlock == nil {
-		return nil
-	}
-
-	if err = app.postProcessFinalizedBlock(ctx, rtState, finalizedBlock); err != nil {
-		return fmt.Errorf("failed to post process finalized block: %w", err)
-	}
-	return nil
+	return app.tryFinalizeExecutorCommits(ctx, rtState, forced)
 }
 
 // New constructs a new roothash application instance.

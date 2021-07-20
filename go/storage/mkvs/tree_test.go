@@ -26,14 +26,14 @@ import (
 
 const (
 	insertItems  = 1000
-	allItemsRoot = "71bb02a598b13c6c8e1e969e4c7f91b30a441bb9140e97b4a2d2962d4ed9d63a"
+	allItemsRoot = "2187c55627819b60069888ba86f83dc2a9f50c827624b0e31e31261806300ede"
 
 	insertItemsShort  = 500
-	allItemsRootShort = "3c7a9fbe868a9db439e128985a61518701f00d15bcd6a46956e6e12e4fad818b"
+	allItemsRootShort = "cf6e9b6a26e10a8218b8658ac9302af1a4c1ae4e1b1a7633860a0f81fb759495"
 
 	longKey          = "Unlock the potential of your data without compromising security or privacy"
 	longValue        = "The platform that puts data privacy first. From sharing medical records, to analyzing personal financial information, to training machine learning models, the Oasis platform supports applications that use even the most sensitive data without compromising privacy or performance."
-	allLongItemsRoot = "51ab169f7362d3261a63883e8a4011108784108107c93e8a1693c26fbeed4715"
+	allLongItemsRoot = "d829bb244a709bacf33bc2d8b4a016592e5310a10910aa980ef91cb3b4347dcb"
 )
 
 var (
@@ -132,7 +132,7 @@ func (s *dummySerialSyncer) SyncIterate(ctx context.Context, request *syncer.Ite
 
 func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	keyZero := []byte("foo")
 	valueZero := []byte("bar")
@@ -155,7 +155,7 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	log, root, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	require.Equal(t, "68e0c95d0dcb3a4ace95d1a64b8d7bb1dd08e3708abdca4068c1ccf32b7076d4", root.String())
+	require.Equal(t, "db67c0572006673b488342a45e6590a75e8919265e6da706c80c6b2776017aa7", root.String())
 	require.Equal(t, writeLogToMap(writelog.WriteLog{writelog.LogEntry{Key: keyZero, Value: valueZero}}), writeLogToMap(log))
 	require.Equal(t, log[0].Type(), writelog.LogInsert)
 
@@ -200,7 +200,7 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	// Tree now has key_zero and key_one and should hash as if the mangling didn't happen.
 	log, root, err = tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	require.Equal(t, "821d13489eae34debd85117823058a143ee3c534e91828a0db8d48ecb2128b8c", root.String())
+	require.Equal(t, "e627581db43e18410a52793e662e4f21ae6a4fca14e16915a85ec4c3e3e41a13", root.String())
 	require.Equal(t, writeLogToMap(writelog.WriteLog{writelog.LogEntry{Key: keyOne, Value: valueOne}, writelog.LogEntry{Key: keyZero, Value: valueZero}}), writeLogToMap(log))
 	require.Equal(t, writelog.LogInsert, log[0].Type())
 	require.Equal(t, writelog.LogInsert, log[1].Type())
@@ -209,6 +209,7 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	tree = NewWithRoot(nil, ndb, node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      root,
 	})
 
@@ -227,13 +228,14 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	log, root, err = tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	require.Equal(t, "68e0c95d0dcb3a4ace95d1a64b8d7bb1dd08e3708abdca4068c1ccf32b7076d4", root.String())
+	require.Equal(t, "db67c0572006673b488342a45e6590a75e8919265e6da706c80c6b2776017aa7", root.String())
 	require.Equal(t, writeLogToMap(writelog.WriteLog{writelog.LogEntry{Key: keyOne, Value: nil}}), writeLogToMap(log))
 	require.Equal(t, writelog.LogDelete, log[0].Type())
 
 	_, err = tree.CommitKnown(ctx, node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      root,
 	})
 	require.NoError(t, err, "CommitKnown")
@@ -242,6 +244,7 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	_, err = tree.CommitKnown(ctx, node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      bogusRoot,
 	})
 	require.Error(t, err, "CommitKnown")
@@ -268,7 +271,7 @@ func testBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testLongKeys(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb, Capacity(0, 512))
+	tree := New(nil, ndb, node.RootTypeState, Capacity(0, 512))
 
 	// First insert keys 0..n and remove them in order n..0.
 	var roots []hash.Hash
@@ -314,7 +317,7 @@ func testLongKeys(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testEmptyKeys(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	testEmptyKeyInsert := func(t *testing.T, ctx context.Context, tree Tree) {
 		emptyKey := node.Key("")
@@ -485,7 +488,7 @@ func testEmptyKeys(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testInsertCommitBatch(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -504,7 +507,7 @@ func testInsertCommitBatch(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testInsertCommitEach(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -526,7 +529,7 @@ func testInsertCommitEach(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testRemove(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	// First insert keys 0..n and remove them in order n..0.
 	var roots []hash.Hash
@@ -623,7 +626,7 @@ func testSyncerBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testSyncerRootEmptyLabelNeedsDeref(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	// Add two keys that differ in the first bit so the root will have
 	// an empty label.
@@ -638,6 +641,7 @@ func testSyncerRootEmptyLabelNeedsDeref(t *testing.T, ndb db.NodeDB, factory Nod
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash,
 	}
 
@@ -683,7 +687,7 @@ func testSyncerRootEmptyLabelNeedsDeref(t *testing.T, ndb db.NodeDB, factory Nod
 
 func testSyncerRemove(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	var roots []hash.Hash
 	keys, values := generateKeyValuePairs()
@@ -699,6 +703,7 @@ func testSyncerRemove(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      roots[len(roots)-1],
 	}
 	stats := syncer.NewStatsCollector(tree)
@@ -720,7 +725,7 @@ func testSyncerRemove(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testSyncerInsert(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -734,6 +739,7 @@ func testSyncerInsert(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash,
 	}
 	stats := syncer.NewStatsCollector(tree)
@@ -754,7 +760,7 @@ func testSyncerNilNodes(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	var err error
 
 	ctx := context.Background()
-	tree := New(nil, nil)
+	tree := New(nil, nil, node.RootTypeState)
 
 	// Arbitrary sequence of operations. The point is to produce a tree with
 	// an internal node where at least one of the children is a null pointer.
@@ -780,6 +786,7 @@ func testSyncerNilNodes(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	remote := NewWithRoot(wire, nil, node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      root,
 	})
 
@@ -814,7 +821,7 @@ func testSyncerPrefetchPrefixes(t *testing.T, ndb db.NodeDB, factory NodeDBFacto
 
 func testValueEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb, Capacity(0, 512)).(*tree)
+	tree := New(nil, ndb, node.RootTypeState, Capacity(0, 512)).(*tree)
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -827,12 +834,12 @@ func testValueEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	require.EqualValues(t, 999, tree.cache.internalNodeCount, "Cache.InternalNodeCount")
 	// Only a subset of the leaf values should remain in cache.
-	require.EqualValues(t, 448, tree.cache.valueSize, "Cache.ValueSize")
+	require.EqualValues(t, 416, tree.cache.valueSize, "Cache.ValueSize")
 }
 
 func testNodeEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb, Capacity(128, 0)).(*tree)
+	tree := New(nil, ndb, node.RootTypeState, Capacity(128, 0)).(*tree)
 
 	keys, values := generateKeyValuePairsEx("foo", 150)
 	for i := 0; i < len(keys); i++ {
@@ -854,12 +861,12 @@ func testNodeEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	// Only a subset of nodes should remain in cache.
 	require.EqualValues(t, 128, tree.cache.internalNodeCount, "Cache.InternalNodeCount")
-	require.EqualValues(t, 15904, tree.cache.valueSize, "Cache.LeafValueSize")
+	require.EqualValues(t, 14912, tree.cache.valueSize, "Cache.LeafValueSize")
 }
 
 func testDoubleInsertWithEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb, Capacity(128, 0))
+	tree := New(nil, ndb, node.RootTypeState, Capacity(128, 0))
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -882,7 +889,7 @@ func testDoubleInsertWithEviction(t *testing.T, ndb db.NodeDB, factory NodeDBFac
 
 func testDebugDumpLocal(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	err := tree.Insert(ctx, []byte("foo 1"), []byte("bar 1"))
 	require.NoError(t, err, "Insert")
@@ -908,7 +915,7 @@ func testApplyWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	}
 
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.ApplyWriteLog(ctx, writelog.NewStaticIterator(writeLog))
 	require.NoError(t, err, "ApplyWriteLog")
 	_, _, err = tree.Commit(ctx, testNs, 0)
@@ -941,6 +948,7 @@ func testOnCommitHooks(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      emptyRoot,
 	}
 
@@ -969,14 +977,14 @@ func testOnCommitHooks(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testCommitNoPersist(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	err := tree.Insert(ctx, []byte("this key"), []byte("should not be persisted"))
 	require.NoError(t, err, "Insert")
 
 	log, root, err := tree.Commit(ctx, testNs, 0, NoPersist())
 	require.NoError(t, err, "Commit")
-	require.Equal(t, "456d55ad04387c43086b53df4988ebcb5fce6f52d9cd37e3fa79c69aed106b7e", root.String(), "computed root should be correct")
+	require.Equal(t, "46141a682ada455db80763c17c4e76535adaafaa2508d4fdae8a5ee5c0166629", root.String(), "computed root should be correct")
 	require.Len(t, log, 1, "write log should contain one item")
 
 	// Make sure we can still commit and finalize something at an arbitrary higher round.
@@ -986,19 +994,25 @@ func testCommitNoPersist(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	log, root, err = tree.Commit(ctx, testNs, 42)
 	require.NoError(t, err, "Commit")
-	require.Equal(t, "b27dda2f4f86f9dfa6168696a35ad03c3fddfe721d80d102e5b3c82abfa6a638", root.String(), "computed root should be correct")
+	require.Equal(t, "d9b2effdff5a22145cef58c7c84c8040ee441e65a30e75d13e7490939299a4f4", root.String(), "computed root should be correct")
 	require.Len(t, log, 2, "write log should contain two items")
 
-	err = ndb.Finalize(ctx, 42, []hash.Hash{root})
+	nodeRoot := node.Root{
+		Namespace: testNs,
+		Version:   42,
+		Type:      node.RootTypeState,
+		Hash:      root,
+	}
+	err = ndb.Finalize(ctx, []node.Root{nodeRoot})
 	require.NoError(t, err, "Finalize")
 
 	roots, err := ndb.GetRootsForVersion(ctx, 42)
 	require.NoError(t, err, "GetRootsForVersion")
 	require.Len(t, roots, 1, "there should only be one root")
-	require.Equal(t, root, roots[0], "the root hash should be correct")
+	require.Equal(t, nodeRoot, roots[0], "the root hash should be correct")
 
 	// Make sure everything has been persisted now.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 42, Hash: root})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 42, Type: node.RootTypeState, Hash: root})
 
 	value, err := tree.Get(ctx, []byte("this key"))
 	require.NoError(t, err, "Get")
@@ -1014,39 +1028,49 @@ func testHasRoot(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 	}
 	root.Hash.Empty()
 	require.True(t, ndb.HasRoot(root), "HasRoot should return true on empty root")
 
 	// Create a root in version 0.
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHash1, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	// Finalize version 0.
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHash1})
-	require.NoError(t, err, "Finalize")
 
-	// Make sure that HasRoot returns true.
 	root = node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash1,
 	}
+
+	// Finalize version 0.
+	err = ndb.Finalize(ctx, []node.Root{root})
+	require.NoError(t, err, "Finalize")
+
+	// Make sure that HasRoot returns true.
 	require.True(t, ndb.HasRoot(root), "HasRoot should return true for existing root")
 	root.Hash.FromBytes([]byte("invalid root"))
 	require.False(t, ndb.HasRoot(root), "HasRoot should return false for non-existing root")
 
 	// Create a different root in version 1.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("goo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHash2, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
 	// Finalize version 1.
-	err = ndb.Finalize(ctx, 1, []hash.Hash{rootHash2})
+	root2 := node.Root{
+		Namespace: testNs,
+		Version:   1,
+		Type:      node.RootTypeState,
+		Hash:      rootHash2,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root2})
 	require.NoError(t, err, "Finalize")
 
 	// Make sure that HasRoot for root hash from version 0 but with
@@ -1054,6 +1078,7 @@ func testHasRoot(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root = node.Root{
 		Namespace: testNs,
 		Version:   1,
+		Type:      node.RootTypeState,
 		Hash:      rootHash1,
 	}
 	require.False(t, ndb.HasRoot(root), "HasRoot should return false for non-existing root")
@@ -1065,27 +1090,39 @@ func testGetRootsForVersion(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) 
 	ctx := context.Background()
 
 	// Create two roots in version 10.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHash1, err := tree.Commit(ctx, testNs, 10)
 	require.NoError(t, err, "Commit")
 
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("bar"), []byte("foo"))
 	require.NoError(t, err, "Insert")
 	_, rootHash2, err := tree.Commit(ctx, testNs, 10)
 	require.NoError(t, err, "Commit")
 
 	// Finalize version 10.
-	err = ndb.Finalize(ctx, 10, []hash.Hash{rootHash1, rootHash2})
+	root1 := node.Root{
+		Namespace: testNs,
+		Version:   10,
+		Type:      node.RootTypeState,
+		Hash:      rootHash1,
+	}
+	root2 := node.Root{
+		Namespace: testNs,
+		Version:   10,
+		Type:      node.RootTypeState,
+		Hash:      rootHash2,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root1, root2})
 	require.NoError(t, err, "Finalize")
 
 	roots, err := ndb.GetRootsForVersion(ctx, 10)
 	require.NoError(t, err, "GetRootsForVersion")
 	require.Len(t, roots, 2, "GetRootsForVersion should return the correct number of roots")
-	require.Contains(t, roots, rootHash1, "GetRootsForVersion should return the correct roots")
-	require.Contains(t, roots, rootHash2, "GetRootsForVersion should return the correct roots")
+	require.Contains(t, roots, root1, "GetRootsForVersion should return the correct roots")
+	require.Contains(t, roots, root2, "GetRootsForVersion should return the correct roots")
 
 	roots, err = ndb.GetRootsForVersion(ctx, 1)
 	require.NoError(t, err, "GetRootsForVersion")
@@ -1103,12 +1140,18 @@ func testSize(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.NoError(t, err, "Size")
 
 	// Put something in the database.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHash1, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHash1})
+	root1 := node.Root{
+		Namespace: testNs,
+		Version:   0,
+		Type:      node.RootTypeState,
+		Hash:      rootHash1,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root1})
 	require.NoError(t, err, "Finalize")
 
 	// Reopen database to force flush.
@@ -1134,11 +1177,12 @@ func testMergeWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	emptyRoot := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 	}
 	emptyRoot.Hash.Empty()
 
 	// Put some stuff in the tree.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, keyZero, valueZero)
 	require.NoError(t, err, "Insert")
 	_, rootHash1, err := tree.Commit(ctx, testNs, 0)
@@ -1147,6 +1191,7 @@ func testMergeWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root1 := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash1,
 	}
 
@@ -1165,6 +1210,7 @@ func testMergeWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root2 := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash2,
 	}
 
@@ -1196,6 +1242,7 @@ func testMergeWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	root3 := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash3,
 	}
 
@@ -1208,7 +1255,7 @@ func testMergeWriteLog(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	// Create some keys in version 0.
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
@@ -1222,7 +1269,13 @@ func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Error(t, err, "Prune should fail for non-finalized versions")
 	require.Equal(t, db.ErrNotFinalized, err)
 	// Finalize version 0.
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHash1})
+	root1 := node.Root{
+		Namespace: testNs,
+		Version:   0,
+		Type:      node.RootTypeState,
+		Hash:      rootHash1,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root1})
 	require.NoError(t, err, "Finalize")
 
 	// Remove key in version 1.
@@ -1237,7 +1290,13 @@ func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Error(t, err, "Prune should fail for non-finalized versions")
 	require.Equal(t, db.ErrNotFinalized, err)
 	// Finalize version 1.
-	err = ndb.Finalize(ctx, 1, []hash.Hash{rootHash2})
+	root2 := node.Root{
+		Namespace: testNs,
+		Version:   1,
+		Type:      node.RootTypeState,
+		Hash:      rootHash2,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root2})
 	require.NoError(t, err, "Finalize")
 
 	// Add some keys in version 2.
@@ -1250,7 +1309,13 @@ func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Error(t, err, "Prune should fail for non-finalized versions")
 	require.Equal(t, db.ErrNotFinalized, err)
 	// Finalize version 2.
-	err = ndb.Finalize(ctx, 2, []hash.Hash{rootHash3})
+	root3 := node.Root{
+		Namespace: testNs,
+		Version:   2,
+		Type:      node.RootTypeState,
+		Hash:      rootHash3,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root3})
 	require.NoError(t, err, "Finalize")
 
 	earliestVersion, err := ndb.GetEarliestVersion(ctx)
@@ -1278,7 +1343,7 @@ func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.EqualValues(t, 2, latestVersion, "latest version should be correct")
 
 	// Keys must still be available in version 2.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 2, Hash: rootHash3})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 2, Type: node.RootTypeState, Hash: rootHash3})
 	value, err := tree.Get(ctx, []byte("blah"))
 	require.NoError(t, err, "Get")
 	require.EqualValues(t, []byte("ugh"), value)
@@ -1294,14 +1359,14 @@ func testPruneBasic(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Nil(t, value, "removed key must be gone")
 
 	// Version 0 must be gone.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHash1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHash1})
 	_, err = tree.Get(ctx, []byte("foo"))
 	require.Error(t, err, "Get")
 }
 
 func testPruneManyVersions(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	const numVersions = 50
 	const numPairsPerVersion = 50
@@ -1316,7 +1381,13 @@ func testPruneManyVersions(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 		_, rootHash, err := tree.Commit(ctx, testNs, uint64(r))
 		require.NoError(t, err, "Commit")
-		err = ndb.Finalize(ctx, uint64(r), []hash.Hash{rootHash})
+		root := node.Root{
+			Namespace: testNs,
+			Version:   uint64(r),
+			Type:      node.RootTypeState,
+			Hash:      rootHash,
+		}
+		err = ndb.Finalize(ctx, []node.Root{root})
 		require.NoError(t, err, "Finalize")
 	}
 
@@ -1343,25 +1414,11 @@ func testPruneManyVersions(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	}
 }
 
-// countCreatedNodes counts the number of nodes that have been created in the same
-// version as the root is in and have not been previously seen.
-func countCreatedNodes(t *testing.T, ndb db.NodeDB, root node.Root, seenNodes map[hash.Hash]bool) (nodes int) {
-	err := db.Visit(context.Background(), ndb, root, func(ctx context.Context, n node.Node) bool {
-		if n.GetCreatedVersion() == root.Version && !seenNodes[n.GetHash()] {
-			seenNodes[n.GetHash()] = true
-			nodes++
-		}
-		return true
-	})
-	require.NoError(t, err, "Visit")
-	return
-}
-
 func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
 
 	// Create a root in version 0.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	err = tree.Insert(ctx, []byte("moo"), []byte("goo"))
@@ -1369,11 +1426,11 @@ func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	_, rootHashR0_1, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 	// Finalize version 0.
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHashR0_1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1}})
 	require.NoError(t, err, "Finalize")
 
 	// Create a derived root A in version 1.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1})
 	err = tree.Insert(ctx, []byte("dr"), []byte("A"))
 	require.NoError(t, err, "Insert")
 	err = tree.Remove(ctx, []byte("moo"))
@@ -1382,7 +1439,7 @@ func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.NoError(t, err, "Commit")
 
 	// Create a derived root B in version 1.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1})
 	err = tree.Insert(ctx, []byte("dr"), []byte("B"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_2, err := tree.Commit(ctx, testNs, 1)
@@ -1390,13 +1447,13 @@ func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	// Finalize version 1. Only derived root B was finalized, so derived root A
 	// should be discarded.
-	err = ndb.Finalize(ctx, 1, []hash.Hash{rootHashR1_2})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_2}})
 	require.NoError(t, err, "Finalize")
 
 	// Make sure that the write log for the discarded root is gone.
-	rootR0_1 := node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_1}
-	rootR1_1 := node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_1}
-	rootR1_2 := node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_2}
+	rootR0_1 := node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1}
+	rootR1_1 := node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_1}
+	rootR1_2 := node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_2}
 	_, err = ndb.GetWriteLog(ctx, rootR0_1, rootR1_1)
 	require.Error(t, err, "GetWriteLog")
 	// Make sure that the write log for the non-discarded root exists.
@@ -1404,13 +1461,13 @@ func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.NoError(t, err, "GetWriteLog")
 
 	// Create a derived root C from derived root B in version 2.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_2})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_2})
 	err = tree.Insert(ctx, []byte("yet"), []byte("another"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR2_1, err := tree.Commit(ctx, testNs, 2)
 	require.NoError(t, err, "Commit")
 	// Finalize version 2.
-	err = ndb.Finalize(ctx, 2, []hash.Hash{rootHashR2_1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 2, Type: node.RootTypeState, Hash: rootHashR2_1}})
 	require.NoError(t, err, "Finalize")
 
 	// Prune version 1 (should fail as it is not the earliest version).
@@ -1438,7 +1495,7 @@ func testPruneForkedRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	}{
 		{2, rootHashR2_1, []string{"foo", "moo", "dr", "yet"}},
 	} {
-		tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: root.Version, Hash: root.Hash})
+		tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: root.Version, Type: node.RootTypeState, Hash: root.Hash})
 
 		for _, key := range root.Keys {
 			value, err := tree.Get(ctx, []byte(key))
@@ -1455,7 +1512,7 @@ func testPruneLoneRootsShared(t *testing.T, ndb db.NodeDB, factory NodeDBFactory
 	// that shares some nodes with a root that is among the finalized
 	// roots. Make sure that the shared nodes aren't pruned.
 
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	err = tree.Insert(ctx, []byte("foo 2"), []byte("bar2"))
@@ -1465,7 +1522,7 @@ func testPruneLoneRootsShared(t *testing.T, ndb db.NodeDB, factory NodeDBFactory
 	_, rootHash1, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	err = tree.Insert(ctx, []byte("foo 2"), []byte("bar2"))
@@ -1477,11 +1534,11 @@ func testPruneLoneRootsShared(t *testing.T, ndb db.NodeDB, factory NodeDBFactory
 	_, _, err = tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHash1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHash1}})
 	require.NoError(t, err, "Finalize")
 
 	// Check that the shared nodes are still there.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHash1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHash1})
 	value, err := tree.Get(ctx, []byte("foo"))
 	require.NoError(t, err, "Get")
 	require.EqualValues(t, []byte("bar"), value)
@@ -1512,7 +1569,7 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 			Namespace: testNs,
 			Version:   4,
 			SrcRoot:   "xnK40e9W7Sirh8NiLFEUBpvdOte4+XN0mNDAHs7wlno=",
-			DstRoot:   "lBnLyljpBdIweInarStbMkAGn8qq2sftGfJJWsvHCTk=",
+			DstRoot:   "HDRPGZxGtdYTxcEwY8xMEQb5glc5rzc30q27u2CceVU=",
 			Items: []item{
 				{
 					Key: "VFxlQ0wtW+UFzn4ojduOXMqLVlgtTzk5tN+eysKJiu7nAA==",
@@ -1528,8 +1585,8 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 		{
 			Namespace: testNs,
 			Version:   4,
-			SrcRoot:   "lBnLyljpBdIweInarStbMkAGn8qq2sftGfJJWsvHCTk=",
-			DstRoot:   "XeNxDPHiY0PAQI5vFxFNxjwgAj++Sf0kCohpaUvImUg=",
+			SrcRoot:   "HDRPGZxGtdYTxcEwY8xMEQb5glc5rzc30q27u2CceVU=",
+			DstRoot:   "1mhju3gCBswUklbJuiifvVJDY6QeNiqRx2F1MDdxcys=",
 			Finalized: true,
 			Items: []item{
 				{
@@ -1550,8 +1607,8 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 		{
 			Namespace: testNs,
 			Version:   4,
-			SrcRoot:   "lBnLyljpBdIweInarStbMkAGn8qq2sftGfJJWsvHCTk=",
-			DstRoot:   "rgbZz2sV2QlI/XG/+GiQoYlDpmxrMbY/hFs6PhTu1hA=",
+			SrcRoot:   "HDRPGZxGtdYTxcEwY8xMEQb5glc5rzc30q27u2CceVU=",
+			DstRoot:   "+h6pzinXfRJY1tnL7jXoGcbUfG0lFCYTX1TaDngycso=",
 			Items: []item{
 				{
 					Key: "RWt2X2tleVxlQ0wtW+UFzn4ojduOXMqLVlgtTzk5tN+eysKJiu7n",
@@ -1574,7 +1631,7 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 		},
 	}
 
-	var finalizedRoots []hash.Hash
+	var finalizedRoots []node.Root
 	for _, batch := range batches {
 		srcRootHashRaw, err := base64.StdEncoding.DecodeString(batch.SrcRoot)
 		require.NoError(t, err, "base64.DecodeString")
@@ -1585,6 +1642,7 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 		tree := NewWithRoot(nil, ndb, node.Root{
 			Namespace: batch.Namespace,
 			Version:   batch.Version,
+			Type:      node.RootTypeState,
 			Hash:      srcRootHash,
 		})
 		defer tree.Close()
@@ -1610,18 +1668,19 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 		require.EqualValues(t, dstRootHash, rootHash, "computed root hash must be as expected")
 
 		if batch.Finalized {
-			finalizedRoots = append(finalizedRoots, rootHash)
+			finalizedRoots = append(finalizedRoots, node.Root{
+				Namespace: batches[0].Namespace,
+				Version:   batches[0].Version,
+				Type:      node.RootTypeState,
+				Hash:      rootHash,
+			})
 		}
 	}
 
-	err := ndb.Finalize(ctx, batches[0].Version, finalizedRoots)
+	err := ndb.Finalize(ctx, finalizedRoots)
 	require.NoError(t, err, "Finalize")
 
-	tree := NewWithRoot(nil, ndb, node.Root{
-		Namespace: batches[0].Namespace,
-		Version:   batches[0].Version,
-		Hash:      finalizedRoots[0],
-	})
+	tree := NewWithRoot(nil, ndb, finalizedRoots[0])
 	defer tree.Close()
 
 	it := tree.NewIterator(ctx)
@@ -1634,11 +1693,98 @@ func testPruneLoneRootsShared2(t *testing.T, ndb db.NodeDB, factory NodeDBFactor
 	require.NoError(t, it.Err(), "tree should still be consistent")
 }
 
+func testPruneLoneRootsShared3(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	// Create a root in version 0.
+	tree := New(nil, ndb, node.RootTypeState)
+	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
+	require.NoError(err, "Insert")
+	_, _, err = tree.Commit(ctx, testNs, 0)
+	require.NoError(err, "Commit")
+
+	// Create another root in version 0.
+	tree = New(nil, ndb, node.RootTypeState)
+	err = tree.Insert(ctx, []byte("moo"), []byte("goo"))
+	require.NoError(err, "Insert")
+	_, rootHashR0_2, err := tree.Commit(ctx, testNs, 0)
+	require.NoError(err, "Commit")
+
+	// Create the same root as the first root in version 1.
+	tree = New(nil, ndb, node.RootTypeState)
+	err = tree.Insert(ctx, []byte("foo"), []byte("bar"))
+	require.NoError(err, "Insert")
+	_, rootHashR1_1, err := tree.Commit(ctx, testNs, 1)
+	require.NoError(err, "Commit")
+
+	// Finalize version 0 with the second root.
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_2}})
+	require.NoError(err, "Finalize")
+
+	// Make sure that the first root in version 1 is still valid.
+	tree = NewWithRoot(nil, ndb, node.Root{
+		Namespace: testNs,
+		Version:   1,
+		Type:      node.RootTypeState,
+		Hash:      rootHashR1_1,
+	})
+	value, err := tree.Get(ctx, []byte("foo"))
+	require.NoError(err, "Get")
+	require.EqualValues([]byte("bar"), value)
+}
+
+func testPruneLoneRootsShared4(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	// Create a root in version 0.
+	tree := New(nil, ndb, node.RootTypeState)
+	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
+	require.NoError(err, "Insert")
+	_, rootHashR0_1, err := tree.Commit(ctx, testNs, 0)
+	require.NoError(err, "Commit")
+
+	// Create the same root as the first root in version 1.
+	tree = New(nil, ndb, node.RootTypeState)
+	err = tree.Insert(ctx, []byte("foo"), []byte("bar"))
+	require.NoError(err, "Insert")
+	_, rootHashR1_1, err := tree.Commit(ctx, testNs, 1)
+	require.NoError(err, "Commit")
+
+	// Finalize version 0.
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1}})
+	require.NoError(err, "Finalize")
+	// Finalize version 1.
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_1}})
+	require.NoError(err, "Finalize")
+	// Prune version 0.
+	err = ndb.Prune(ctx, 0)
+	require.NoError(err, "Prune")
+
+	// Reopen database to force compaction.
+	ndb.Close()
+	ndb, err = factory(testNs)
+	require.NoError(err, "ndb.New")
+	defer ndb.Close()
+
+	// Make sure that the first root in version 1 is still valid.
+	tree = NewWithRoot(nil, ndb, node.Root{
+		Namespace: testNs,
+		Version:   1,
+		Type:      node.RootTypeState,
+		Hash:      rootHashR1_1,
+	})
+	value, err := tree.Get(ctx, []byte("foo"))
+	require.NoError(err, "Get")
+	require.EqualValues([]byte("bar"), value)
+}
+
 func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
 
 	// Create a root in version 0.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	err = tree.Insert(ctx, []byte("moo"), []byte("goo"))
@@ -1647,42 +1793,48 @@ func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.NoError(t, err, "Commit")
 
 	// Create another root in version 0.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("goo"), []byte("blah"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR0_2, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
 	// Create yet another root in version 0.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("yet"), []byte("another"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR0_3, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
 	// Create yet another root in version 0.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("yet2"), []byte("another2"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR0_4, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
 	// Finalize version 0.
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHashR0_1, rootHashR0_2, rootHashR0_3, rootHashR0_4})
+	var finalRoots []node.Root
+	for _, hash := range []hash.Hash{rootHashR0_1, rootHashR0_2, rootHashR0_3, rootHashR0_4} {
+		finalRoots = append(finalRoots, node.Root{
+			Namespace: testNs,
+			Version:   0,
+			Type:      node.RootTypeState,
+			Hash:      hash,
+		})
+	}
+	err = ndb.Finalize(ctx, finalRoots)
 	require.NoError(t, err, "Finalize")
 
 	// Create a distinct root in version 1.
-	seenNodes := make(map[hash.Hash]bool)
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("different"), []byte("boo"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_1, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	nodesR1_1 := countCreatedNodes(t, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_1}, seenNodes)
-	require.EqualValues(t, 1, nodesR1_1)
 
 	// Create a derived root in version 1.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_2})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_2})
 	err = tree.Insert(ctx, []byte("different2"), []byte("boo"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_2, err := tree.Commit(ctx, testNs, 1)
@@ -1690,40 +1842,36 @@ func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	// Create two linked roots inside version 1 which will not be referenced
 	// in subsequent versions and so should be garbage collected.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("first"), []byte("am i"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_3, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	nodesR1_3 := countCreatedNodes(t, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_3}, seenNodes)
-	require.EqualValues(t, 1, nodesR1_3)
 
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_3})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_3})
 	err = tree.Insert(ctx, []byte("second"), []byte("i am"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_4, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	nodesR1_4 := countCreatedNodes(t, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_4}, seenNodes)
-	require.EqualValues(t, 2, nodesR1_4)
 
 	// Create three linked roots inside version 1 where the first root is
 	// derived from a root in version 0, the second root is derived from
 	// the first root and the third root is derived from the second root
 	// (both in the same version). All three should be garbage collected
 	// as they are not referenced in subsequent versions.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_3})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_3})
 	err = tree.Insert(ctx, []byte("first"), []byte("am i"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_5, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_5})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_5})
 	err = tree.Insert(ctx, []byte("second"), []byte("i am"))
 	require.NoError(t, err, "Insert")
 	err = tree.Remove(ctx, []byte("yet"))
 	require.NoError(t, err, "Remove")
 	_, rootHashR1_6, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_6})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_6})
 	err = tree.Insert(ctx, []byte("third"), []byte("i am not"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_7, err := tree.Commit(ctx, testNs, 1)
@@ -1734,17 +1882,17 @@ func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	// the first root and the third root is derived from the second root
 	// (both in the same version). The third root is then referenced in version
 	// 2 so only intermediate nodes should be garbage collected.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: rootHashR0_4})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_4})
 	err = tree.Insert(ctx, []byte("first2"), []byte("am i"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_8, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_8})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_8})
 	err = tree.Insert(ctx, []byte("second2"), []byte("i am"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_9, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_9})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_9})
 	err = tree.Insert(ctx, []byte("third2"), []byte("i am not"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_10, err := tree.Commit(ctx, testNs, 1)
@@ -1753,32 +1901,50 @@ func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	// and should be garbage collected.
 
 	// Finalize version 1.
-	err = ndb.Finalize(ctx, 1, []hash.Hash{rootHashR1_1, rootHashR1_2, rootHashR1_4, rootHashR1_7, rootHashR1_10})
+	finalRoots = nil
+	for _, hash := range []hash.Hash{rootHashR1_1, rootHashR1_2, rootHashR1_4, rootHashR1_7, rootHashR1_10} {
+		finalRoots = append(finalRoots, node.Root{
+			Namespace: testNs,
+			Version:   1,
+			Type:      node.RootTypeState,
+			Hash:      hash,
+		})
+	}
+	err = ndb.Finalize(ctx, finalRoots)
 	require.NoError(t, err, "Finalize")
 
 	// Create a distinct root in version 2.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("blah"), []byte("brah"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR2_1, err := tree.Commit(ctx, testNs, 2)
 	require.NoError(t, err, "Commit")
 
 	// Create a derived root in version 2.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_2})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_2})
 	err = tree.Insert(ctx, []byte("foo"), []byte("boo"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR2_2, err := tree.Commit(ctx, testNs, 2)
 	require.NoError(t, err, "Commit")
 
 	// Create another derived root in version 2.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Hash: rootHashR1_10})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 1, Type: node.RootTypeState, Hash: rootHashR1_10})
 	err = tree.Insert(ctx, []byte("foo2"), []byte("boo"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR2_3, err := tree.Commit(ctx, testNs, 2)
 	require.NoError(t, err, "Commit")
 
 	// Finalize version 2.
-	err = ndb.Finalize(ctx, 2, []hash.Hash{rootHashR2_1, rootHashR2_2, rootHashR2_3})
+	finalRoots = nil
+	for _, hash := range []hash.Hash{rootHashR2_1, rootHashR2_2, rootHashR2_3} {
+		finalRoots = append(finalRoots, node.Root{
+			Namespace: testNs,
+			Version:   2,
+			Type:      node.RootTypeState,
+			Hash:      hash,
+		})
+	}
+	err = ndb.Finalize(ctx, finalRoots)
 	require.NoError(t, err, "Finalize")
 
 	// Prune versions 0 and 1, all of the lone root's node should have been removed.
@@ -1803,7 +1969,7 @@ func testPruneLoneRoots(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 		{2, rootHashR2_2, []string{"goo", "different2", "foo"}},
 		{2, rootHashR2_3, []string{"yet2", "first2", "second2", "third2", "foo2"}},
 	} {
-		tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: root.Version, Hash: root.Hash})
+		tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: root.Version, Type: node.RootTypeState, Hash: root.Hash})
 
 		for _, key := range root.Keys {
 			value, err := tree.Get(ctx, []byte(key))
@@ -1817,28 +1983,28 @@ func testErrors(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
 
 	// Commit root for version 0.
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 	err := tree.Insert(ctx, []byte("foo"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR0_1, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
 
 	// Commit root for version 1.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("another"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR1_1, err := tree.Commit(ctx, testNs, 1)
 	require.NoError(t, err, "Commit")
 
 	// Commit root for version 2.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("another2"), []byte("bar"))
 	require.NoError(t, err, "Insert")
 	_, rootHashR2_1, err := tree.Commit(ctx, testNs, 2)
 	require.NoError(t, err, "Commit")
 
 	// Commit for non-following version should fail.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 2, Hash: rootHashR2_1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 2, Type: node.RootTypeState, Hash: rootHashR2_1})
 	err = tree.Insert(ctx, []byte("moo"), []byte("moo"))
 	require.NoError(t, err, "Insert")
 	_, _, err = tree.Commit(ctx, testNs, 100)
@@ -1846,7 +2012,7 @@ func testErrors(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Equal(t, db.ErrRootMustFollowOld, err)
 
 	// Commit with mismatched old root should fail.
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 99, Hash: rootHashR1_1})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 99, Type: node.RootTypeState, Hash: rootHashR1_1})
 	err = tree.Insert(ctx, []byte("moo"), []byte("moo"))
 	require.NoError(t, err, "Insert")
 	_, _, err = tree.Commit(ctx, testNs, 100)
@@ -1855,25 +2021,25 @@ func testErrors(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	// Commit with non-existent old root should fail.
 	bogusRoot := hash.NewFromBytes([]byte("bogus root"))
-	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Hash: bogusRoot})
+	tree = NewWithRoot(nil, ndb, node.Root{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: bogusRoot})
 	_, _, err = tree.Commit(ctx, testNs, 1)
 	require.Error(t, err, "Commit should fail for invalid root")
 	require.Equal(t, db.ErrRootNotFound, err)
 
 	// Finalizing a version twice should fail.
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHashR0_1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1}})
 	require.NoError(t, err, "Finalize")
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHashR0_1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 0, Type: node.RootTypeState, Hash: rootHashR0_1}})
 	require.Error(t, err, "Finalize should fail as version is already finalized")
 	require.Equal(t, db.ErrAlreadyFinalized, err)
 
 	// Finalize of version 2 should fail as version 1 is not finalized.
-	err = ndb.Finalize(ctx, 2, []hash.Hash{rootHashR2_1})
+	err = ndb.Finalize(ctx, []node.Root{{Namespace: testNs, Version: 2, Type: node.RootTypeState, Hash: rootHashR2_1}})
 	require.Error(t, err, "Finalize should fail as previous version not finalized")
 	require.Equal(t, db.ErrNotFinalized, err)
 
 	// Commit into an already finalized version should fail.
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("already finalized"), []byte("woohoo"))
 	require.NoError(t, err, "Insert")
 	_, _, err = tree.Commit(ctx, testNs, 0)
@@ -1884,7 +2050,7 @@ func testErrors(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	var badNs common.Namespace
 	_ = badNs.UnmarshalText([]byte("badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb"))
 
-	tree = New(nil, ndb)
+	tree = New(nil, ndb, node.RootTypeState)
 	err = tree.Insert(ctx, []byte("bad namespace"), []byte("woohoo"))
 	require.NoError(t, err, "Insert")
 	_, _, err = tree.Commit(ctx, badNs, 0)
@@ -1892,7 +2058,7 @@ func testErrors(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	require.Equal(t, db.ErrBadNamespace, err)
 
 	// Using the WithoutWriteLog option together with a remote read syncer should panic.
-	require.Panics(t, func() { New(tree, nil, WithoutWriteLog()) })
+	require.Panics(t, func() { New(tree, nil, node.RootTypeState, WithoutWriteLog()) })
 }
 
 func testIncompatibleDB(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
@@ -1914,7 +2080,7 @@ func testSpecialCaseFromJSON(t *testing.T, ndb db.NodeDB, fixture string) {
 	require.NoError(t, err, "failed to unmarshal fixture")
 
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	// Also test all operations against a "remote" tree to test sync operations.
 	var root node.Root
@@ -1926,7 +2092,7 @@ func testSpecialCaseFromJSON(t *testing.T, ndb db.NodeDB, fixture string) {
 		var rootHash hash.Hash
 		_, rootHash, err = tree.Commit(ctx, testNs, 0)
 		require.NoError(t, err, "Commit")
-		root = node.Root{Namespace: testNs, Hash: rootHash}
+		root = node.Root{Namespace: testNs, Type: node.RootTypeState, Hash: rootHash}
 		remoteTree = NewWithRoot(tree, nil, root, Capacity(0, 0))
 	}
 
@@ -2012,7 +2178,7 @@ func testSpecialCase5(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 func testLargeUpdates(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 	ctx := context.Background()
-	tree := New(nil, ndb)
+	tree := New(nil, ndb, node.RootTypeState)
 
 	// The number of elements is such that it would overflow the maximum number of allowed array
 	// elements in the default (untrusted) CBOR decoder.
@@ -2023,7 +2189,13 @@ func testLargeUpdates(t *testing.T, ndb db.NodeDB, factory NodeDBFactory) {
 
 	_, rootHash, err := tree.Commit(ctx, testNs, 0)
 	require.NoError(t, err, "Commit")
-	err = ndb.Finalize(ctx, 0, []hash.Hash{rootHash})
+	root := node.Root{
+		Namespace: testNs,
+		Version:   0,
+		Type:      node.RootTypeState,
+		Hash:      rootHash,
+	}
+	err = ndb.Finalize(ctx, []node.Root{root})
 	require.NoError(t, err, "Finalize")
 }
 
@@ -2064,6 +2236,8 @@ func testBackend(
 		{"PruneLoneRoots", testPruneLoneRoots},
 		{"PruneLoneRootsShared", testPruneLoneRootsShared},
 		{"PruneLoneRootsShared2", testPruneLoneRootsShared2},
+		{"PruneLoneRootsShared3", testPruneLoneRootsShared3},
+		{"PruneLoneRootsShared4", testPruneLoneRootsShared4},
 		{"PruneForkedRoots", testPruneForkedRoots},
 		{"SpecialCase1", testSpecialCase1},
 		{"SpecialCase2", testSpecialCase2},
@@ -2164,7 +2338,7 @@ func benchmarkInsertBatch(b *testing.B, numValues int, commit bool) {
 			MaxCacheSize: 16 * 1024 * 1024,
 		})
 		require.NoError(b, err, "New")
-		tree := New(nil, ndb)
+		tree := New(nil, ndb, node.RootTypeState)
 
 		for i := 0; i < numValues; i++ {
 			key := []byte(fmt.Sprintf("key %d", i))
@@ -2207,7 +2381,7 @@ func generateLongKeyValuePairs() ([][]byte, [][]byte) {
 
 func generatePopulatedTree(t *testing.T, ndb db.NodeDB) ([][]byte, [][]byte, node.Root, Tree) {
 	ctx := context.Background()
-	tree := New(nil, ndb, Capacity(0, 0))
+	tree := New(nil, ndb, node.RootTypeState, Capacity(0, 0))
 
 	keys, values := generateKeyValuePairs()
 	for i := 0; i < len(keys); i++ {
@@ -2222,6 +2396,7 @@ func generatePopulatedTree(t *testing.T, ndb db.NodeDB) ([][]byte, [][]byte, nod
 	root := node.Root{
 		Namespace: testNs,
 		Version:   0,
+		Type:      node.RootTypeState,
 		Hash:      rootHash,
 	}
 	return keys, values, root, tree

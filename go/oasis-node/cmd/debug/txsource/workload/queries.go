@@ -1,7 +1,6 @@
 package workload
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
@@ -27,7 +27,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction/results"
 	tmcrypto "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
 	control "github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
@@ -35,10 +35,13 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 )
 
-const (
-	// NameQueries is the name of the queries workload.
-	NameQueries = "queries"
+// NameQueries is the name of the queries workload.
+const NameQueries = "queries"
 
+// Queries is the queries workload.
+var Queries = &queries{}
+
+const (
 	// CfgConsensusNumKeptVersions is the number of last consensus state versions that the nodes are
 	// keeping (e.g., due to a configured pruning policy). Versions older than that will not be
 	// queried.
@@ -58,13 +61,17 @@ const (
 	// queriesIterationTimeout is the combined timeout for running all the queries that are executed
 	// in a single iteration. The purpose of this timeout is to prevent the client being stuck and
 	// treating that as an error instead.
-	queriesIterationTimeout = 60 * time.Second
+	queriesIterationTimeout = 120 * time.Second
 
 	// queriesNumAllowedQueryTxsHistoricalFailures is the number of allowed failures of histortical
 	// `QueryTxs` requests. A historical `QueryTxs` request can fail in case available storage
 	// nodes have gap in history for the queried height, due to restoring from checkpoint. See also:
 	// https://github.com/oasisprotocol/oasis-core/issues/3337
 	queriesNumAllowedQueryTxsHistoricalFailures = 5
+
+	// doQueryAllProposalsEvery configures how often the queries workload should query all (including)
+	// past proposals.
+	doQueryAllProposalsEvery = 10
 )
 
 // QueriesFlags are the queries workload flags.
@@ -74,21 +81,25 @@ type queries struct {
 	logger *logging.Logger
 
 	runtimeID       common.Namespace
-	epochtimeParams epochtime.ConsensusParameters
-	stakingParams   staking.ConsensusParameters
-	schedulerParams scheduler.ConsensusParameters
+	epochtimeParams *beacon.ConsensusParameters
+	stakingParams   *staking.ConsensusParameters
+	schedulerParams *scheduler.ConsensusParameters
 
-	control   control.NodeController
-	staking   staking.Backend
-	consensus consensus.ClientBackend
-	registry  registry.Backend
-	scheduler scheduler.Backend
-	runtime   runtimeClient.RuntimeClient
+	control    control.NodeController
+	beacon     beacon.Backend
+	staking    staking.Backend
+	consensus  consensus.ClientBackend
+	registry   registry.Backend
+	scheduler  scheduler.Backend
+	governance governance.Backend
+	runtime    runtimeClient.RuntimeClient
 
 	// queryTxsHistoricalFailures is a counter of historical QueryTxs queries that failed.
 	queryTxsHistoricalFailures uint64
 
 	runtimeGenesisRound uint64
+
+	iteration uint64
 }
 
 func (q *queries) sanityCheckTransactionEvents(ctx context.Context, height int64, txEvents []*results.Event) error {
@@ -97,114 +108,109 @@ func (q *queries) sanityCheckTransactionEvents(ctx context.Context, height int64
 	if err != nil {
 		return fmt.Errorf("registry.GetEvents error at height %d: %w", height, err)
 	}
-	var expectedRegistryEvents []*registry.Event
+	expectedRegistryEvents := make(map[hash.Hash]int)
 	for _, event := range registryEvents {
 		if event.TxHash.IsEmpty() {
 			continue
 		}
-		expectedRegistryEvents = append(expectedRegistryEvents, event)
+		h := hash.NewFromBytes(cbor.Marshal(event)[:])
+		expectedRegistryEvents[h] = expectedRegistryEvents[h] + 1
 	}
+
 	stakingEvents, err := q.staking.GetEvents(ctx, height)
 	if err != nil {
-		return fmt.Errorf("staking.GetEven error at height %d: %w", height, err)
+		return fmt.Errorf("staking.GetEvents error at height %d: %w", height, err)
 	}
-	var expectedStakingEvents []*staking.Event
+	expectedStakingEvents := make(map[hash.Hash]int)
 	for _, event := range stakingEvents {
 		if event.TxHash.IsEmpty() {
 			continue
 		}
-		expectedStakingEvents = append(expectedStakingEvents, event)
+		h := hash.NewFromBytes(cbor.Marshal(event)[:])
+		expectedStakingEvents[h] = expectedStakingEvents[h] + 1
 	}
 
-	compareEvents := func(e1, e2 interface{}) int {
-		return bytes.Compare(cbor.Marshal(e1), cbor.Marshal(e2))
+	governanceEvents, err := q.governance.GetEvents(ctx, height)
+	if err != nil {
+		return fmt.Errorf("governance.GetEvents error at height %d: %w", height, err)
 	}
-	ensureEventExists := func(txEvent *results.Event) error {
-		var found bool
+	expectedGovernanceEvents := make(map[hash.Hash]int)
+	for _, event := range governanceEvents {
+		if event.TxHash.IsEmpty() {
+			continue
+		}
+		h := hash.NewFromBytes(cbor.Marshal(event)[:])
+		expectedGovernanceEvents[h] = expectedGovernanceEvents[h] + 1
+	}
+
+	for _, txEvent := range txEvents {
+		var (
+			expectedEvents map[hash.Hash]int
+			event          interface{}
+		)
 		switch {
 		case txEvent.Registry != nil:
-			for _, registryEvent := range expectedRegistryEvents {
-				if compareEvents(registryEvent, txEvent.Registry) == 0 {
-					found = true
-					break
-				}
-			}
+			expectedEvents = expectedRegistryEvents
+			event = txEvent.Registry
 		case txEvent.Staking != nil:
-			for _, stakingEvent := range expectedStakingEvents {
-				if compareEvents(stakingEvent, txEvent.Staking) == 0 {
-					found = true
-					break
-				}
-			}
+			expectedEvents = expectedStakingEvents
+			event = txEvent.Staking
+		case txEvent.Governance != nil:
+			expectedEvents = expectedGovernanceEvents
+			event = txEvent.Governance
 		case txEvent.RootHash != nil:
 			// XXX: we cannot get roothash events from a client.
-			found = true
+			continue
+		default:
+			return fmt.Errorf("unsupported event: %+v", txEvent)
 		}
-		if !found {
-			return fmt.Errorf("GetTransactionsWithResults transaction event not found")
+		h := hash.NewFromBytes(cbor.Marshal(event)[:])
+
+		// Make sure that the event is expected.
+		switch {
+		case expectedEvents[h] == 1:
+			// Remove the event from expected events map as counter reached zero.
+			delete(expectedEvents, h)
+		case expectedEvents[h] < 1:
+			// Unexpected event.
+			q.logger.Error("GetTransactionsWithResults produced an unexpected event",
+				"transaction_event", txEvent,
+				"registry_events", registryEvents,
+				"staking_events", stakingEvents,
+				"height", height,
+			)
+			return fmt.Errorf("GetTransactionsWithResults produced an unexpected event")
+		default:
+			// More events remaining.
+			expectedEvents[h] = expectedEvents[h] - 1
 		}
-		return nil
 	}
 
-	var numStakingEvents, numRegistryEvents int
-	seenEvents := make(map[hash.Hash]struct{})
-	for _, txEvent := range txEvents {
-		if err := ensureEventExists(txEvent); err != nil {
-			q.logger.Error("GetTransactionsWithResults ensure event exists failed",
-				"transaction_event", txEvent,
-				"registry_events", expectedRegistryEvents,
-				"staking_events", expectedStakingEvents,
-				"height", height,
-			)
-			return err
-		}
-		if txEvent.Staking != nil {
-			numStakingEvents++
-		}
-		if txEvent.Registry != nil {
-			numRegistryEvents++
-		}
-		h := hash.NewFromBytes(cbor.Marshal(txEvent)[:])
-		if _, ok := seenEvents[h]; ok {
-			q.logger.Error("GetTransactionsWithResults duplicate event",
-				"registry_events", expectedRegistryEvents,
-				"staking_events", expectedStakingEvents,
-				"transaction_events", txEvents,
-				"height", height,
-			)
-			return fmt.Errorf("GetTransactionsWithResults duplicate event")
-		}
-		seenEvents[h] = struct{}{}
-	}
-	// If all events exist and lengths match (with no duplicates), the results are equal.
-	if len(expectedStakingEvents) != numStakingEvents {
-		q.logger.Error("GetTransactionsWithResults staking events lengths missmatch",
-			"events", txEvents,
-			"staking_events", expectedStakingEvents,
-			"height", height,
+	// All expected events should be seen.
+	if len(expectedRegistryEvents) != 0 {
+		q.logger.Error("GetTransactionsWithResults did not produce all expected registry events",
+			"missing_events", expectedRegistryEvents,
 		)
-		return fmt.Errorf("GetTransactionsWithResults staking events length missmatch")
+		return fmt.Errorf("GetTransactionsWithResults did not produce all expected registry events")
 	}
-	if len(expectedRegistryEvents) != numRegistryEvents {
-		q.logger.Error("GetTransactionsWithResults registry events lengths missmatch",
-			"events", txEvents,
-			"registry_events", expectedRegistryEvents,
-			"height", height,
+	if len(expectedStakingEvents) != 0 {
+		q.logger.Error("GetTransactionsWithResults did not produce all expected staking events",
+			"missing_events", expectedStakingEvents,
 		)
-		return fmt.Errorf("GetTransactionsWithResults registry events length missmatch")
+		return fmt.Errorf("GetTransactionsWithResults did not produce all expected staking events")
 	}
 
 	return nil
 }
 
-// doConsensusQueries does GetEpoch, GetBlock, GetTransaction queries for the
-// provided height.
+// doConsensusQueries does GetBlock, GetTransaction queries for the provided
+// height.
 func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height int64) error {
-	q.logger.Debug("Doing consensus queries",
+	q.logger.Debug("doing consensus queries",
 		"height", height,
 	)
 
-	epoch, err := q.consensus.GetEpoch(ctx, height)
+	epoch, err := q.beacon.GetEpoch(ctx, height)
 	if err != nil {
 		return fmt.Errorf("GetEpoch at height %d: %w", height, err)
 	}
@@ -215,14 +221,14 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 	if block.Height != height {
 		return fmt.Errorf("block.Height: %d == %d violated", block.Height, height)
 	}
-	if !q.epochtimeParams.DebugMockBackend {
-		expectedEpoch := epochtime.EpochTime(block.Height / q.epochtimeParams.Interval)
+	if params := q.epochtimeParams.InsecureParameters; params != nil && !q.epochtimeParams.DebugMockBackend {
+		expectedEpoch := beacon.EpochTime(block.Height / params.Interval)
 		if expectedEpoch != epoch {
-			q.logger.Error("Invalid epoch",
+			q.logger.Error("invalid epoch",
 				"expected", expectedEpoch,
 				"epoch", epoch,
 				"height", block.Height,
-				"epoch_interval", q.epochtimeParams.Interval,
+				"epoch_interval", params.Interval,
 			)
 			return fmt.Errorf("Invalid epoch: %d", epoch)
 		}
@@ -256,41 +262,30 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 		return fmt.Errorf("GetTransactionsWithResults at height %d: %w", height, err)
 	}
 	if len(txs) != len(txsWithRes.Transactions) {
-		q.logger.Error("GetTransactionsWithResults transactions length missmatch",
+		q.logger.Error("GetTransactionsWithResults transactions length mismatch",
 			"txs", txs,
 			"txs_with_results", txsWithRes,
 			"height", height,
 		)
 		return fmt.Errorf(
-			"GetTransactionsWithResults transactions length missmatch, expected: %d, got: %d",
+			"GetTransactionsWithResults transactions length mismatch, expected: %d, got: %d",
 			len(txs), len(txsWithRes.Transactions),
 		)
 	}
 	if len(txsWithRes.Transactions) != len(txsWithRes.Results) {
-		q.logger.Error("GetTransactionsWithResults results length missmatch",
+		q.logger.Error("GetTransactionsWithResults results length mismatch",
 			"txs", txs,
 			"txs_with_results", txsWithRes,
 			"height", height,
 		)
 		return fmt.Errorf(
-			"GetTransactionsWithResults results length missmatch, expected: %d, got: %d",
+			"GetTransactionsWithResults results length mismatch, expected: %d, got: %d",
 			len(txsWithRes.Transactions), len(txsWithRes.Results),
 		)
 	}
 
 	var txEvents []*results.Event
-	for txIdx, res := range txsWithRes.Results {
-		if res.IsSuccess() {
-			// Successful transaction should always produce events.
-			if len(res.Events) == 0 {
-				q.logger.Error("GetTransactionsWithResults successful transaction without events",
-					"transaction", txsWithRes.Transactions[txIdx],
-					"result", res,
-					"height", height,
-				)
-				return fmt.Errorf("GetTransactionsWithResults successful transaction result without events")
-			}
-		}
+	for _, res := range txsWithRes.Results {
 		txEvents = append(txEvents, res.Events...)
 	}
 	if err := q.sanityCheckTransactionEvents(ctx, height, txEvents); err != nil {
@@ -316,7 +311,7 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 		q.logger.Debug("state integrity verified")
 	}
 
-	q.logger.Debug("Consensus queries done",
+	q.logger.Debug("consensus queries done",
 		"height", height,
 		"epoch", epoch,
 		"block", block,
@@ -328,7 +323,7 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 // doSchedulerQueries does GetCommittees and GetValidator queries for the
 // provided height.
 func (q *queries) doSchedulerQueries(ctx context.Context, rng *rand.Rand, height int64) error {
-	q.logger.Debug("Doing scheduler queries",
+	q.logger.Debug("doing scheduler queries",
 		"height", height,
 	)
 
@@ -348,11 +343,11 @@ func (q *queries) doSchedulerQueries(ctx context.Context, rng *rand.Rand, height
 	if err != nil {
 		return fmt.Errorf("GetCommittees at height %d: %w", height, err)
 	}
-	epoch, err := q.consensus.GetEpoch(ctx, height)
+	epoch, err := q.beacon.GetEpoch(ctx, height)
 	if err != nil {
 		return fmt.Errorf("GetEpoch failure: %w", err)
 	}
-	// In the E2E-tests we only validators are present in the genesis documents,
+	// In the E2E-tests only validators are present in the genesis documents,
 	// meaning there will be no other committees in the first epoch (epoch=0).
 	// In epoch 1 the key-manager will register, but not yet compute/storage
 	// workers, since those will wait for key-manager committee to be available.
@@ -368,7 +363,7 @@ func (q *queries) doSchedulerQueries(ctx context.Context, rng *rand.Rand, height
 		}
 	}
 
-	q.logger.Debug("Scheduler queries done",
+	q.logger.Debug("scheduler queries done",
 		"height", height,
 		"validators", validators,
 		"committees", committees,
@@ -379,7 +374,7 @@ func (q *queries) doSchedulerQueries(ctx context.Context, rng *rand.Rand, height
 
 // doRegistryQueries does registry queries for the provided height.
 func (q *queries) doRegistryQueries(ctx context.Context, rng *rand.Rand, height int64) error {
-	q.logger.Debug("Doing registry queries",
+	q.logger.Debug("doing registry queries",
 		"height", height,
 	)
 
@@ -471,7 +466,7 @@ func (q *queries) doRegistryQueries(ctx context.Context, rng *rand.Rand, height 
 		return fmt.Errorf("GetEvents error at height %d: %w", height, err)
 	}
 
-	q.logger.Debug("Done registry queries",
+	q.logger.Debug("done registry queries",
 		"height", height,
 	)
 
@@ -480,7 +475,7 @@ func (q *queries) doRegistryQueries(ctx context.Context, rng *rand.Rand, height 
 
 // doStakingQueries does staking queries at the provided height.
 func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height int64) error {
-	q.logger.Debug("Doing staking queries",
+	q.logger.Debug("doing staking queries",
 		"height", height,
 	)
 
@@ -497,6 +492,11 @@ func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height i
 	lastBlockFees, err := q.staking.LastBlockFees(ctx, height)
 	if err != nil {
 		return fmt.Errorf("staking.LastBLockFees: %w", err)
+	}
+
+	governanceDeposits, err := q.staking.GovernanceDeposits(ctx, height)
+	if err != nil {
+		return fmt.Errorf("staking.GovernanceDeposits: %w", err)
 	}
 
 	thKind := staking.ThresholdKind(rng.Intn(int(staking.KindMax)))
@@ -567,13 +567,15 @@ func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height i
 		}
 	}
 	_ = totalSum.Add(commonPool)
+	_ = totalSum.Add(governanceDeposits)
 	_ = totalSum.Add(lastBlockFees)
 	_ = totalSum.Add(&accSum)
 
 	if total.Cmp(&totalSum) != 0 {
-		q.logger.Error("Staking total supply mismatch",
+		q.logger.Error("staking total supply mismatch",
 			"height", height,
 			"common_pool", commonPool,
+			"governance_deposits", governanceDeposits,
 			"last_block_fees", lastBlockFees,
 			"accounts_sum", accSum,
 			"total_sum", totalSum,
@@ -589,10 +591,11 @@ func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height i
 		return fmt.Errorf("GetEvents error at height %d: %w", height, grr)
 	}
 
-	q.logger.Debug("Done staking queries",
+	q.logger.Debug("done staking queries",
 		"height", height,
 		"total", total,
 		"common_pool", commonPool,
+		"governance_deposits", governanceDeposits,
 		"last_block_fees", lastBlockFees,
 		"threshold", threshold,
 	)
@@ -600,9 +603,73 @@ func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height i
 	return nil
 }
 
+// doGovernanceQueries does governance queries at the provided height.
+func (q *queries) doGovernanceQueries(ctx context.Context, rng *rand.Rand, height int64) error {
+	q.logger.Debug("doing governance queries",
+		"height", height,
+	)
+
+	if q.iteration%doQueryAllProposalsEvery == 0 {
+		proposals, err := q.governance.Proposals(ctx, height)
+		if err != nil {
+			return fmt.Errorf("governance.Proposals: %w", err)
+		}
+		for _, p := range proposals {
+			var p2 *governance.Proposal
+			p2, err = q.governance.Proposal(ctx, &governance.ProposalQuery{Height: height, ProposalID: p.ID})
+			if err != nil {
+				return fmt.Errorf("governance.Proposal: %w", err)
+			}
+			if !p.Content.Equals(&p2.Content) {
+				return fmt.Errorf("proposal contents not equal")
+			}
+
+			_, err = q.governance.Votes(ctx, &governance.ProposalQuery{Height: height, ProposalID: p.ID})
+			if err != nil {
+				return fmt.Errorf("governance.Votes: %w", err)
+			}
+		}
+	}
+
+	activeProposals, err := q.governance.ActiveProposals(ctx, height)
+	if err != nil {
+		return fmt.Errorf("governance.ActiveProposals: %w", err)
+	}
+	for _, p := range activeProposals {
+		var p2 *governance.Proposal
+		p2, err = q.governance.Proposal(ctx, &governance.ProposalQuery{Height: height, ProposalID: p.ID})
+		if err != nil {
+			return fmt.Errorf("governance.Proposal: %w", err)
+		}
+		if !p.Content.Equals(&p2.Content) {
+			return fmt.Errorf("proposal contents not equal")
+		}
+
+		_, err = q.governance.Votes(ctx, &governance.ProposalQuery{Height: height, ProposalID: p.ID})
+		if err != nil {
+			return fmt.Errorf("governance.Votes: %w", err)
+		}
+	}
+
+	pendingUpgrades, err := q.governance.PendingUpgrades(ctx, height)
+	if err != nil {
+		return fmt.Errorf("governance.PendingUpgrades: %w", err)
+	}
+	for _, pu := range pendingUpgrades {
+		if err = pu.ValidateBasic(); err != nil {
+			return fmt.Errorf("invalid pending upgrade: %w", err)
+		}
+	}
+
+	q.logger.Debug("done governance queries",
+		"height", height,
+	)
+	return nil
+}
+
 // doRuntimeQueries does runtime queries at a random round.
 func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
-	q.logger.Debug("Doing runtime queries")
+	q.logger.Debug("doing runtime queries")
 
 	// Latest block.
 	latestBlock, err := q.runtime.GetBlock(ctx, &runtimeClient.GetBlockRequest{
@@ -634,7 +701,7 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 		Round:     round,
 	})
 	if err != nil {
-		q.logger.Error("Runtime GetBlock failure",
+		q.logger.Error("runtime GetBlock failure",
 			"round", round,
 			"latest_round", latestRound,
 			"err", err,
@@ -647,7 +714,7 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 		Round:     round,
 	})
 	if err != nil {
-		q.logger.Error("Runtime WaitBlockIndexed failure",
+		q.logger.Error("runtime WaitBlockIndexed failure",
 			"round", round,
 			"err", err,
 		)
@@ -658,7 +725,7 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 		BlockHash: block.Header.EncodedHash(),
 	})
 	if err != nil {
-		q.logger.Error("Runtime GetBlockByHash failure",
+		q.logger.Error("runtime GetBlockByHash failure",
 			"hash", block.Header.EncodedHash(),
 			"latest_round", latestRound,
 			"err", err,
@@ -666,7 +733,7 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 		return fmt.Errorf("runtimeClient.GetBlockByHash, hash: %s: %w", block.Header.EncodedHash(), err)
 	}
 	if block.Header.EncodedHash() != block2.Header.EncodedHash() {
-		q.logger.Error("Runtime block header hash missmatch",
+		q.logger.Error("runtime block header hash mismatch",
 			"round", round,
 			"latest_round", latestRound,
 			"round_hash", block.Header.EncodedHash(),
@@ -678,12 +745,12 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 	_, err = q.runtime.QueryTxs(ctx, &runtimeClient.QueryTxsRequest{
 		RuntimeID: q.runtimeID,
 		Query: runtimeClient.Query{
-			RoundMin: 0,
+			RoundMin: q.runtimeGenesisRound,
 			RoundMax: round,
 		},
 	})
 	if err != nil {
-		q.logger.Error("Runtime QueryTxs failure",
+		q.logger.Error("runtime QueryTxs failure",
 			"round", round,
 			"latest_round", latestRound,
 			"err", err,
@@ -703,7 +770,7 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 		}
 	}
 
-	q.logger.Debug("Done runtime queries",
+	q.logger.Debug("done runtime queries",
 		"latest_round", latestRound,
 		"block", block,
 		"round", round,
@@ -713,14 +780,14 @@ func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 }
 
 func (q *queries) doControlQueries(ctx context.Context, rng *rand.Rand) error {
-	q.logger.Debug("Doing node control queries")
+	q.logger.Debug("doing node control queries")
 
 	_, err := q.control.GetStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("control.GetStatus error: %w", err)
 	}
 
-	q.logger.Debug("Done node control queries")
+	q.logger.Debug("done node control queries")
 
 	return nil
 }
@@ -751,7 +818,7 @@ func (q *queries) doQueries(ctx context.Context, rng *rand.Rand) error {
 		height = rng.Int63n(block.Height-earliestHeight+1) + earliestHeight
 	}
 
-	q.logger.Debug("Doing queries",
+	q.logger.Debug("doing queries",
 		"height", height,
 		"height_latest", block.Height,
 	)
@@ -771,13 +838,16 @@ func (q *queries) doQueries(ctx context.Context, rng *rand.Rand) error {
 	if err := q.doStakingQueries(ctx, rng, height); err != nil {
 		return fmt.Errorf("staking queries error: %w", err)
 	}
+	if err := q.doGovernanceQueries(ctx, rng, height); err != nil {
+		return fmt.Errorf("governance queries error: %w", err)
+	}
 	if viper.GetBool(CfgQueriesRuntimeEnabled) {
 		if err := q.doRuntimeQueries(ctx, rng); err != nil {
 			return fmt.Errorf("runtime queries error: %w", err)
 		}
 	}
 
-	q.logger.Debug("Queries done",
+	q.logger.Debug("queries done",
 		"height", height,
 		"height_latest", block.Height,
 	)
@@ -791,26 +861,41 @@ func (q *queries) NeedsFunds() bool {
 }
 
 // Implements Workload.
-func (q *queries) Run(gracefulExit context.Context, rng *rand.Rand, conn *grpc.ClientConn, cnsc consensus.ClientBackend, fundingAccount signature.Signer) error {
+func (q *queries) Run(
+	gracefulExit context.Context,
+	rng *rand.Rand,
+	conn *grpc.ClientConn,
+	cnsc consensus.ClientBackend,
+	sm consensus.SubmissionManager,
+	fundingAccount signature.Signer,
+	validatorEntities []signature.Signer,
+) error {
+	var err error
 	ctx := context.Background()
 
 	q.logger = logging.GetLogger("cmd/txsource/workload/queries")
 
 	q.control = control.NewNodeControllerClient(conn)
 	q.consensus = cnsc
+	q.beacon = beacon.NewBeaconClient(conn)
 	q.registry = registry.NewRegistryClient(conn)
 	q.runtime = runtimeClient.NewRuntimeClient(conn)
 	q.scheduler = scheduler.NewSchedulerClient(conn)
+	q.governance = governance.NewGovernanceClient(conn)
 	q.staking = staking.NewStakingClient(conn)
 
-	// TODO: could add a methods to get consensus parameters directly.
-	doc, err := q.consensus.StateToGenesis(ctx, consensus.HeightLatest)
+	q.stakingParams, err = q.staking.ConsensusParameters(ctx, consensus.HeightLatest)
 	if err != nil {
-		return fmt.Errorf("consensus.StateToGenesis error: %w", err)
+		return fmt.Errorf("failed to query staking consensus parameters: %w", err)
 	}
-	q.epochtimeParams = doc.EpochTime.Parameters
-	q.stakingParams = doc.Staking.Parameters
-	q.schedulerParams = doc.Scheduler.Parameters
+	q.schedulerParams, err = q.scheduler.ConsensusParameters(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("failed to query scheduler consensus parameters: %w", err)
+	}
+	q.epochtimeParams, err = q.beacon.ConsensusParameters(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("failed to query epochtime consensus parameters: %w", err)
+	}
 
 	// Setup simple-keyvalue runtime info.
 	err = q.runtimeID.UnmarshalHex(viper.GetString(CfgRuntimeID))
@@ -830,7 +915,7 @@ func (q *queries) Run(gracefulExit context.Context, rng *rand.Rand, conn *grpc.C
 	if viper.GetBool(CfgQueriesRuntimeEnabled) {
 		// Wait for 2nd epoch, so that runtimes are up and running.
 		q.logger.Info("waiting for 2nd epoch")
-		if err := cnsc.WaitEpoch(ctx, 2); err != nil {
+		if err := q.beacon.WaitEpoch(ctx, 2); err != nil {
 			return fmt.Errorf("failed waiting for 2nd epoch: %w", err)
 		}
 	}
@@ -852,6 +937,7 @@ func (q *queries) Run(gracefulExit context.Context, rng *rand.Rand, conn *grpc.C
 		default:
 			return err
 		}
+		q.iteration++
 
 		select {
 		case <-time.After(1 * time.Second):

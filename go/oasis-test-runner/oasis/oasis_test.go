@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/oasisprotocol/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519"
 	"github.com/stretchr/testify/require"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/drbg"
@@ -35,12 +35,7 @@ func TestNodeIdentity(t *testing.T) {
 
 	b0, _ := generateDeterministicNodeKeys(t, ByzantineDefaultIdentitySeed)
 	b1, _ := generateDeterministicNodeKeys(t, ByzantineSlot1IdentitySeed)
-	b2, _ := generateDeterministicNodeKeys(t, ByzantineSlot2IdentitySeed)
-	b3, _ := generateDeterministicNodeKeys(t, ByzantineSlot3IdentitySeed)
-	require.Equal(t, 1, bytes.Compare(c0, b0))
+	require.Equal(t, -1, bytes.Compare(c0, b0))
 	require.Equal(t, 1, bytes.Compare(b1, c0))
 	require.Equal(t, 1, bytes.Compare(c2, b1))
-	require.Equal(t, 1, bytes.Compare(b2, c2))
-	require.Equal(t, 1, bytes.Compare(c1, b2))
-	require.Equal(t, 1, bytes.Compare(b3, c1))
 }

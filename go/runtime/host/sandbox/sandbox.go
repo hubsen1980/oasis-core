@@ -14,6 +14,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	cmnBackoff "github.com/oasisprotocol/oasis-core/go/common/backoff"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
@@ -38,6 +39,9 @@ type Config struct {
 	// GetSandboxConfig is a function that generates the sandbox configuration. In case it is not
 	// specified a default function is used.
 	GetSandboxConfig func(cfg host.Config, socketPath, runtimeDir string) (process.Config, error)
+
+	// HostInfo provides information about the host environment.
+	HostInfo *protocol.HostInfo
 
 	// HostInitializer is a function that additionally initializes the runtime host. In case it is
 	// not specified a default function is used.
@@ -121,7 +125,7 @@ func (r *sandboxedRuntime) Call(ctx context.Context, body *protocol.Body) (rsp *
 	}
 
 	// Retry call in case the runtime is not yet ready.
-	err = backoff.Retry(callFn, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+	err = backoff.Retry(callFn, backoff.WithContext(cmnBackoff.NewExponentialBackOff(), ctx))
 	return
 }
 
@@ -313,11 +317,15 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 	}()
 	defer cancel()
 
+	// Populate the runtime-specific parts of host information.
+	hi := r.cfg.HostInfo.Clone()
+	hi.LocalConfig = r.rtCfg.LocalConfig
+
 	// Perform common host initialization.
 	var rtVersion *version.Version
 	initCtx, cancelInit := context.WithTimeout(ctx, runtimeInitTimeout)
 	defer cancelInit()
-	if rtVersion, err = pc.InitHost(initCtx, conn); err != nil {
+	if rtVersion, err = pc.InitHost(initCtx, conn, hi); err != nil {
 		return fmt.Errorf("failed to initialize connection: %w", err)
 	}
 
@@ -442,7 +450,7 @@ func (r *sandboxedRuntime) manager() {
 					})
 
 					if ticker == nil {
-						ticker = backoff.NewTicker(backoff.NewExponentialBackOff())
+						ticker = backoff.NewTicker(cmnBackoff.NewExponentialBackOff())
 						tickerCh = ticker.C
 					}
 					continue
@@ -506,6 +514,10 @@ func New(cfg Config) (host.Provisioner, error) {
 				SandboxBinaryPath: cfg.SandboxBinaryPath,
 			}, nil
 		}
+	}
+	// Make sure host environment information was provided in HostInfo.
+	if cfg.HostInfo == nil {
+		return nil, fmt.Errorf("no host information provided")
 	}
 	// Use a default HostInitializer if none was provided.
 	if cfg.HostInitializer == nil {

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
 
 	cmnBadger "github.com/oasisprotocol/oasis-core/go/common/badger"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
@@ -20,6 +20,12 @@ const dbName = "persistent-store.badger.db"
 
 // ErrNotFound is returned when the requested key could not be found in the database.
 var ErrNotFound = errors.New("persistent: key not found in database")
+
+// GetPersistentStoreDBDir returns the database directory path for the node with
+// the given data directory.
+func GetPersistentStoreDBDir(dataDir string) string {
+	return filepath.Join(dataDir, dbName)
+}
 
 // CommonStore is the interface to the common storage for the node.
 type CommonStore struct {
@@ -46,15 +52,12 @@ func (cs *CommonStore) GetServiceStore(name string) (*ServiceStore, error) {
 func NewCommonStore(dataDir string) (*CommonStore, error) {
 	logger := logging.GetLogger("common/persistent")
 
-	opts := badger.DefaultOptions(filepath.Join(dataDir, dbName))
+	opts := badger.DefaultOptions(GetPersistentStoreDBDir(dataDir))
 	opts = opts.WithLogger(cmnBadger.NewLogAdapter(logger))
 	opts = opts.WithSyncWrites(true)
-	// Allow value log truncation if required (this is needed to recover the
-	// value log file which can get corrupted in crashes).
-	opts = opts.WithTruncate(true)
 	opts = opts.WithCompression(options.None)
 
-	db, err := badger.Open(opts)
+	db, err := cmnBadger.Open(opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open persistence database: %w", err)
 	}

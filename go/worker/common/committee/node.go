@@ -2,7 +2,7 @@ package committee
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -10,11 +10,12 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
+	control "github.com/oasisprotocol/oasis-core/go/control/api"
 	keymanagerApi "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	keymanagerClient "github.com/oasisprotocol/oasis-core/go/keymanager/client"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	"github.com/oasisprotocol/oasis-core/go/runtime/committee"
+	"github.com/oasisprotocol/oasis-core/go/runtime/nodes"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	"github.com/oasisprotocol/oasis-core/go/worker/common/api"
 	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
@@ -82,12 +83,18 @@ type NodeHooks interface {
 	// Guarded by CrossNode.
 	HandleNewEventLocked(*roothash.Event)
 	// Guarded by CrossNode.
-	HandleNodeUpdateLocked(*committee.NodeUpdate, *EpochSnapshot)
+	HandleNodeUpdateLocked(*nodes.NodeUpdate, *EpochSnapshot)
+
+	// Initialized returns a channel that will be closed when the worker is initialized and ready
+	// to service requests.
+	Initialized() <-chan struct{}
 }
 
 // Node is a committee node.
 type Node struct {
 	Runtime runtimeRegistry.Runtime
+
+	HostNode control.ControlledNode
 
 	Identity         *identity.Identity
 	KeyManager       keymanagerApi.Backend
@@ -106,10 +113,11 @@ type Node struct {
 
 	// Mutable and shared between nodes' workers.
 	// Guarded by .CrossNode.
-	CrossNode          sync.Mutex
-	CurrentBlock       *block.Block
-	CurrentBlockHeight int64
-	Height             int64
+	CrossNode             sync.Mutex
+	CurrentBlock          *block.Block
+	CurrentBlockHeight    int64
+	CurrentConsensusBlock *consensus.LightBlock
+	Height                int64
 
 	logger *logging.Logger
 }
@@ -121,6 +129,10 @@ func (n *Node) Name() string {
 
 // Start starts the service.
 func (n *Node) Start() error {
+	if err := n.Group.Start(); err != nil {
+		return fmt.Errorf("failed to start group services: %w", err)
+	}
+
 	go n.worker()
 	return nil
 }
@@ -165,10 +177,10 @@ func (n *Node) GetStatus(ctx context.Context) (*api.Status, error) {
 	epoch := n.Group.GetEpochSnapshot()
 	status.LastCommitteeUpdateHeight = epoch.GetGroupVersion()
 	if cmte := epoch.GetExecutorCommittee(); cmte != nil {
-		status.ExecutorRole = cmte.Role
+		status.ExecutorRoles = cmte.Roles
 	}
 	if cmte := epoch.GetStorageCommittee(); cmte != nil {
-		status.StorageRole = cmte.Role
+		status.StorageRoles = cmte.Roles
 	}
 	status.IsTransactionScheduler = epoch.IsTransactionScheduler(status.LatestRound)
 
@@ -194,7 +206,7 @@ func (n *Node) HandlePeerMessage(ctx context.Context, message *p2p.Message, isOw
 			return nil
 		}
 	}
-	return p2pError.Permanent(errors.New("unknown message type"))
+	return p2pError.ErrUnhandledMessage
 }
 
 // Guarded by n.CrossNode.
@@ -242,9 +254,21 @@ func (n *Node) handleNewBlockLocked(blk *block.Block, height int64) {
 	// Helps in cases where node is restarted mid epoch.
 	firstBlockReceived := n.CurrentBlock == nil
 
+	// Fetch light consensus block.
+	consensusBlk, err := n.Consensus.GetLightBlock(n.ctx, height)
+	if err != nil {
+		n.logger.Error("failed to query light block",
+			"err", err,
+			"height", height,
+			"round", blk.Header.Round,
+		)
+		return
+	}
+
 	// Update the current block.
 	n.CurrentBlock = blk
 	n.CurrentBlockHeight = height
+	n.CurrentConsensusBlock = consensusBlk
 
 	for _, hooks := range n.hooks {
 		hooks.HandleNewBlockEarlyLocked(blk)
@@ -299,7 +323,7 @@ func (n *Node) handleNewEventLocked(ev *roothash.Event) {
 }
 
 // Guarded by n.CrossNode.
-func (n *Node) handleNodeUpdateLocked(update *committee.NodeUpdate) {
+func (n *Node) handleNodeUpdateLocked(update *nodes.NodeUpdate) {
 	epoch := n.Group.GetEpochSnapshot()
 
 	for _, hooks := range n.hooks {
@@ -313,8 +337,17 @@ func (n *Node) worker() {
 	defer close(n.quitCh)
 	defer (n.cancelCtx)()
 
+	// Wait for consensus sync.
+	n.logger.Info("delaying worker start until after initial synchronization")
+	select {
+	case <-n.stopCh:
+		return
+	case <-n.Consensus.Synced():
+	}
+	n.logger.Info("consensus has finished initial synchronization")
+
 	// Wait for the runtime.
-	rt, err := n.Runtime.RegistryDescriptor(n.ctx)
+	rt, err := n.Runtime.ActiveDescriptor(n.ctx)
 	if err != nil {
 		n.logger.Error("failed to wait for registry descriptor",
 			"err", err,
@@ -329,7 +362,7 @@ func (n *Node) worker() {
 	if rt.KeyManager != nil {
 		n.logger.Info("runtime indicates a key manager is required, waiting for it to be ready")
 
-		n.KeyManagerClient, err = keymanagerClient.New(n.ctx, n.Runtime, n.KeyManager, n.Consensus.Registry(), n.Identity)
+		n.KeyManagerClient, err = keymanagerClient.New(n.ctx, n.Runtime, n.Consensus, n.Identity)
 		if err != nil {
 			n.logger.Error("failed to create key manager client",
 				"err", err,
@@ -360,7 +393,7 @@ func (n *Node) worker() {
 	defer consensusBlocksSub.Close()
 
 	// Start watching roothash blocks.
-	blocks, blocksSub, err := n.Consensus.RootHash().WatchBlocks(n.Runtime.ID())
+	blocks, blocksSub, err := n.Consensus.RootHash().WatchBlocks(n.ctx, n.Runtime.ID())
 	if err != nil {
 		n.logger.Error("failed to subscribe to roothash blocks",
 			"err", err,
@@ -370,7 +403,7 @@ func (n *Node) worker() {
 	defer blocksSub.Close()
 
 	// Start watching roothash events.
-	events, eventsSub, err := n.Consensus.RootHash().WatchEvents(n.Runtime.ID())
+	events, eventsSub, err := n.Consensus.RootHash().WatchEvents(n.ctx, n.Runtime.ID())
 	if err != nil {
 		n.logger.Error("failed to subscribe to roothash events",
 			"err", err,
@@ -389,9 +422,7 @@ func (n *Node) worker() {
 	}
 	defer nodeUpsSub.Close()
 
-	// We are initialized.
-	close(n.initCh)
-
+	initialized := false
 	for {
 		select {
 		case <-n.stopCh:
@@ -407,6 +438,27 @@ func (n *Node) worker() {
 				n.Height = blk.Height
 			}()
 		case blk := <-blocks:
+			// We are initialized after we have received the first block. This makes sure that any
+			// history reindexing has been completed.
+			if !initialized {
+				n.logger.Debug("common worker is initialized")
+
+				close(n.initCh)
+				initialized = true
+
+				// Wait for all child workers to initialize as well.
+				n.logger.Debug("waiting for child worker initialization")
+				for _, hooks := range n.hooks {
+					select {
+					case <-hooks.Initialized():
+					case <-n.stopCh:
+						n.logger.Info("termination requested while waiting for child worker initialization")
+						return
+					}
+				}
+				n.logger.Debug("all child workers are initialized")
+			}
+
 			// Received a block (annotated).
 			func() {
 				n.CrossNode.Lock()
@@ -433,6 +485,7 @@ func (n *Node) worker() {
 }
 
 func NewNode(
+	hostNode control.ControlledNode,
 	runtime runtimeRegistry.Runtime,
 	identity *identity.Identity,
 	keymanager keymanagerApi.Backend,
@@ -446,6 +499,7 @@ func NewNode(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	n := &Node{
+		HostNode:   hostNode,
 		Runtime:    runtime,
 		Identity:   identity,
 		KeyManager: keymanager,

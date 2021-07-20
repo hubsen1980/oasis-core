@@ -16,7 +16,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
 	storageClient "github.com/oasisprotocol/oasis-core/go/storage/client"
@@ -83,7 +83,7 @@ func doExport(cmd *cobra.Command, args []string) {
 	ok = true
 }
 
-func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *registry.RuntimeGenesis) error {
+func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *roothash.GenesisRuntimeState) error {
 	dataDir = filepath.Join(dataDir, runtimeRegistry.RuntimesDir, id.String())
 
 	// Initialize the storage backend.
@@ -102,6 +102,7 @@ func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *registry.R
 	root := storageAPI.Root{
 		Namespace: id,
 		Version:   rtg.Round,
+		Type:      storageAPI.RootTypeState,
 		Hash:      rtg.StateRoot,
 	}
 	tree := mkvs.NewWithRoot(storageBackend, nil, root)
@@ -172,7 +173,7 @@ func newDirectStorageBackend(dataDir string, namespace common.Namespace) (storag
 		cfg.DB = filepath.Join(cfg.DB, storageDatabase.DefaultFileName(cfg.Backend))
 		return storageDatabase.New(cfg)
 	case storageClient.BackendName:
-		return storageClient.New(context.Background(), namespace, nil, nil, nil, nil)
+		return storageClient.NewForPublicStorage(context.Background(), namespace, nil, nil, nil)
 	default:
 		return nil, fmt.Errorf("storage: unsupported backend: '%v'", cfg.Backend)
 	}

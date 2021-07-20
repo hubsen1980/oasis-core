@@ -3,8 +3,8 @@ package history
 import (
 	"fmt"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	cmnBadger "github.com/oasisprotocol/oasis-core/go/common/badger"
@@ -25,6 +25,10 @@ var (
 	//
 	// Value is CBOR-serialized roothash.AnnotatedBlock.
 	blockKeyFmt = keyformat.New(0x02, uint64(0))
+	// roundResultsKeyFmt is the round result index key format.
+	//
+	// Value is CBOR-serialized roothash.RoundResults.
+	roundResultsKeyFmt = keyformat.New(0x03, uint64(0))
 )
 
 type dbMetadata struct {
@@ -53,12 +57,9 @@ func newDB(fn string, runtimeID common.Namespace) (*DB, error) {
 	opts := badger.DefaultOptions(fn)
 	opts = opts.WithLogger(cmnBadger.NewLogAdapter(logger))
 	opts = opts.WithSyncWrites(true)
-	// Allow value log truncation if required (this is needed to recover the
-	// value log file which can get corrupted in crashes).
-	opts = opts.WithTruncate(true)
 	opts = opts.WithCompression(options.None)
 
-	db, err := badger.Open(opts)
+	db, err := cmnBadger.Open(opts)
 	if err != nil {
 		return nil, fmt.Errorf("runtime/history: failed to open database: %w", err)
 	}
@@ -161,7 +162,7 @@ func (d *DB) consensusCheckpoint(height int64) error {
 	})
 }
 
-func (d *DB) commit(blk *roothash.AnnotatedBlock) error {
+func (d *DB) commit(blk *roothash.AnnotatedBlock, roundResults *roothash.RoundResults) error {
 	return d.db.Update(func(tx *badger.Txn) error {
 		meta, err := d.queryGetMetadata(tx)
 		if err != nil {
@@ -194,6 +195,10 @@ func (d *DB) commit(blk *roothash.AnnotatedBlock) error {
 			return err
 		}
 
+		if err = tx.Set(roundResultsKeyFmt.Encode(blk.Block.Header.Round), cbor.Marshal(roundResults)); err != nil {
+			return err
+		}
+
 		meta.LastRound = blk.Block.Header.Round
 		if blk.Height > meta.LastConsensusHeight {
 			meta.LastConsensusHeight = blk.Height
@@ -216,13 +221,35 @@ func (d *DB) getBlock(round uint64) (*roothash.AnnotatedBlock, error) {
 		}
 
 		return item.Value(func(val []byte) error {
-			return cbor.Unmarshal(val, &blk)
+			return cbor.UnmarshalTrusted(val, &blk)
 		})
 	})
 	if txErr != nil {
 		return nil, txErr
 	}
 	return &blk, nil
+}
+
+func (d *DB) getRoundResults(round uint64) (*roothash.RoundResults, error) {
+	var roundResults *roothash.RoundResults
+	txErr := d.db.View(func(tx *badger.Txn) error {
+		item, err := tx.Get(roundResultsKeyFmt.Encode(round))
+		switch err {
+		case nil:
+		case badger.ErrKeyNotFound:
+			return roothash.ErrNotFound
+		default:
+			return err
+		}
+
+		return item.Value(func(val []byte) error {
+			return cbor.UnmarshalTrusted(val, &roundResults)
+		})
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	return roundResults, nil
 }
 
 func (d *DB) close() {

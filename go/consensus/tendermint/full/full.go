@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -52,16 +53,15 @@ import (
 	tmcommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/db"
-	tmepochtime "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/epochtime"
-	tmepochtimemock "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/epochtime_mock"
+	tmgovernance "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/governance"
 	tmkeymanager "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/keymanager"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/light"
 	tmregistry "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/registry"
 	tmroothash "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/roothash"
 	tmscheduler "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/scheduler"
 	tmstaking "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/staking"
-	epochtimeAPI "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
+	governanceAPI "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanagerAPI "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	cmbackground "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/background"
 	cmflags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
@@ -72,6 +72,7 @@ import (
 	roothashAPI "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	schedulerAPI "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	stakingAPI "github.com/oasisprotocol/oasis-core/go/staking/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 	upgradeAPI "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
 
@@ -104,8 +105,6 @@ const (
 
 	// CfgMinGasPrice configures the minimum gas price for this validator.
 	CfgMinGasPrice = "consensus.tendermint.min_gas_price"
-	// CfgDebugDisableCheckTx disables CheckTx.
-	CfgDebugDisableCheckTx = "consensus.tendermint.debug.disable_check_tx"
 
 	// CfgSupplementarySanityEnabled is the supplementary sanity enabled flag.
 	CfgSupplementarySanityEnabled = "consensus.tendermint.supplementarysanity.enabled"
@@ -123,6 +122,9 @@ const (
 	CfgConsensusStateSyncTrustHeight = "consensus.tendermint.state_sync.trust_height"
 	// CfgConsensusStateSyncTrustHash is the known trusted block header hash for the light client.
 	CfgConsensusStateSyncTrustHash = "consensus.tendermint.state_sync.trust_hash"
+
+	// CfgUpgradeStopDelay is the average amount of time to delay shutting down the node on upgrade.
+	CfgUpgradeStopDelay = "consensus.tendermint.upgrade.stop_delay"
 )
 
 const (
@@ -131,6 +133,8 @@ const (
 	// the node is considered not yet synced.
 	// NOTE: this is only used during the initial sync.
 	syncWorkerLastBlockTimeDiffThreshold = 1 * time.Minute
+
+	minUpgradeStopWaitPeriod = 5 * time.Second
 
 	// tmSubscriberID is the subscriber identifier used for all internal Tendermint pubsub
 	// subscriptions. If any other subscriber IDs need to be derived they will be under this prefix.
@@ -163,12 +167,12 @@ type fullService struct { // nolint: maligned
 	stateStore tmstate.Store
 
 	beacon        beaconAPI.Backend
-	epochtime     epochtimeAPI.Backend
+	governance    governanceAPI.Backend
 	keymanager    keymanagerAPI.Backend
 	registry      registryAPI.Backend
 	roothash      roothashAPI.Backend
-	staking       stakingAPI.Backend
 	scheduler     schedulerAPI.Backend
+	staking       stakingAPI.Backend
 	submissionMgr consensusAPI.SubmissionManager
 
 	serviceClients   []api.ServiceClient
@@ -181,8 +185,10 @@ type fullService struct { // nolint: maligned
 	isInitialized, isStarted bool
 	startedCh                chan struct{}
 	syncedCh                 chan struct{}
+	quitCh                   chan struct{}
 
-	startFn func() error
+	startFn  func() error
+	stopOnce sync.Once
 
 	nextSubscriberID uint64
 }
@@ -219,6 +225,19 @@ func (t *fullService) Start() error {
 			return fmt.Errorf("tendermint: failed to start service: %w", err)
 		}
 
+		// Make sure the quit channel is closed when the node shuts down.
+		go func() {
+			select {
+			case <-t.quitCh:
+			case <-t.node.Quit():
+				select {
+				case <-t.quitCh:
+				default:
+					close(t.quitCh)
+				}
+			}
+		}()
+
 		// Start event dispatchers for all the service clients.
 		t.serviceClientsWg.Add(len(t.serviceClients))
 		for _, svc := range t.serviceClients {
@@ -247,11 +266,7 @@ func (t *fullService) Start() error {
 
 // Implements service.BackgroundService.
 func (t *fullService) Quit() <-chan struct{} {
-	if !t.started() {
-		return make(chan struct{})
-	}
-
-	return t.node.Quit()
+	return t.quitCh
 }
 
 // Implements service.BackgroundService.
@@ -266,14 +281,15 @@ func (t *fullService) Stop() {
 		return
 	}
 
-	t.failMonitor.markCleanShutdown()
-	if err := t.node.Stop(); err != nil {
-		t.Logger.Error("Error on stopping node", err)
-	}
+	t.stopOnce.Do(func() {
+		t.failMonitor.markCleanShutdown()
+		if err := t.node.Stop(); err != nil {
+			t.Logger.Error("Error on stopping node", err)
+		}
 
-	t.svcMgr.Stop()
-	t.mux.Stop()
-	t.node.Wait()
+		t.svcMgr.Stop()
+		t.mux.Stop()
+	})
 }
 
 func (t *fullService) Started() <-chan struct{} {
@@ -303,6 +319,10 @@ func (t *fullService) GetAddresses() ([]node.ConsensusAddress, error) {
 	return []node.ConsensusAddress{addr}, nil
 }
 
+func (t *fullService) Checkpointer() checkpoint.Checkpointer {
+	return t.mux.State().Checkpointer()
+}
+
 func (t *fullService) StateToGenesis(ctx context.Context, blockHeight int64) (*genesisAPI.Document, error) {
 	blk, err := t.GetTendermintBlock(ctx, blockHeight)
 	if err != nil {
@@ -327,9 +347,9 @@ func (t *fullService) StateToGenesis(ctx context.Context, blockHeight int64) (*g
 	}
 
 	// Call StateToGenesis on all backends and merge the results together.
-	epochtimeGenesis, err := t.epochtime.StateToGenesis(ctx, blockHeight)
+	beaconGenesis, err := t.beacon.StateToGenesis(ctx, blockHeight)
 	if err != nil {
-		t.Logger.Error("epochtime StateToGenesis failure",
+		t.Logger.Error("beacon StateToGenesis failure",
 			"err", err,
 			"block_height", blockHeight,
 		)
@@ -381,18 +401,27 @@ func (t *fullService) StateToGenesis(ctx context.Context, blockHeight int64) (*g
 		return nil, err
 	}
 
+	governanceGenesis, err := t.governance.StateToGenesis(ctx, blockHeight)
+	if err != nil {
+		t.Logger.Error("governance StateToGenesis failure",
+			"err", err,
+			"block_height", blockHeight,
+		)
+		return nil, err
+	}
+
 	return &genesisAPI.Document{
 		Height:     blockHeight,
 		ChainID:    genesisDoc.ChainID,
 		HaltEpoch:  genesisDoc.HaltEpoch,
 		Time:       blk.Header.Time,
-		EpochTime:  *epochtimeGenesis,
+		Beacon:     *beaconGenesis,
 		Registry:   *registryGenesis,
 		RootHash:   *roothashGenesis,
 		Staking:    *stakingGenesis,
+		Governance: *governanceGenesis,
 		KeyManager: *keymanagerGenesis,
 		Scheduler:  *schedulerGenesis,
-		Beacon:     genesisDoc.Beacon,
 		Consensus:  genesisDoc.Consensus,
 	}, nil
 }
@@ -401,7 +430,11 @@ func (t *fullService) GetGenesisDocument(ctx context.Context) (*genesisAPI.Docum
 	return t.genesis, nil
 }
 
-func (t *fullService) RegisterHaltHook(hook func(context.Context, int64, epochtimeAPI.EpochTime)) {
+func (t *fullService) GetChainContext(ctx context.Context) (string, error) {
+	return t.genesis.ChainContext(), nil
+}
+
+func (t *fullService) RegisterHaltHook(hook consensusAPI.HaltHook) {
 	if !t.initialized() {
 		return
 	}
@@ -446,12 +479,7 @@ func (t *fullService) SubmitTx(ctx context.Context, tx *transaction.SignedTransa
 		return v
 	case v := <-txSub.Out():
 		if result := v.Data().(tmtypes.EventDataTx).Result; !result.IsOK() {
-			err := errors.FromCode(result.GetCodespace(), result.GetCode())
-			if err == nil {
-				// Fallback to an ordinary error.
-				err = fmt.Errorf(result.GetLog())
-			}
-			return err
+			return errors.FromCode(result.GetCodespace(), result.GetCode(), result.GetLog())
 		}
 		return nil
 	case <-txSub.Cancelled():
@@ -483,12 +511,7 @@ func (t *fullService) broadcastTxRaw(data []byte) error {
 
 	rsp := <-ch
 	if result := rsp.GetCheckTx(); !result.IsOK() {
-		err := errors.FromCode(result.GetCodespace(), result.GetCode())
-		if err == nil {
-			// Fallback to an ordinary error.
-			err = fmt.Errorf(result.GetLog())
-		}
-		return err
+		return errors.FromCode(result.GetCodespace(), result.GetCode(), result.GetLog())
 	}
 
 	return nil
@@ -584,10 +607,6 @@ func (t *fullService) SubmissionManager() consensusAPI.SubmissionManager {
 	return t.submissionMgr
 }
 
-func (t *fullService) EpochTime() epochtimeAPI.Backend {
-	return t.epochtime
-}
-
 func (t *fullService) Beacon() beaconAPI.Backend {
 	return t.beacon
 }
@@ -612,34 +631,8 @@ func (t *fullService) Scheduler() schedulerAPI.Backend {
 	return t.scheduler
 }
 
-func (t *fullService) GetEpoch(ctx context.Context, height int64) (epochtimeAPI.EpochTime, error) {
-	if t.epochtime == nil {
-		return epochtimeAPI.EpochInvalid, consensusAPI.ErrUnsupported
-	}
-	return t.epochtime.GetEpoch(ctx, height)
-}
-
-func (t *fullService) WaitEpoch(ctx context.Context, epoch epochtimeAPI.EpochTime) error {
-	if t.epochtime == nil {
-		return consensusAPI.ErrUnsupported
-	}
-
-	ch, sub := t.epochtime.WatchEpochs()
-	defer sub.Close()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case e, ok := <-ch:
-			if !ok {
-				return context.Canceled
-			}
-			if e >= epoch {
-				return nil
-			}
-		}
-	}
+func (t *fullService) Governance() governanceAPI.Backend {
+	return t.governance
 }
 
 func (t *fullService) GetBlock(ctx context.Context, height int64) (*consensusAPI.Block, error) {
@@ -740,6 +733,20 @@ func (t *fullService) GetTransactionsWithResults(ctx context.Context, height int
 		for _, e := range roothashEvents {
 			result.Events = append(result.Events, &results.Event{RootHash: e})
 		}
+
+		// Transaction governance events.
+		governanceEvents, err := tmgovernance.EventsFromTendermint(
+			txsWithResults.Transactions[txIdx],
+			blk.Height,
+			rs.Events,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range governanceEvents {
+			result.Events = append(result.Events, &results.Event{Governance: e})
+		}
+
 		txsWithResults.Results = append(txsWithResults.Results, result)
 	}
 	return &txsWithResults, nil
@@ -756,11 +763,12 @@ func (t *fullService) GetUnconfirmedTransactions(ctx context.Context) ([][]byte,
 
 func (t *fullService) GetStatus(ctx context.Context) (*consensusAPI.Status, error) {
 	status := &consensusAPI.Status{
-		ConsensusVersion: version.ConsensusProtocol.String(),
-		Backend:          api.BackendName,
-		Features:         t.SupportedFeatures(),
+		Version:  version.ConsensusProtocol,
+		Backend:  api.BackendName,
+		Features: t.SupportedFeatures(),
 	}
 
+	status.ChainContext = t.genesis.ChainContext()
 	status.GenesisHeight = t.genesis.Height
 	if t.started() {
 		// Only attempt to fetch blocks in case the consensus service has started as otherwise
@@ -798,30 +806,43 @@ func (t *fullService) GetStatus(ctx context.Context) (*consensusAPI.Status, erro
 			status.LatestHash = latestBlk.Hash
 			status.LatestTime = latestBlk.Time
 			status.LatestStateRoot = latestBlk.StateRoot
+
+			var epoch beaconAPI.EpochTime
+			epoch, err = t.beacon.GetEpoch(ctx, status.LatestHeight)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch epoch: %w", err)
+			}
+			status.LatestEpoch = epoch
 		case consensusAPI.ErrNoCommittedBlocks:
 			// No committed blocks yet.
 		default:
 			return nil, fmt.Errorf("failed to fetch current block: %w", err)
 		}
-	}
 
-	// List of consensus peers.
-	tmpeers := t.node.Switch().Peers().List()
-	peers := make([]string, 0, len(tmpeers))
-	for _, tmpeer := range tmpeers {
-		p := string(tmpeer.ID()) + "@" + tmpeer.RemoteAddr().String()
-		peers = append(peers, p)
-	}
-	status.NodePeers = peers
+		// List of consensus peers.
+		tmpeers := t.node.Switch().Peers().List()
+		peers := make([]string, 0, len(tmpeers))
+		for _, tmpeer := range tmpeers {
+			p := string(tmpeer.ID()) + "@" + tmpeer.RemoteAddr().String()
+			peers = append(peers, p)
+		}
+		status.NodePeers = peers
 
-	// Check if the local node is in the validator set for the latest (uncommitted) block.
-	vals, err := t.stateStore.LoadValidators(status.LatestHeight + 1)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load validator set: %w", err)
+		// Check if the local node is in the validator set for the latest (uncommitted) block.
+		valSetHeight := status.LatestHeight + 1
+		if valSetHeight < status.GenesisHeight {
+			valSetHeight = status.GenesisHeight
+		}
+		vals, err := t.stateStore.LoadValidators(valSetHeight)
+		if err != nil {
+			// Failed to load validator set.
+			status.IsValidator = false
+		} else {
+			consensusPk := t.identity.ConsensusSigner.Public()
+			consensusAddr := []byte(crypto.PublicKeyToTendermint(&consensusPk).Address())
+			status.IsValidator = vals.HasAddress(consensusAddr)
+		}
 	}
-	consensusPk := t.identity.ConsensusSigner.Public()
-	consensusAddr := []byte(crypto.PublicKeyToTendermint(&consensusPk).Address())
-	status.IsValidator = vals.HasAddress(consensusAddr)
 
 	return status, nil
 }
@@ -886,25 +907,25 @@ func (t *fullService) initialize() error {
 		}
 	}
 
-	if err := t.initEpochtime(); err != nil {
-		return err
-	}
-	if err := t.mux.SetEpochtime(t.epochtime); err != nil {
-		return err
-	}
+	// Initialize the beacon/epochtime backend.
+	var (
+		err error
 
-	// Initialize the rest of backends.
-	var err error
-	var scBeacon tmbeacon.ServiceClient
+		scBeacon tmbeacon.ServiceClient
+	)
 	if scBeacon, err = tmbeacon.New(t.ctx, t); err != nil {
-		t.Logger.Error("initialize: failed to initialize beacon backend",
+		t.Logger.Error("initialize: failed to initialize beapoch backend",
 			"err", err,
 		)
 		return err
 	}
 	t.beacon = scBeacon
 	t.serviceClients = append(t.serviceClients, scBeacon)
+	if err = t.mux.SetEpochtime(t.beacon); err != nil {
+		return err
+	}
 
+	// Initialize the rest of backends.
 	var scKeyManager tmkeymanager.ServiceClient
 	if scKeyManager, err = tmkeymanager.New(t.ctx, t); err != nil {
 		t.Logger.Error("initialize: failed to initialize keymanager backend",
@@ -962,6 +983,17 @@ func (t *fullService) initialize() error {
 	t.serviceClients = append(t.serviceClients, scRootHash)
 	t.svcMgr.RegisterCleanupOnly(t.roothash, "roothash backend")
 
+	var scGovernance tmgovernance.ServiceClient
+	if scGovernance, err = tmgovernance.New(t.ctx, t); err != nil {
+		t.Logger.Error("governance: failed to initialize governance backend",
+			"err", err,
+		)
+		return err
+	}
+	t.governance = scGovernance
+	t.serviceClients = append(t.serviceClients, scGovernance)
+	t.svcMgr.RegisterCleanupOnly(t.governance, "governance backend")
+
 	// Enable supplementary sanity checks when enabled.
 	if viper.GetBool(CfgSupplementarySanityEnabled) {
 		ssa := supplementarysanity.New(viper.GetUint64(CfgSupplementarySanityInterval))
@@ -974,7 +1006,28 @@ func (t *fullService) initialize() error {
 }
 
 func (t *fullService) GetLastRetainedVersion(ctx context.Context) (int64, error) {
-	return t.mux.State().LastRetainedVersion()
+	if err := t.ensureStarted(ctx); err != nil {
+		return -1, err
+	}
+	return t.node.BlockStore().Base(), nil
+}
+
+func (t *fullService) heightToTendermintHeight(height int64) (int64, error) {
+	var tmHeight int64
+	if height == consensusAPI.HeightLatest {
+		// Do not let Tendermint determine the latest height (e.g., by passing nil) as that
+		// completely ignores ABCI processing so it can return a block for which local state does
+		// not yet exist. Use our mux notion of latest height instead.
+		tmHeight = t.mux.State().BlockHeight()
+		if tmHeight == 0 {
+			// No committed blocks yet.
+			return 0, consensusAPI.ErrNoCommittedBlocks
+		}
+	} else {
+		tmHeight = height
+	}
+
+	return tmHeight, nil
 }
 
 func (t *fullService) GetTendermintBlock(ctx context.Context, height int64) (*tmtypes.Block, error) {
@@ -982,18 +1035,15 @@ func (t *fullService) GetTendermintBlock(ctx context.Context, height int64) (*tm
 		return nil, err
 	}
 
-	var tmHeight int64
-	if height == consensusAPI.HeightLatest {
-		// Do not let Tendermint determine the latest height (e.g., by passing nil here) as that
-		// completely ignores ABCI processing so it can return a block for which local state does
-		// not yet exist. Use our mux notion of latest height instead.
-		tmHeight = t.mux.State().BlockHeight()
-		if tmHeight == 0 {
-			// No committed blocks yet.
-			return nil, nil
-		}
-	} else {
-		tmHeight = height
+	tmHeight, err := t.heightToTendermintHeight(height)
+	switch err {
+	case nil:
+		// Continues bellow.
+	case consensusAPI.ErrNoCommittedBlocks:
+		// No committed blocks yet.
+		return nil, nil
+	default:
+		return nil, err
 	}
 	result, err := t.client.Block(ctx, &tmHeight)
 	if err != nil {
@@ -1006,20 +1056,14 @@ func (t *fullService) GetBlockResults(ctx context.Context, height int64) (*tmrpc
 	if t.client == nil {
 		panic("client not available yet")
 	}
-
-	// As in GetTendermintBlock above, get the latest tendermint block height
-	// from our mux.
-	var tmHeight int64
-	if height == consensusAPI.HeightLatest {
-		tmHeight = t.mux.State().BlockHeight()
-		if tmHeight == 0 {
-			// No committed blocks yet.
-			return nil, consensusAPI.ErrNoCommittedBlocks
-		}
-	} else {
-		tmHeight = height
+	if err := t.ensureStarted(ctx); err != nil {
+		return nil, err
 	}
 
+	tmHeight, err := t.heightToTendermintHeight(height)
+	if err != nil {
+		return nil, err
+	}
 	result, err := t.client.BlockResults(ctx, &tmHeight)
 	if err != nil {
 		return nil, fmt.Errorf("tendermint: block results query failed: %w", err)
@@ -1038,34 +1082,6 @@ func (t *fullService) WatchTendermintBlocks() (<-chan *tmtypes.Block, *pubsub.Su
 
 func (t *fullService) ConsensusKey() signature.PublicKey {
 	return t.identity.ConsensusSigner.Public()
-}
-
-func (t *fullService) initEpochtime() error {
-	var err error
-	if t.genesis.EpochTime.Parameters.DebugMockBackend {
-		var scEpochTime tmepochtimemock.ServiceClient
-		scEpochTime, err = tmepochtimemock.New(t.ctx, t)
-		if err != nil {
-			t.Logger.Error("initEpochtime: failed to initialize mock epochtime backend",
-				"err", err,
-			)
-			return err
-		}
-		t.epochtime = scEpochTime
-		t.serviceClients = append(t.serviceClients, scEpochTime)
-	} else {
-		var scEpochTime tmepochtime.ServiceClient
-		scEpochTime, err = tmepochtime.New(t.ctx, t, t.genesis.EpochTime.Parameters.Interval)
-		if err != nil {
-			t.Logger.Error("initEpochtime: failed to initialize epochtime backend",
-				"err", err,
-			)
-			return err
-		}
-		t.epochtime = scEpochTime
-		t.serviceClients = append(t.serviceClients, scEpochTime)
-	}
-	return nil
 }
 
 func (t *fullService) lazyInit() error {
@@ -1090,7 +1106,6 @@ func (t *fullService) lazyInit() error {
 		HaltEpochHeight:           t.genesis.HaltEpoch,
 		MinGasPrice:               viper.GetUint64(CfgMinGasPrice),
 		OwnTxSigner:               t.identity.NodeSigner.Public(),
-		DisableCheckTx:            viper.GetBool(CfgDebugDisableCheckTx) && cmflags.DebugDontBlameOasis(),
 		DisableCheckpointer:       viper.GetBool(CfgCheckpointerDisabled),
 		CheckpointerCheckInterval: viper.GetDuration(CfgCheckpointerCheckInterval),
 		InitialHeight:             uint64(t.genesis.Height),
@@ -1297,6 +1312,41 @@ func (t *fullService) lazyInit() error {
 		t.client = tmcli.New(t.node)
 		t.failMonitor = newFailMonitor(t.ctx, t.Logger, t.node.ConsensusState().Wait)
 
+		// Register a halt hook that handles upgrades gracefully.
+		t.RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch beaconAPI.EpochTime, err error) {
+			if !errors.Is(err, upgradeAPI.ErrStopForUpgrade) {
+				return
+			}
+
+			// Mark this as a clean shutdown and request the node to stop gracefully.
+			t.failMonitor.markCleanShutdown()
+
+			// Wait before stopping to give time for P2P messages to propagate. Sleep for at least
+			// minUpgradeStopWaitPeriod or the configured commit timeout.
+			t.Logger.Info("waiting a bit before stopping the node for upgrade")
+			waitPeriod := minUpgradeStopWaitPeriod
+			if tc := t.genesis.Consensus.Parameters.TimeoutCommit; tc > waitPeriod {
+				waitPeriod = tc
+			}
+			time.Sleep(waitPeriod)
+
+			go func() {
+				// Sleep another period so there is some time between when consensus shuts down and
+				// when all the other services start shutting down.
+				//
+				// Randomize the period so that not all nodes shut down at the same time.
+				delay := getRandomValueFromInterval(0.5, rand.Float64(), viper.GetDuration(CfgUpgradeStopDelay))
+				time.Sleep(delay)
+
+				t.Logger.Info("stopping the node for upgrade")
+				t.Stop()
+
+				// Close the quit channel early to force the node to stop. This is needed because
+				// the Tendermint node will otherwise never quit.
+				close(t.quitCh)
+			}()
+		})
+
 		return nil
 	}
 
@@ -1329,8 +1379,6 @@ func (t *fullService) syncWorker() {
 				return
 			}
 			if !isFastSyncing {
-				t.Logger.Info("Tendermint Node finished fast-sync")
-
 				// Check latest block time.
 				tmBlock, err := t.GetTendermintBlock(t.ctx, consensusAPI.HeightLatest)
 				if err != nil {
@@ -1458,6 +1506,7 @@ func New(
 		dataDir:               dataDir,
 		startedCh:             make(chan struct{}),
 		syncedCh:              make(chan struct{}),
+		quitCh:                make(chan struct{}),
 	}
 
 	t.Logger.Info("starting a full consensus node")
@@ -1483,7 +1532,6 @@ func init() {
 	Flags.Bool(CfgP2PDisablePeerExchange, false, "Disable Tendermint's peer-exchange reactor")
 	Flags.Duration(CfgP2PPersistenPeersMaxDialPeriod, 0*time.Second, "Tendermint max timeout when redialing a persistent peer (default: unlimited)")
 	Flags.Uint64(CfgMinGasPrice, 0, "minimum gas price")
-	Flags.Bool(CfgDebugDisableCheckTx, false, "do not perform CheckTx on incoming transactions (UNSAFE)")
 	Flags.Bool(CfgDebugUnsafeReplayRecoverCorruptedWAL, false, "Enable automatic recovery from corrupted WAL during replay (UNSAFE).")
 
 	Flags.Bool(CfgSupplementarySanityEnabled, false, "enable supplementary sanity checks (slows down consensus)")
@@ -1496,7 +1544,8 @@ func init() {
 	Flags.Uint64(CfgConsensusStateSyncTrustHeight, 0, "state sync: light client trusted height")
 	Flags.String(CfgConsensusStateSyncTrustHash, "", "state sync: light client trusted consensus header hash")
 
-	_ = Flags.MarkHidden(CfgDebugDisableCheckTx)
+	Flags.Duration(CfgUpgradeStopDelay, 60*time.Second, "average amount of time to delay shutting down the node on upgrade")
+
 	_ = Flags.MarkHidden(CfgDebugUnsafeReplayRecoverCorruptedWAL)
 
 	_ = Flags.MarkHidden(CfgSupplementarySanityEnabled)

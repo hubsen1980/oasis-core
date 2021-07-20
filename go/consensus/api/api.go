@@ -14,15 +14,17 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/service"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction/results"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 	mkvsNode "github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 )
 
@@ -52,6 +54,9 @@ var (
 
 	// ErrDuplicateTx is the error returned when the transaction already exists in the mempool.
 	ErrDuplicateTx = errors.New(moduleName, 5, "consensus: duplicate transaction")
+
+	// ErrInvalidArgument is the error returned when the request contains an invalid argument.
+	ErrInvalidArgument = errors.New(moduleName, 6, "consensus: invalid argument")
 )
 
 // FeatureMask is the consensus backend feature bitmask.
@@ -100,16 +105,6 @@ type ClientBackend interface {
 	// EstimateGas calculates the amount of gas required to execute the given transaction.
 	EstimateGas(ctx context.Context, req *EstimateGasRequest) (transaction.Gas, error)
 
-	// WaitEpoch waits for consensus to reach an epoch.
-	//
-	// Note that an epoch is considered reached even if any epoch greater than
-	// the one specified is reached (e.g., that the current epoch is already
-	// in the future).
-	WaitEpoch(ctx context.Context, epoch epochtime.EpochTime) error
-
-	// GetEpoch returns the current epoch.
-	GetEpoch(ctx context.Context, height int64) (epochtime.EpochTime, error)
-
 	// GetBlock returns a consensus block at a specific height.
 	GetBlock(ctx context.Context, height int64) (*Block, error)
 
@@ -135,8 +130,29 @@ type ClientBackend interface {
 	// GetGenesisDocument returns the original genesis document.
 	GetGenesisDocument(ctx context.Context) (*genesis.Document, error)
 
+	// GetChainContext returns the chain domain separation context.
+	GetChainContext(ctx context.Context) (string, error)
+
 	// GetStatus returns the current status overview.
 	GetStatus(ctx context.Context) (*Status, error)
+
+	// Beacon returns the beacon backend.
+	Beacon() beacon.Backend
+
+	// Registry returns the registry backend.
+	Registry() registry.Backend
+
+	// Staking returns the staking backend.
+	Staking() staking.Backend
+
+	// Scheduler returns the scheduler backend.
+	Scheduler() scheduler.Backend
+
+	// Governance returns the governance backend.
+	Governance() governance.Backend
+
+	// RootHash returns the roothash backend.
+	RootHash() roothash.Backend
 }
 
 // Block is a consensus block.
@@ -158,8 +174,8 @@ type Block struct {
 
 // Status is the current status overview.
 type Status struct { // nolint: maligned
-	// ConsensusVersion is the version of the consensus protocol that the node is using.
-	ConsensusVersion string `json:"consensus_version"`
+	// Version is the version of the consensus protocol that the node is using.
+	Version version.Version `json:"version"`
 	// Backend is the consensus backend identifier.
 	Backend string `json:"backend"`
 	// Features are the indicated consensus backend features.
@@ -174,6 +190,8 @@ type Status struct { // nolint: maligned
 	LatestHash []byte `json:"latest_hash"`
 	// LatestTime is the timestamp of the latest block.
 	LatestTime time.Time `json:"latest_time"`
+	// LatestEpoch is the epoch of the latest block.
+	LatestEpoch beacon.EpochTime `json:"latest_epoch"`
 	// LatestStateRoot is the Merkle root of the consensus state tree.
 	LatestStateRoot mkvsNode.Root `json:"latest_state_root"`
 
@@ -186,6 +204,9 @@ type Status struct { // nolint: maligned
 	LastRetainedHeight int64 `json:"last_retained_height"`
 	// LastRetainedHash is the hash of the oldest retained block.
 	LastRetainedHash []byte `json:"last_retained_hash"`
+
+	// ChainContext is the chain domain separation context.
+	ChainContext string `json:"chain_context"`
 
 	// IsValidator returns whether the current node is part of the validator set.
 	IsValidator bool `json:"is_validator"`
@@ -208,7 +229,15 @@ type Backend interface {
 
 	// GetAddresses returns the consensus backend addresses.
 	GetAddresses() ([]node.ConsensusAddress, error)
+
+	// Checkpointer returns the checkpointer associated with consensus state.
+	//
+	// This may be nil in case checkpoints are disabled.
+	Checkpointer() checkpoint.Checkpointer
 }
+
+// HaltHook is a function that gets called when consensus needs to halt for some reason.
+type HaltHook func(ctx context.Context, blockHeight int64, epoch beacon.EpochTime, err error)
 
 // ServicesBackend is an interface for consensus backends which indicate support for
 // communicating with consensus services.
@@ -217,33 +246,14 @@ type Backend interface {
 type ServicesBackend interface {
 	ClientBackend
 
-	// RegisterHaltHook registers a function to be called when the
-	// consensus Halt epoch height is reached.
-	RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime))
+	// RegisterHaltHook registers a function to be called when the consensus needs to halt.
+	RegisterHaltHook(hook HaltHook)
 
 	// SubmissionManager returns the transaction submission manager.
 	SubmissionManager() SubmissionManager
 
-	// EpochTime returns the epochtime backend.
-	EpochTime() epochtime.Backend
-
-	// Beacon returns the beacon backend.
-	Beacon() beacon.Backend
-
 	// KeyManager returns the keymanager backend.
 	KeyManager() keymanager.Backend
-
-	// Registry returns the registry backend.
-	Registry() registry.Backend
-
-	// RootHash returns the roothash backend.
-	RootHash() roothash.Backend
-
-	// Staking returns the staking backend.
-	Staking() staking.Backend
-
-	// Scheduler returns the scheduler backend.
-	Scheduler() scheduler.Backend
 }
 
 // TransactionAuthHandler is the interface for handling transaction authentication

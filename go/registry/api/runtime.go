@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -13,11 +12,10 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
-	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
@@ -27,7 +25,9 @@ var (
 	// kind is malformed or unknown.
 	ErrUnsupportedRuntimeKind = errors.New("runtime: unsupported runtime kind")
 
-	_ prettyprint.PrettyPrinter = (*SignedRuntime)(nil)
+	// ErrUnsupportedRuntimeGovernanceModel is the error returned when the
+	// parsed runtime governance model is malformed or unknown.
+	ErrUnsupportedRuntimeGovernanceModel = errors.New("runtime: unsupported governance model")
 )
 
 // RuntimeKind represents the runtime functionality.
@@ -82,16 +82,20 @@ func (k *RuntimeKind) FromString(str string) error {
 // ExecutorParameters are parameters for the executor committee.
 type ExecutorParameters struct {
 	// GroupSize is the size of the committee.
-	GroupSize uint64 `json:"group_size"`
+	GroupSize uint16 `json:"group_size"`
 
 	// GroupBackupSize is the size of the discrepancy resolution group.
-	GroupBackupSize uint64 `json:"group_backup_size"`
+	GroupBackupSize uint16 `json:"group_backup_size"`
 
 	// AllowedStragglers is the number of allowed stragglers.
-	AllowedStragglers uint64 `json:"allowed_stragglers"`
+	AllowedStragglers uint16 `json:"allowed_stragglers"`
 
 	// RoundTimeout is the round timeout in consensus blocks.
 	RoundTimeout int64 `json:"round_timeout"`
+
+	// MaxMessages is the maximum number of messages that can be emitted by the runtime in a
+	// single round.
+	MaxMessages uint32 `json:"max_messages"`
 }
 
 // ValidateBasic performs basic executor parameter validity checks.
@@ -106,6 +110,7 @@ func (e *ExecutorParameters) ValidateBasic() error {
 	if e.RoundTimeout < 5 {
 		return fmt.Errorf("round timeout too small")
 	}
+
 	return nil
 }
 
@@ -144,7 +149,7 @@ func (t *TxnSchedulerParameters) ValidateBasic() error {
 	if t.MaxBatchSizeBytes < 1024 {
 		return fmt.Errorf("transaction scheduler max batch bytes size parameter too small")
 	}
-	if t.ProposerTimeout < 5 {
+	if t.ProposerTimeout < 2 {
 		return fmt.Errorf("transaction scheduler proposer timeout parameter too small")
 	}
 
@@ -154,11 +159,11 @@ func (t *TxnSchedulerParameters) ValidateBasic() error {
 // StorageParameters are parameters for the storage committee.
 type StorageParameters struct {
 	// GroupSize is the size of the storage group.
-	GroupSize uint64 `json:"group_size"`
+	GroupSize uint16 `json:"group_size"`
 
 	// MinWriteReplication is the number of nodes to which any writes must be replicated before
 	// being assumed to be committed. It must be less than or equal to the GroupSize.
-	MinWriteReplication uint64 `json:"min_write_replication"`
+	MinWriteReplication uint16 `json:"min_write_replication"`
 
 	// MaxApplyWriteLogEntries is the maximum number of write log entries when performing an Apply
 	// operation.
@@ -210,6 +215,7 @@ func (s *StorageParameters) ValidateBasic() error {
 			return fmt.Errorf("storage CheckpointChunkSize parameter too small")
 		}
 	}
+
 	return nil
 }
 
@@ -218,13 +224,46 @@ type AnyNodeRuntimeAdmissionPolicy struct{}
 
 // EntityWhitelistRuntimeAdmissionPolicy allows only whitelisted entities' nodes to register.
 type EntityWhitelistRuntimeAdmissionPolicy struct {
-	Entities map[signature.PublicKey]bool `json:"entities"`
+	Entities map[signature.PublicKey]EntityWhitelistConfig `json:"entities"`
+}
+
+type EntityWhitelistConfig struct {
+	// MaxNodes is the maximum number of nodes that an entity can register under
+	// the given runtime for a specific role. If the map is empty or absent, the
+	// number of nodes is unlimited. If the map is present and non-empty, the
+	// the number of nodes is restricted to the specified maximum (where zero
+	// means no nodes allowed), any missing roles imply zero nodes.
+	MaxNodes map[node.RolesMask]uint16 `json:"max_nodes,omitempty"`
 }
 
 // RuntimeAdmissionPolicy is a specification of which nodes are allowed to register for a runtime.
 type RuntimeAdmissionPolicy struct {
 	AnyNode         *AnyNodeRuntimeAdmissionPolicy         `json:"any_node,omitempty"`
 	EntityWhitelist *EntityWhitelistRuntimeAdmissionPolicy `json:"entity_whitelist,omitempty"`
+}
+
+// SchedulingConstraints are the node scheduling constraints.
+//
+// Multiple fields may be set in which case the ALL the constraints must be satisfied.
+type SchedulingConstraints struct {
+	ValidatorSet *ValidatorSetConstraint `json:"validator_set,omitempty"`
+	MaxNodes     *MaxNodesConstraint     `json:"max_nodes,omitempty"`
+	MinPoolSize  *MinPoolSizeConstraint  `json:"min_pool_size,omitempty"`
+}
+
+// ValidatorSetConstraint specifies that the entity must have a node that is part of the validator
+// set. No other options can currently be specified.
+type ValidatorSetConstraint struct {
+}
+
+// MaxNodesConstraint specifies that only the given number of nodes may be eligible per entity.
+type MaxNodesConstraint struct {
+	Limit uint16 `json:"limit"`
+}
+
+// MinPoolSizeConstraint is the minimum required candidate pool size constraint.
+type MinPoolSizeConstraint struct {
+	Limit uint16 `json:"limit"`
 }
 
 // RuntimeStakingParameters are the stake-related parameters for a runtime.
@@ -235,10 +274,27 @@ type RuntimeStakingParameters struct {
 	// In case a node is registered for multiple runtimes, it will need to satisfy the maximum
 	// threshold of all the runtimes.
 	Thresholds map[staking.ThresholdKind]quantity.Quantity `json:"thresholds,omitempty"`
+
+	// Slashing are the per-runtime misbehavior slashing parameters.
+	Slashing map[staking.SlashReason]staking.Slash `json:"slashing,omitempty"`
+
+	// RewardSlashEquvocationRuntimePercent is the percentage of the reward obtained when slashing
+	// for equivocation that is transferred to the runtime's account.
+	RewardSlashEquvocationRuntimePercent uint8 `json:"reward_equivocation,omitempty"`
+
+	// RewardSlashBadResultsRuntimePercent is the percentage of the reward obtained when slashing
+	// for incorrect results that is transferred to the runtime's account.
+	RewardSlashBadResultsRuntimePercent uint8 `json:"reward_bad_results,omitempty"`
 }
 
 // ValidateBasic performs basic descriptor validity checks.
 func (s *RuntimeStakingParameters) ValidateBasic(runtimeKind RuntimeKind) error {
+	if s.RewardSlashEquvocationRuntimePercent > 100 {
+		return fmt.Errorf("runtime reward percentage from slashing for equivocation must be <= 100")
+	}
+	if s.RewardSlashBadResultsRuntimePercent > 100 {
+		return fmt.Errorf("runtime reward percentage from slashing for bad results must be <= 100")
+	}
 	for kind, q := range s.Thresholds {
 		switch kind {
 		case staking.KindNodeCompute, staking.KindNodeStorage:
@@ -263,10 +319,10 @@ func (s *RuntimeStakingParameters) ValidateBasic(runtimeKind RuntimeKind) error 
 const (
 	// LatestRuntimeDescriptorVersion is the latest entity descriptor version that should be used
 	// for all new descriptors. Using earlier versions may be rejected.
-	LatestRuntimeDescriptorVersion = 1
+	LatestRuntimeDescriptorVersion = 2
 
 	// Minimum and maximum descriptor versions that are allowed.
-	minRuntimeDescriptorVersion = 1
+	minRuntimeDescriptorVersion = 2
 	maxRuntimeDescriptorVersion = LatestRuntimeDescriptorVersion
 )
 
@@ -310,8 +366,70 @@ type Runtime struct { // nolint: maligned
 	// This policy applies to all roles.
 	AdmissionPolicy RuntimeAdmissionPolicy `json:"admission_policy"`
 
+	// Constraints are the node scheduling constraints.
+	Constraints map[scheduler.CommitteeKind]map[scheduler.Role]SchedulingConstraints `json:"constraints,omitempty"`
+
 	// Staking stores the runtime's staking-related parameters.
 	Staking RuntimeStakingParameters `json:"staking,omitempty"`
+
+	// GovernanceModel specifies the runtime governance model.
+	GovernanceModel RuntimeGovernanceModel `json:"governance_model"`
+}
+
+// RuntimeGovernanceModel specifies the runtime governance model.
+type RuntimeGovernanceModel uint8
+
+const (
+	GovernanceInvalid   RuntimeGovernanceModel = 0
+	GovernanceEntity    RuntimeGovernanceModel = 1
+	GovernanceRuntime   RuntimeGovernanceModel = 2
+	GovernanceConsensus RuntimeGovernanceModel = 3
+
+	GovernanceMax = GovernanceConsensus
+
+	gmInvalid   = "invalid"
+	gmEntity    = "entity"
+	gmRuntime   = "runtime"
+	gmConsensus = "consensus"
+)
+
+// String returns a string representation of a runtime governance model.
+func (gm RuntimeGovernanceModel) String() string {
+	model, err := gm.MarshalText()
+	if err != nil {
+		return "[unsupported runtime governance model]"
+	}
+	return string(model)
+}
+
+func (gm RuntimeGovernanceModel) MarshalText() ([]byte, error) {
+	switch gm {
+	case GovernanceInvalid:
+		return []byte(gmInvalid), nil
+	case GovernanceEntity:
+		return []byte(gmEntity), nil
+	case GovernanceRuntime:
+		return []byte(gmRuntime), nil
+	case GovernanceConsensus:
+		return []byte(gmConsensus), nil
+	default:
+		return nil, ErrUnsupportedRuntimeGovernanceModel
+	}
+}
+
+func (gm *RuntimeGovernanceModel) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case gmEntity:
+		*gm = GovernanceEntity
+	case gmRuntime:
+		*gm = GovernanceRuntime
+	case gmConsensus:
+		*gm = GovernanceConsensus
+	default:
+		return fmt.Errorf("%w: '%s'", ErrUnsupportedRuntimeGovernanceModel, string(text))
+	}
+
+	return nil
 }
 
 // ValidateBasic performs basic descriptor validity checks.
@@ -376,6 +494,11 @@ func (r *Runtime) ValidateBasic(strictVersion bool) error {
 	if err := r.Staking.ValidateBasic(r.Kind); err != nil {
 		return fmt.Errorf("bad staking parameters: %w", err)
 	}
+
+	if r.GovernanceModel < 1 || r.GovernanceModel > GovernanceMax {
+		return fmt.Errorf("%w: out of range", ErrUnsupportedRuntimeGovernanceModel)
+	}
+
 	return nil
 }
 
@@ -389,47 +512,20 @@ func (r *Runtime) IsCompute() bool {
 	return r.Kind == KindCompute
 }
 
-// SignedRuntime is a signed blob containing a CBOR-serialized Runtime.
-type SignedRuntime struct {
-	signature.Signed
-}
-
-// Open first verifies the blob signature and then unmarshals the blob.
-func (s *SignedRuntime) Open(context signature.Context, runtime *Runtime) error { // nolint: interfacer
-	return s.Signed.Open(context, runtime)
-}
-
-// PrettyPrint writes a pretty-printed representation of the type
-// to the given writer.
-func (s SignedRuntime) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	pt, err := s.PrettyType()
-	if err != nil {
-		fmt.Fprintf(w, "%s<error: %s>\n", prefix, err)
-		return
+// StakingAddress returns the correct staking address for the runtime based
+// on its governance model or nil if there is no staking address under the
+// given governance model.
+func (r *Runtime) StakingAddress() *staking.Address {
+	var acctAddr staking.Address
+	switch r.GovernanceModel {
+	case GovernanceEntity:
+		acctAddr = staking.NewAddress(r.EntityID)
+	case GovernanceRuntime:
+		acctAddr = staking.NewRuntimeAddress(r.ID)
+	default:
+		return nil
 	}
-
-	pt.(prettyprint.PrettyPrinter).PrettyPrint(ctx, prefix, w)
-}
-
-// PrettyType returns a representation of the type that can be used for pretty printing.
-func (s SignedRuntime) PrettyType() (interface{}, error) {
-	var rt Runtime
-	if err := cbor.Unmarshal(s.Signed.Blob, &rt); err != nil {
-		return nil, fmt.Errorf("malformed signed blob: %w", err)
-	}
-	return signature.NewPrettySigned(s.Signed, rt)
-}
-
-// SignRuntime serializes the Runtime and signs the result.
-func SignRuntime(signer signature.Signer, context signature.Context, runtime *Runtime) (*SignedRuntime, error) {
-	signed, err := signature.SignSigned(signer, context, runtime)
-	if err != nil {
-		return nil, err
-	}
-
-	return &SignedRuntime{
-		Signed: *signed,
-	}, nil
+	return &acctAddr
 }
 
 // VersionInfo is the per-runtime version information.
@@ -440,12 +536,6 @@ type VersionInfo struct {
 	// TEE is the enclave version information, in an enclave provider specific
 	// format if any.
 	TEE []byte `json:"tee,omitempty"`
-}
-
-// VersionInfoIntelSGX is the SGX TEE version information.
-type VersionInfoIntelSGX struct {
-	// Enclaves is the allowed MRENCLAVE/MRSIGNER pairs.
-	Enclaves []sgx.EnclaveIdentity `json:"enclaves"`
 }
 
 // RuntimeGenesis is the runtime genesis information that is used to
@@ -523,7 +613,7 @@ func (rtg *RuntimeGenesis) SanityCheck(isGenesis bool) error {
 
 // RuntimeDescriptorProvider is an interface that provides access to runtime descriptors.
 type RuntimeDescriptorProvider interface {
-	// RegistryDescriptor waits for the runtime to be registered and then returns its registry
+	// ActiveDescriptor waits for the runtime to be initialized and then returns its active
 	// descriptor.
-	RegistryDescriptor(ctx context.Context) (*Runtime, error)
+	ActiveDescriptor(ctx context.Context) (*Runtime, error)
 }

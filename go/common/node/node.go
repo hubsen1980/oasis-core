@@ -4,6 +4,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +15,10 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/pvss"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
+	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
 )
@@ -28,6 +31,10 @@ var (
 	// ErrRAKHashMismatch is the error returned when the TEE attestation
 	// does not contain the node's RAK hash.
 	ErrRAKHashMismatch = errors.New("node: RAK hash mismatch")
+
+	// ErrBadEnclaveIdentity is the error returned when the TEE enclave
+	// identity doesn't match the required values.
+	ErrBadEnclaveIdentity = errors.New("node: bad TEE enclave identity")
 
 	teeHashContext = []byte("oasis-core/node: TEE RAK binding")
 
@@ -71,8 +78,9 @@ type Node struct { // nolint: maligned
 	// Beacon contains information for this node's participation
 	// in the random beacon protocol.
 	//
-	// NOTE: This is reserved for future use.
-	Beacon cbor.RawMessage `json:"beacon,omitempty"`
+	// TODO: This is optional for now, make mandatory once enough
+	// nodes provide this field.
+	Beacon *BeaconInfo `json:"beacon,omitempty"`
 
 	// Runtimes are the node's runtimes.
 	Runtimes []*Runtime `json:"runtimes"`
@@ -95,11 +103,25 @@ const (
 	RoleValidator RolesMask = 1 << 3
 	// RoleConsensusRPC is the public consensus RPC services worker role.
 	RoleConsensusRPC RolesMask = 1 << 4
+	// RoleStorageRPC is the public storage RPC services worker role.
+	RoleStorageRPC RolesMask = 1 << 5
 
 	// RoleReserved are all the bits of the Oasis node roles bitmask
 	// that are reserved and must not be used.
-	RoleReserved RolesMask = ((1 << 32) - 1) & ^((RoleConsensusRPC << 1) - 1)
+	RoleReserved RolesMask = ((1 << 32) - 1) & ^((RoleStorageRPC << 1) - 1)
 )
+
+// Roles returns a list of available valid roles.
+func Roles() (roles []RolesMask) {
+	return []RolesMask{
+		RoleComputeWorker,
+		RoleStorageWorker,
+		RoleKeyManager,
+		RoleValidator,
+		RoleConsensusRPC,
+		RoleStorageRPC,
+	}
+}
 
 // IsSingleRole returns true if RolesMask encodes a single valid role.
 func (m RolesMask) IsSingleRole() bool {
@@ -127,6 +149,9 @@ func (m RolesMask) String() string {
 	}
 	if m&RoleConsensusRPC != 0 {
 		ret = append(ret, "consensus-rpc")
+	}
+	if m&RoleStorageRPC != 0 {
+		ret = append(ret, "storage-rpc")
 	}
 
 	return strings.Join(ret, ",")
@@ -272,6 +297,13 @@ type ConsensusInfo struct {
 	Addresses []ConsensusAddress `json:"addresses"`
 }
 
+// BeaconInfo contains information for this node's participation in
+// the random beacon protocol.
+type BeaconInfo struct {
+	// Point is the elliptic curve point used for the PVSS algorithm.
+	Point pvss.Point `json:"point"`
+}
+
 // Capabilities represents a node's capabilities.
 type Capabilities struct {
 	// TEE is the capability of a node executing batches in a TEE.
@@ -343,7 +375,7 @@ func RAKHash(rak signature.PublicKey) hash.Hash {
 }
 
 // Verify verifies the node's TEE capabilities, at the provided timestamp.
-func (c *CapabilityTEE) Verify(ts time.Time) error {
+func (c *CapabilityTEE) Verify(ts time.Time, constraints []byte) error {
 	rakHash := RAKHash(c.RAK)
 
 	switch c.Hardware {
@@ -362,6 +394,25 @@ func (c *CapabilityTEE) Verify(ts time.Time) error {
 		q, err := avr.Quote()
 		if err != nil {
 			return err
+		}
+
+		// Ensure that the MRENCLAVE/MRSIGNER match what is specified
+		// in the TEE-specific constraints field.
+		var cs sgx.Constraints
+		if err := cbor.Unmarshal(constraints, &cs); err != nil {
+			return fmt.Errorf("node: malformed SGX constraints: %w", err)
+		}
+		var eidValid bool
+		for _, eid := range cs.Enclaves {
+			eidMrenclave := eid.MrEnclave
+			eidMrsigner := eid.MrSigner
+			if bytes.Equal(eidMrenclave[:], q.Report.MRENCLAVE[:]) && bytes.Equal(eidMrsigner[:], q.Report.MRSIGNER[:]) {
+				eidValid = true
+				break
+			}
+		}
+		if !eidValid {
+			return ErrBadEnclaveIdentity
 		}
 
 		// Ensure that the ISV quote includes the hash of the node's

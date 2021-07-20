@@ -10,22 +10,25 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
-	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-const (
-	// NameDelegation is the name of the delegation workload.
-	NameDelegation = "delegation"
+// NameDelegation is the name of the delegation workload.
+const NameDelegation = "delegation"
 
+// Delegation is the delegation workload.
+var Delegation = &delegation{
+	BaseWorkload: NewBaseWorkload(NameDelegation),
+}
+
+const (
 	delegationNumAccounts = 10
 	delegateAmount        = 100
 )
 
 type delegation struct {
-	logger *logging.Logger
+	BaseWorkload
 
 	accounts []struct {
 		signer        signature.Signer
@@ -34,14 +37,13 @@ type delegation struct {
 		address       staking.Address
 		delegatedTo   staking.Address
 	}
-	fundingAccount signature.Signer
 }
 
-func (d *delegation) doEscrowTx(ctx context.Context, rng *rand.Rand, cnsc consensus.ClientBackend) error {
-	d.logger.Debug("escrow tx flow")
+func (d *delegation) doEscrowTx(ctx context.Context, rng *rand.Rand) error {
+	d.Logger.Debug("escrow tx flow")
 
 	// Get current epoch.
-	epoch, err := cnsc.GetEpoch(ctx, consensus.HeightLatest)
+	epoch, err := d.Consensus().Beacon().GetEpoch(ctx, consensus.HeightLatest)
 	if err != nil {
 		return fmt.Errorf("GetEpoch: %w", err)
 	}
@@ -57,7 +59,7 @@ func (d *delegation) doEscrowTx(ctx context.Context, rng *rand.Rand, cnsc consen
 		}
 	}
 	if fromPermIdx == -1 {
-		d.logger.Debug("all accounts already delegating or debonding, skipping delegation")
+		d.Logger.Debug("all accounts already delegating or debonding, skipping delegation")
 		return nil
 	}
 
@@ -78,12 +80,12 @@ func (d *delegation) doEscrowTx(ctx context.Context, rng *rand.Rand, cnsc consen
 		return fmt.Errorf("escrow amount error: %w", err)
 	}
 
-	tx := staking.NewAddEscrowTx(d.accounts[selectedIdx].reckonedNonce, &transaction.Fee{}, escrow)
+	tx := staking.NewAddEscrowTx(d.accounts[selectedIdx].reckonedNonce, nil, escrow)
 	d.accounts[selectedIdx].reckonedNonce++
 	// We only do one escrow per account at a time, so `delegateAmount`
 	// funds (that are Escrowed) should already be in the balance.
-	if err := fundSignAndSubmitTx(ctx, d.logger, cnsc, d.accounts[selectedIdx].signer, tx, d.fundingAccount); err != nil {
-		d.logger.Error("failed to sign and submit escrow transaction",
+	if err := d.FundSignAndSubmitTx(ctx, d.accounts[selectedIdx].signer, tx); err != nil {
+		d.Logger.Error("failed to sign and submit escrow transaction",
 			"tx", tx,
 			"signer", d.accounts[selectedIdx].signer.Public(),
 		)
@@ -93,8 +95,8 @@ func (d *delegation) doEscrowTx(ctx context.Context, rng *rand.Rand, cnsc consen
 	return nil
 }
 
-func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc consensus.ClientBackend, stakingClient staking.Backend) error {
-	d.logger.Debug("reclaim escrow tx")
+func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, stakingClient staking.Backend) error {
+	d.Logger.Debug("reclaim escrow tx")
 
 	// Select an account that has active delegation.
 	perm := rng.Perm(delegationNumAccounts)
@@ -107,13 +109,13 @@ func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc
 		}
 	}
 	if fromPermIdx == -1 {
-		d.logger.Debug("no accounts delegating, skipping reclaim")
+		d.Logger.Debug("no accounts delegating, skipping reclaim")
 		return nil
 	}
 	selectedIdx := perm[fromPermIdx]
 
 	// Query amount of delegated shares for the account.
-	delegations, err := stakingClient.Delegations(ctx, &staking.OwnerQuery{
+	delegations, err := stakingClient.DelegationsFor(ctx, &staking.OwnerQuery{
 		Height: consensus.HeightLatest,
 		Owner:  d.accounts[selectedIdx].address,
 	})
@@ -122,7 +124,7 @@ func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc
 	}
 	delegation := delegations[d.accounts[selectedIdx].delegatedTo]
 	if delegation == nil {
-		d.logger.Error("missing expected delegation",
+		d.Logger.Error("missing expected delegation",
 			"delegator", d.accounts[selectedIdx].signer.Public(),
 			"account", d.accounts[selectedIdx].delegatedTo,
 			"delegations", delegations,
@@ -136,10 +138,10 @@ func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc
 		Account: d.accounts[selectedIdx].delegatedTo,
 		Shares:  delegation.Shares,
 	}
-	tx := staking.NewReclaimEscrowTx(d.accounts[selectedIdx].reckonedNonce, &transaction.Fee{}, reclaim)
+	tx := staking.NewReclaimEscrowTx(d.accounts[selectedIdx].reckonedNonce, nil, reclaim)
 	d.accounts[selectedIdx].reckonedNonce++
-	if err = fundSignAndSubmitTx(ctx, d.logger, cnsc, d.accounts[selectedIdx].signer, tx, d.fundingAccount); err != nil {
-		d.logger.Error("failed to sign and submit reclaim escrow transaction",
+	if err = d.FundSignAndSubmitTx(ctx, d.accounts[selectedIdx].signer, tx); err != nil {
+		d.Logger.Error("failed to sign and submit reclaim escrow transaction",
 			"tx", tx,
 			"signer", d.accounts[selectedIdx].signer.Public(),
 		)
@@ -148,7 +150,7 @@ func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc
 
 	// Query debonding end epoch for the account.
 	var debondingDelegations map[staking.Address][]*staking.DebondingDelegation
-	debondingDelegations, err = stakingClient.DebondingDelegations(ctx, &staking.OwnerQuery{
+	debondingDelegations, err = stakingClient.DebondingDelegationsFor(ctx, &staking.OwnerQuery{
 		Height: consensus.HeightLatest,
 		Owner:  d.accounts[selectedIdx].address,
 	})
@@ -157,7 +159,7 @@ func (d *delegation) doReclaimEscrowTx(ctx context.Context, rng *rand.Rand, cnsc
 	}
 	debondingDelegation := debondingDelegations[d.accounts[selectedIdx].delegatedTo]
 	if len(debondingDelegation) == 0 {
-		d.logger.Error("missing expected debonding delegation",
+		d.Logger.Error("missing expected debonding delegation",
 			"delegator", d.accounts[selectedIdx].signer.Public(),
 			"account", d.accounts[selectedIdx].delegatedTo,
 			"debonding_delegations", debondingDelegation,
@@ -184,12 +186,14 @@ func (d *delegation) Run(
 	rng *rand.Rand,
 	conn *grpc.ClientConn,
 	cnsc consensus.ClientBackend,
+	sm consensus.SubmissionManager,
 	fundingAccount signature.Signer,
+	validatorEntities []signature.Signer,
 ) error {
-	ctx := context.Background()
+	// Initialize base workload.
+	d.BaseWorkload.Init(cnsc, sm, fundingAccount)
 
-	d.logger = logging.GetLogger("cmd/txsource/workload/delegation")
-	d.fundingAccount = fundingAccount
+	ctx := context.Background()
 
 	fac := memorySigner.NewFactory()
 	d.accounts = make([]struct {
@@ -210,7 +214,7 @@ func (d *delegation) Run(
 
 		// Fund the account with delegation amount.
 		// Funds for fees will be transferred before making transactions.
-		if err = transferFunds(ctx, d.logger, cnsc, fundingAccount, d.accounts[i].address, delegateAmount); err != nil {
+		if err = d.TransferFunds(ctx, fundingAccount, d.accounts[i].address, delegateAmount); err != nil {
 			return fmt.Errorf("account funding failure: %w", err)
 		}
 	}
@@ -220,11 +224,11 @@ func (d *delegation) Run(
 	for {
 		switch rng.Intn(2) {
 		case 0:
-			if err := d.doEscrowTx(ctx, rng, cnsc); err != nil {
+			if err := d.doEscrowTx(ctx, rng); err != nil {
 				return err
 			}
 		case 1:
-			if err := d.doReclaimEscrowTx(ctx, rng, cnsc, stakingClient); err != nil {
+			if err := d.doReclaimEscrowTx(ctx, rng, stakingClient); err != nil {
 				return err
 			}
 		default:
@@ -234,7 +238,7 @@ func (d *delegation) Run(
 		select {
 		case <-time.After(1 * time.Second):
 		case <-gracefulExit.Done():
-			d.logger.Debug("time's up")
+			d.Logger.Debug("time's up")
 			return nil
 		}
 	}

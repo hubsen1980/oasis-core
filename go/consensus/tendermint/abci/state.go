@@ -12,21 +12,21 @@ import (
 	"github.com/eapache/channels"
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
 	abciState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci/state"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	storageDB "github.com/oasisprotocol/oasis-core/go/storage/database"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
+	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
 
 var _ api.ApplicationState = (*applicationState)(nil)
@@ -52,6 +52,7 @@ type applicationState struct { // nolint: maligned
 	prunerNotifyCh *channels.RingChannel
 
 	checkpointer checkpoint.Checkpointer
+	upgrader     upgrade.Backend
 
 	blockLock   sync.RWMutex
 	blockTime   time.Time
@@ -60,15 +61,14 @@ type applicationState struct { // nolint: maligned
 
 	txAuthHandler api.TransactionAuthHandler
 
-	timeSource epochtime.Backend
+	timeSource beacon.Backend
 
 	haltMode        bool
-	haltEpochHeight epochtime.EpochTime
+	haltEpochHeight beacon.EpochTime
 
 	minGasPrice        quantity.Quantity
 	ownTxSigner        signature.PublicKey
 	ownTxSignerAddress staking.Address
-	disableCheckTx     bool
 
 	metricsClosedCh chan struct{}
 }
@@ -79,9 +79,12 @@ func (s *applicationState) NewContext(mode api.ContextMode, now time.Time) *api.
 
 	var blockCtx *api.BlockContext
 	var state mkvs.Tree
+	blockHeight := int64(s.stateRoot.Version)
 	switch mode {
 	case api.ContextInitChain:
 		state = s.deliverTxTree
+		// Configure block height so that current height will be correctly computed.
+		blockHeight = int64(s.initialHeight) - 1
 	case api.ContextCheckTx:
 		state = s.checkTxTree
 	case api.ContextDeliverTx, api.ContextBeginBlock, api.ContextEndBlock:
@@ -103,7 +106,7 @@ func (s *applicationState) NewContext(mode api.ContextMode, now time.Time) *api.
 		api.NewNopGasAccountant(),
 		s,
 		state,
-		int64(s.stateRoot.Version),
+		blockHeight,
 		blockCtx,
 		int64(s.initialHeight),
 	)
@@ -115,6 +118,10 @@ func (s *applicationState) LastRetainedVersion() (int64, error) {
 
 func (s *applicationState) Storage() storage.LocalBackend {
 	return s.storage
+}
+
+func (s *applicationState) Checkpointer() checkpoint.Checkpointer {
+	return s.checkpointer
 }
 
 func (s *applicationState) InitialHeight() int64 {
@@ -154,30 +161,40 @@ func (s *applicationState) BlockContext() *api.BlockContext {
 	return s.blockCtx
 }
 
-func (s *applicationState) GetBaseEpoch() (epochtime.EpochTime, error) {
+func (s *applicationState) GetBaseEpoch() (beacon.EpochTime, error) {
 	return s.timeSource.GetBaseEpoch(s.ctx)
 }
 
-func (s *applicationState) GetEpoch(ctx context.Context, blockHeight int64) (epochtime.EpochTime, error) {
+func (s *applicationState) GetEpoch(ctx context.Context, blockHeight int64) (beacon.EpochTime, error) {
 	return s.timeSource.GetEpoch(ctx, blockHeight)
 }
 
-func (s *applicationState) GetCurrentEpoch(ctx context.Context) (epochtime.EpochTime, error) {
+func (s *applicationState) GetCurrentEpoch(ctx context.Context) (beacon.EpochTime, error) {
 	blockHeight := s.BlockHeight()
 	if blockHeight == 0 {
-		return epochtime.EpochInvalid, nil
+		return beacon.EpochInvalid, nil
 	}
+	// Check if there is an epoch transition scheduled for the current height. This should be taken
+	// into account when GetCurrentEpoch is called before the time keeping app does the transition.
+	future, err := s.timeSource.GetFutureEpoch(ctx, blockHeight+1)
+	if err != nil {
+		return beacon.EpochInvalid, fmt.Errorf("failed to get future epoch for height %d: %w", blockHeight+1, err)
+	}
+	if future != nil && future.Height == blockHeight+1 {
+		return future.Epoch, nil
+	}
+
 	currentEpoch, err := s.timeSource.GetEpoch(ctx, blockHeight+1)
 	if err != nil {
-		return epochtime.EpochInvalid, fmt.Errorf("application state time source get epoch for height %d: %w", blockHeight+1, err)
+		return beacon.EpochInvalid, fmt.Errorf("failed to get epoch for height %d: %w", blockHeight+1, err)
 	}
 	return currentEpoch, nil
 }
 
-func (s *applicationState) EpochChanged(ctx *api.Context) (bool, epochtime.EpochTime) {
+func (s *applicationState) EpochChanged(ctx *api.Context) (bool, beacon.EpochTime) {
 	blockHeight := s.BlockHeight()
 	if blockHeight == 0 {
-		return false, epochtime.EpochInvalid
+		return false, beacon.EpochInvalid
 	}
 
 	currentEpoch, err := s.timeSource.GetEpoch(ctx, blockHeight+1)
@@ -185,7 +202,7 @@ func (s *applicationState) EpochChanged(ctx *api.Context) (bool, epochtime.Epoch
 		s.logger.Error("EpochChanged: failed to get current epoch",
 			"err", err,
 		)
-		return false, epochtime.EpochInvalid
+		return false, beacon.EpochInvalid
 	}
 
 	if uint64(blockHeight) == s.initialHeight {
@@ -199,7 +216,7 @@ func (s *applicationState) EpochChanged(ctx *api.Context) (bool, epochtime.Epoch
 		s.logger.Error("EpochChanged: failed to get previous epoch",
 			"err", err,
 		)
-		return false, epochtime.EpochInvalid
+		return false, beacon.EpochInvalid
 	}
 
 	if previousEpoch == currentEpoch {
@@ -226,6 +243,10 @@ func (s *applicationState) OwnTxSignerAddress() staking.Address {
 	return s.ownTxSignerAddress
 }
 
+func (s *applicationState) Upgrader() upgrade.Backend {
+	return s.upgrader
+}
+
 func (s *applicationState) inHaltEpoch(ctx *api.Context) bool {
 	blockHeight := s.BlockHeight()
 
@@ -239,21 +260,6 @@ func (s *applicationState) inHaltEpoch(ctx *api.Context) bool {
 	}
 	s.haltMode = currentEpoch == s.haltEpochHeight
 	return s.haltMode
-}
-
-func (s *applicationState) afterHaltEpoch(ctx *api.Context) bool {
-	blockHeight := s.BlockHeight()
-
-	currentEpoch, err := s.GetEpoch(ctx, blockHeight+1)
-	if err != nil {
-		s.logger.Error("afterHaltEpoch: failed to get epoch",
-			"err", err,
-			"block_height", blockHeight,
-		)
-		return false
-	}
-
-	return currentEpoch > s.haltEpochHeight
 }
 
 func (s *applicationState) doInitChain(now time.Time) error {
@@ -299,8 +305,14 @@ func (s *applicationState) doCommit(now time.Time) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to commit: %w", err)
 	}
-	if err = s.storage.NodeDB().Finalize(s.ctx, s.stateRoot.Version+1, []hash.Hash{stateRootHash}); err != nil {
-		return 0, fmt.Errorf("failed to finalize height %d: %w", s.stateRoot.Version+1, err)
+	newStateRoot := storage.Root{
+		Namespace: s.stateRoot.Namespace,
+		Version:   s.stateRoot.Version + 1,
+		Type:      storage.RootTypeState,
+		Hash:      stateRootHash,
+	}
+	if err = s.storage.NodeDB().Finalize(s.ctx, []storage.Root{newStateRoot}); err != nil {
+		return 0, fmt.Errorf("failed to finalize height %d: %w", newStateRoot.Version, err)
 	}
 
 	s.stateRoot.Hash = stateRootHash
@@ -477,6 +489,7 @@ func InitStateStorage(ctx context.Context, cfg *ApplicationConfig) (storage.Loca
 	}
 	stateRoot := &storage.Root{
 		Version: latestVersion,
+		Type:    storage.RootTypeState,
 	}
 	switch len(roots) {
 	case 0:
@@ -487,7 +500,7 @@ func InitStateStorage(ctx context.Context, cfg *ApplicationConfig) (storage.Loca
 		stateRoot.Hash.Empty()
 	case 1:
 		// Exactly one root -- the usual case.
-		stateRoot.Hash = roots[0]
+		stateRoot.Hash = roots[0].Hash
 	default:
 		// More roots -- should not happen for our use case.
 		return nil, nil, nil, fmt.Errorf("state: more than one root, corrupted database?")
@@ -498,7 +511,7 @@ func InitStateStorage(ctx context.Context, cfg *ApplicationConfig) (storage.Loca
 	return ldb, ndb, stateRoot, nil
 }
 
-func newApplicationState(ctx context.Context, cfg *ApplicationConfig) (*applicationState, error) {
+func newApplicationState(ctx context.Context, upgrader upgrade.Backend, cfg *ApplicationConfig) (*applicationState, error) {
 	if cfg.InitialHeight < 1 {
 		return nil, fmt.Errorf("state: initial height must be >= 1 (got: %d)", cfg.InitialHeight)
 	}
@@ -539,11 +552,11 @@ func newApplicationState(ctx context.Context, cfg *ApplicationConfig) (*applicat
 		statePruner:        statePruner,
 		prunerClosedCh:     make(chan struct{}),
 		prunerNotifyCh:     channels.NewRingChannel(1),
+		upgrader:           upgrader,
 		haltEpochHeight:    cfg.HaltEpochHeight,
 		minGasPrice:        minGasPrice,
 		ownTxSigner:        cfg.OwnTxSigner,
 		ownTxSignerAddress: staking.NewAddress(cfg.OwnTxSigner),
-		disableCheckTx:     cfg.DisableCheckTx,
 		metricsClosedCh:    make(chan struct{}),
 	}
 
@@ -563,9 +576,10 @@ func newApplicationState(ctx context.Context, cfg *ApplicationConfig) (*applicat
 			GetParameters: func(ctx context.Context) (*checkpoint.CreationParameters, error) {
 				params := s.ConsensusParameters()
 				return &checkpoint.CreationParameters{
-					Interval:  params.StateCheckpointInterval,
-					NumKept:   params.StateCheckpointNumKept,
-					ChunkSize: params.StateCheckpointChunkSize,
+					Interval:       params.StateCheckpointInterval,
+					NumKept:        params.StateCheckpointNumKept,
+					ChunkSize:      params.StateCheckpointChunkSize,
+					InitialVersion: cfg.InitialHeight,
 				}, nil
 			},
 		}

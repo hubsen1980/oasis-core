@@ -7,13 +7,14 @@ import (
 
 	"github.com/spf13/viper"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
+	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
@@ -31,6 +32,7 @@ type byzantine struct {
 	storageClients []*storageClient
 	gRPC           *externalGrpc
 
+	runtimeID    common.Namespace
 	capabilities *node.Capabilities
 	rak          signature.Signer
 
@@ -60,7 +62,7 @@ func (b *byzantine) receiveAndScheduleTransactions(ctx context.Context, cbc *com
 	logger.Debug("executor: received transactions", "transactions", txs)
 	// Get latest roothash block.
 	var block *block.Block
-	block, err := getRoothashLatestBlock(ctx, b.tendermint.service, defaultRuntimeID)
+	block, err := getRoothashLatestBlock(ctx, b.tendermint.service, b.runtimeID)
 	if err != nil {
 		return false, fmt.Errorf("failed getting latest roothash block: %w", err)
 	}
@@ -78,7 +80,7 @@ func (b *byzantine) receiveAndScheduleTransactions(ctx context.Context, cbc *com
 		if err = cbc.createCommitment(b.identity, nil, b.executorCommittee.EncodedMembersHash(), commitment.FailureStorageUnavailable); err != nil {
 			panic(fmt.Sprintf("compute create failure indicating commitment failed: %+v", err))
 		}
-		if err = cbc.publishToChain(b.tendermint.service, b.identity, defaultRuntimeID); err != nil {
+		if err = cbc.publishToChain(b.tendermint.service, b.identity); err != nil {
 			panic(fmt.Sprintf("compute publish to chain failed: %+v", err))
 		}
 		return false, nil
@@ -93,36 +95,39 @@ func (b *byzantine) receiveAndScheduleTransactions(ctx context.Context, cbc *com
 }
 
 func initializeAndRegisterByzantineNode(
+	runtimeID common.Namespace,
 	nodeRoles node.RolesMask,
 	expectedStorageRole scheduler.Role,
 	expectedExecutorRole scheduler.Role,
 	shouldBeExecutorProposer bool,
+	noCommittees bool,
 ) (*byzantine, error) {
 	var err error
 	b := &byzantine{
-		logger: logging.GetLogger("cmd/byzantine/node"),
+		logger:    logging.GetLogger("cmd/byzantine/node"),
+		runtimeID: runtimeID,
 	}
 
 	// Initialize.
-	if err = common.Init(); err != nil {
-		common.EarlyLogAndExit(err)
+	if err = cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
 	}
 
 	// Setup identity.
-	b.identity, err = initDefaultIdentity(common.DataDir())
+	b.identity, err = initDefaultIdentity(cmdCommon.DataDir())
 	if err != nil {
 		return nil, fmt.Errorf("init default identity failed: %w", err)
 	}
 
 	// Setup tendermint.
 	b.tendermint = newHonestTendermint()
-	if err = b.tendermint.start(b.identity, common.DataDir()); err != nil {
+	if err = b.tendermint.start(b.identity, cmdCommon.DataDir()); err != nil {
 		return nil, fmt.Errorf("node tendermint start failed: %w", err)
 	}
 
 	// Setup P2P.
 	b.p2p = newP2PHandle()
-	if err = b.p2p.start(b.tendermint, b.identity, defaultRuntimeID); err != nil {
+	if err = b.p2p.start(b.tendermint, b.identity, b.runtimeID); err != nil {
 		return nil, fmt.Errorf("P2P start failed: %w", err)
 	}
 
@@ -133,7 +138,7 @@ func initializeAndRegisterByzantineNode(
 	}
 
 	// Setup storage.
-	storage, err := newStorageNode(b.identity, defaultRuntimeID, common.DataDir())
+	storage, err := newStorageNode(b.identity, b.runtimeID, cmdCommon.DataDir())
 	if err != nil {
 		return nil, fmt.Errorf("initializing storage node failed: %w", err)
 	}
@@ -144,7 +149,7 @@ func initializeAndRegisterByzantineNode(
 	b.storage = storage
 
 	// Wait for activation epoch.
-	activationEpoch := epochtime.EpochTime(viper.GetUint64(CfgActivationEpoch))
+	activationEpoch := beacon.EpochTime(viper.GetUint64(CfgActivationEpoch))
 	if err = waitForEpoch(b.tendermint.service, activationEpoch); err != nil {
 		return nil, fmt.Errorf("waitForEpoch: %w", err)
 	}
@@ -155,8 +160,13 @@ func initializeAndRegisterByzantineNode(
 			return nil, fmt.Errorf("initFakeCapabilitiesSGX: %w", err)
 		}
 	}
-	if err = registryRegisterNode(b.tendermint.service, b.identity, common.DataDir(), getGrpcAddress(), b.p2p.service.Addresses(), defaultRuntimeID, b.capabilities, nodeRoles); err != nil {
+	if err = registryRegisterNode(b.tendermint.service, b.identity, cmdCommon.DataDir(), getGrpcAddress(), b.p2p.service.Addresses(), b.runtimeID, b.capabilities, nodeRoles); err != nil {
 		return nil, fmt.Errorf("registryRegisterNode: %w", err)
+	}
+
+	// If we don't care about committees, bail early.
+	if noCommittees {
+		return b, nil
 	}
 
 	// Get next election committee.
@@ -166,7 +176,7 @@ func initializeAndRegisterByzantineNode(
 	}
 
 	// Ensure we have the expected executor worker role.
-	b.executorCommittee, err = schedulerGetCommittee(b.tendermint, b.electionHeight, scheduler.KindComputeExecutor, defaultRuntimeID)
+	b.executorCommittee, err = schedulerGetCommittee(b.tendermint, b.electionHeight, scheduler.KindComputeExecutor, b.runtimeID)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler get committee %s at height %d failed: %w", scheduler.KindComputeExecutor, b.electionHeight, err)
 	}
@@ -184,7 +194,7 @@ func initializeAndRegisterByzantineNode(
 	b.logger.Debug("executor tx scheduler role ok")
 
 	// Ensure we have the expected storage worker role.
-	storageCommittee, err := schedulerGetCommittee(b.tendermint, b.electionHeight, scheduler.KindStorage, defaultRuntimeID)
+	storageCommittee, err := schedulerGetCommittee(b.tendermint, b.electionHeight, scheduler.KindStorage, b.runtimeID)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler get committee %s failed: %+v", scheduler.KindStorage, err)
 	}
@@ -203,8 +213,11 @@ func initializeAndRegisterByzantineNode(
 	return b, nil
 }
 
-func waitForEpoch(svc consensus.Backend, epoch epochtime.EpochTime) error {
-	ch, sub := svc.EpochTime().WatchEpochs()
+func waitForEpoch(svc consensus.Backend, epoch beacon.EpochTime) error {
+	ch, sub, err := svc.Beacon().WatchEpochs(context.Background())
+	if err != nil {
+		return err
+	}
 	defer sub.Close()
 
 	for {

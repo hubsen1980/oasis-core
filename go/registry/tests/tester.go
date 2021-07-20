@@ -5,16 +5,21 @@ import (
 	"context"
 	"crypto"
 	"errors"
+	"fmt"
+	"math"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/drbg"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/pvss"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/tls"
@@ -25,16 +30,15 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	tmcrypto "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
 	"github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
 const (
 	recvTimeout = 5 * time.Second
 
-	testRuntimeNodeExpiration epochtime.EpochTime = 100
+	testRuntimeNodeExpiration beacon.EpochTime = 15
 )
 
 var (
@@ -61,6 +65,25 @@ func RegistryImplementationTests(t *testing.T, backend api.Backend, consensus co
 	testRegistryEntityNodes(t, backend, consensus, runtimeID, runtimeEWID)
 }
 
+// Add node's ID to node list if it's not already on it.
+func addToNodeList(nodes []signature.PublicKey, node signature.PublicKey) []signature.PublicKey {
+	retNodes := nodes
+
+	var exists bool
+	for _, npk := range nodes {
+		if npk.Equal(node) {
+			exists = true
+			break
+		}
+	}
+
+	if !exists {
+		retNodes = append(retNodes, node)
+	}
+
+	return retNodes
+}
+
 func testRegistryEntityNodes( // nolint: gocyclo
 	t *testing.T,
 	backend api.Backend,
@@ -71,10 +94,10 @@ func testRegistryEntityNodes( // nolint: gocyclo
 	ctx := context.Background()
 
 	// Generate the entities used for the test cases.
-	entities, err := NewTestEntities(entityNodeSeed, 3)
+	entities, err := NewTestEntities(entityNodeSeed, 4)
 	require.NoError(t, err, "NewTestEntities")
 
-	timeSource := consensus.EpochTime().(epochtime.SetableBackend)
+	timeSource := consensus.Beacon().(beacon.SetableBackend)
 	epoch, err := timeSource.GetEpoch(ctx, consensusAPI.HeightLatest)
 	require.NoError(t, err, "GetEpoch")
 
@@ -84,6 +107,63 @@ func testRegistryEntityNodes( // nolint: gocyclo
 	entityCh, entitySub, err := backend.WatchEntities(ctx)
 	require.NoError(t, err, "WatchEntities")
 	defer entitySub.Close()
+
+	// We rely on the runtime tests running before this registering a runtime.
+	nodeRuntimes := []*node.Runtime{{ID: runtimeID}}
+
+	// Allocate nodes before registering entities, so that all the node IDs
+	// are present in the entity's node list (or they'll fail to register).
+	var numNodes int
+	nodes := make([][]*TestNode, 0, len(entities))
+	for i, te := range entities {
+		// Stagger the expirations so that it's possible to test it.
+		var entityNodes []*TestNode
+		entityNodes, err = te.NewTestNodes(i+1, 1, nil, nodeRuntimes, epoch+beacon.EpochTime(i)+1, consensus)
+		require.NoError(t, err, "NewTestNodes")
+
+		// Append nodes to entity's list of nodes & update registration.
+		for _, en := range entityNodes {
+			te.Entity.Nodes = addToNodeList(te.Entity.Nodes, en.Node.ID)
+		}
+		te.SignedRegistration, err = entity.SignEntity(te.Signer, api.RegisterEntitySignatureContext, te.Entity)
+		require.NoError(t, err, "SignEntity")
+
+		nodes = append(nodes, entityNodes)
+		numNodes += len(entityNodes)
+	}
+
+	nodeRuntimesEW := []*node.Runtime{{ID: runtimeEWID}}
+	whitelistedNodes, err := entities[1].NewTestNodes(1, 1, []byte("whitelistedNodes"), nodeRuntimesEW, epoch+2, consensus)
+	require.NoError(t, err, "NewTestNodes whitelisted")
+	nonWhitelistedNodes, err := entities[0].NewTestNodes(1, 1, []byte("nonWhitelistedNodes"), nodeRuntimesEW, epoch+2, consensus)
+	require.NoError(t, err, "NewTestNodes non-whitelisted")
+
+	// Append nodes used for testing the MaxNodes whitelist.
+	// Entity 3 is allowed to have only one compute node.  This is set-up in
+	// "EntityWhitelist" test in testRegistryRuntime() below.
+	ent3nodes, err := entities[3].NewTestNodes(2, 1, []byte("ent3nodes"), nodeRuntimesEW, epoch+2, consensus)
+	require.NoError(t, err, "NewTestNodes for entity 3")
+
+	// Update entity node lists for the whitelist test nodes as well.
+	for _, n := range nonWhitelistedNodes {
+		entities[0].Entity.Nodes = addToNodeList(entities[0].Entity.Nodes, n.Node.ID)
+	}
+	for _, n := range whitelistedNodes {
+		entities[1].Entity.Nodes = addToNodeList(entities[1].Entity.Nodes, n.Node.ID)
+	}
+	for _, n := range ent3nodes {
+		entities[3].Entity.Nodes = addToNodeList(entities[3].Entity.Nodes, n.Node.ID)
+	}
+
+	entities[0].SignedRegistration, err = entity.SignEntity(entities[0].Signer, api.RegisterEntitySignatureContext, entities[0].Entity)
+	require.NoError(t, err, "SignEntity0")
+	entities[1].SignedRegistration, err = entity.SignEntity(entities[1].Signer, api.RegisterEntitySignatureContext, entities[1].Entity)
+	require.NoError(t, err, "SignEntity1")
+	entities[3].SignedRegistration, err = entity.SignEntity(entities[3].Signer, api.RegisterEntitySignatureContext, entities[3].Entity)
+	require.NoError(t, err, "SignEntity3")
+
+	whitelistedNodes = append(whitelistedNodes, ent3nodes[0])
+	nonWhitelistedNodes = append(nonWhitelistedNodes, ent3nodes[1], ent3nodes[2])
 
 	t.Run("EntityRegistration", func(t *testing.T) {
 		require := require.New(t)
@@ -156,27 +236,6 @@ func testRegistryEntityNodes( // nolint: gocyclo
 		}
 		require.Len(seen, len(entities), "unique bulk retrieved entities")
 	})
-
-	// We rely on the runtime tests running before this registering a runtime.
-	nodeRuntimes := []*node.Runtime{{ID: runtimeID}}
-
-	// Node tests, because there needs to be entities.
-	var numNodes int
-	nodes := make([][]*TestNode, 0, len(entities))
-	for i, te := range entities {
-		// Stagger the expirations so that it's possible to test it.
-		var entityNodes []*TestNode
-		entityNodes, err = te.NewTestNodes(i+1, 1, nil, nodeRuntimes, epoch+epochtime.EpochTime(i)+1, consensus)
-		require.NoError(t, err, "NewTestNodes")
-
-		nodes = append(nodes, entityNodes)
-		numNodes += len(entityNodes)
-	}
-	nodeRuntimesEW := []*node.Runtime{{ID: runtimeEWID}}
-	whitelistedNodes, err := entities[1].NewTestNodes(1, 1, []byte("whitelistedNodes"), nodeRuntimesEW, epoch+2, consensus)
-	require.NoError(t, err, "NewTestNodes whitelisted")
-	nonWhitelistedNodes, err := entities[0].NewTestNodes(1, 1, []byte("nonWhitelistedNodes"), nodeRuntimesEW, epoch+2, consensus)
-	require.NoError(t, err, "NewTestNodes non-whitelisted")
 
 	nodeCh, nodeSub, err := backend.WatchNodes(ctx)
 	require.NoError(t, err, "WatchNodes")
@@ -270,8 +329,8 @@ func testRegistryEntityNodes( // nolint: gocyclo
 				t.Fatalf("failed to receive node registration event, whitelisted")
 			}
 		}
-		for _, tn := range nonWhitelistedNodes {
-			require.Error(tn.Register(consensus, tn.SignedRegistration), "register node from non whitelisted entity")
+		for ti, tn := range nonWhitelistedNodes {
+			require.Error(tn.Register(consensus, tn.SignedRegistration), fmt.Sprintf("register node from non whitelisted entity (index %d)", ti))
 		}
 	})
 
@@ -295,7 +354,7 @@ func testRegistryEntityNodes( // nolint: gocyclo
 		require := require.New(t)
 
 		expectedNodeList := getExpectedNodeList()
-		epoch = epochtimeTests.MustAdvanceEpoch(t, timeSource, 1)
+		epoch = beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 		registeredNodes, nerr := backend.GetNodes(ctx, consensusAPI.HeightLatest)
 		require.NoError(nerr, "GetNodes")
@@ -350,7 +409,7 @@ func testRegistryEntityNodes( // nolint: gocyclo
 		expectedDeregEvents := len(nodes[0])
 		deregisteredNodes := make(map[signature.PublicKey]*node.Node)
 
-		epoch = epochtimeTests.MustAdvanceEpoch(t, timeSource, 1)
+		epoch = beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 		for i := 0; i < expectedDeregEvents; i++ {
 			select {
@@ -417,7 +476,7 @@ func testRegistryEntityNodes( // nolint: gocyclo
 		}
 
 		// Advance the epoch to trigger 0th entity nodes to be removed.
-		_ = epochtimeTests.MustAdvanceEpoch(t, timeSource, 1)
+		_ = beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 		// At this point it should only be possible to deregister 0th entity nodes.
 		err := entities[0].Deregister(consensus)
@@ -455,7 +514,7 @@ func testRegistryEntityNodes( // nolint: gocyclo
 		}
 
 		// Advance the epoch to trigger all nodes to expire and be removed.
-		_ = epochtimeTests.MustAdvanceEpoch(t, timeSource, uint64(len(entities)+2))
+		_ = beaconTests.MustAdvanceEpoch(t, timeSource, uint64(len(entities)+2))
 
 		// Now it should be possible to deregister all remaining entities.
 		for _, v := range entities[1:] {
@@ -564,12 +623,23 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 			"EntityWhitelist",
 			func(rt *api.Runtime) {
 				var nodeEntities []*TestEntity
-				nodeEntities, err = NewTestEntities(entityNodeSeed, 3)
+				nodeEntities, err = NewTestEntities(entityNodeSeed, 4)
 				require.NoError(err, "NewTestEntities with entity node seed")
 				rt.AdmissionPolicy = api.RuntimeAdmissionPolicy{
 					EntityWhitelist: &api.EntityWhitelistRuntimeAdmissionPolicy{
-						Entities: map[signature.PublicKey]bool{
-							nodeEntities[1].Entity.ID: true,
+						Entities: map[signature.PublicKey]api.EntityWhitelistConfig{
+							nodeEntities[1].Entity.ID: {
+								MaxNodes: map[node.RolesMask]uint16{
+									node.RoleComputeWorker: 2,
+									node.RoleStorageWorker: 2,
+									node.RoleStorageRPC:    2,
+								},
+							},
+							nodeEntities[3].Entity.ID: {
+								MaxNodes: map[node.RolesMask]uint16{
+									node.RoleComputeWorker: 1,
+								},
+							},
 						},
 					},
 				}
@@ -667,10 +737,10 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 				rt.Kind = api.KindKeyManager
 				rt.TEEHardware = node.TEEHardwareIntelSGX
 
-				vi := api.VersionInfoIntelSGX{
+				cs := sgx.Constraints{
 					Enclaves: []sgx.EnclaveIdentity{{}},
 				}
-				rt.Version.TEE = cbor.Marshal(vi)
+				rt.Version.TEE = cbor.Marshal(cs)
 				// Set non-test runtime.
 				rt.ID = newNamespaceFromSeed([]byte("SGXKeyManager"), common.NamespaceKeyManager)
 			},
@@ -704,10 +774,10 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 				rt.KeyManager = &rtMapByName["KeyManager"].ID
 				rt.TEEHardware = node.TEEHardwareIntelSGX
 
-				vi := api.VersionInfoIntelSGX{
+				cs := sgx.Constraints{
 					Enclaves: []sgx.EnclaveIdentity{{}},
 				}
-				rt.Version.TEE = cbor.Marshal(vi)
+				rt.Version.TEE = cbor.Marshal(cs)
 				// Set non-test runtime.
 				rt.ID = newNamespaceFromSeed([]byte("SGXWithKM"), 0)
 			},
@@ -759,6 +829,24 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 			false,
 			true,
 		},
+		// Runtime with too large MaxMessages parameter.
+		{
+			"TooBigMaxMessages",
+			func(rt *api.Runtime) {
+				rt.Executor.MaxMessages = 64 // MaxRuntimeMessages in these tests is 32.
+			},
+			false,
+			false,
+		},
+		// Runtime with consensus governance after genesis time.
+		{
+			"ConsensusGovernanceAfterGenesis",
+			func(rt *api.Runtime) {
+				rt.GovernanceModel = api.GovernanceConsensus
+			},
+			false,
+			false,
+		},
 	}
 
 	rtMap := make(map[common.Namespace]*api.Runtime)
@@ -791,6 +879,43 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 		}
 	}
 	require.Len(rtMap, 0, "all runtimes were registered")
+
+	// Test runtime re-registration.
+	var re *TestRuntime
+	re, err = NewTestRuntime([]byte("Runtime re-registration test 1"), entity, false)
+	require.NoError(err, "NewTestRuntime (re-registration test 1)")
+	re.MustRegister(t, backend, consensus)
+	// Entity to runtime governance transition should succeed.
+	re.Runtime.GovernanceModel = api.GovernanceRuntime
+	re.MustRegister(t, backend, consensus)
+	// Runtime to consensus governance transition should fail.
+	re.Runtime.GovernanceModel = api.GovernanceConsensus
+	re.MustNotRegister(t, backend, consensus)
+	// Runtime back to entity governance transition should fail.
+	re.Runtime.GovernanceModel = api.GovernanceEntity
+	re.MustNotRegister(t, backend, consensus)
+	// Any updates to runtime parameters should fail for runtime-governed runtimes.
+	re.Runtime.GovernanceModel = api.GovernanceRuntime
+	re.Runtime.TxnScheduler.ProposerTimeout = 6
+	re.MustNotRegister(t, backend, consensus)
+
+	re, err = NewTestRuntime([]byte("Runtime re-registration test 2"), entity, true)
+	require.NoError(err, "NewTestRuntime (re-registration test 2)")
+	re.Runtime.Kind = api.KindKeyManager
+	re.MustRegister(t, backend, consensus)
+	// Non-compute runtimes cannot transition to runtime governance.
+	re.Runtime.GovernanceModel = api.GovernanceRuntime
+	re.MustNotRegister(t, backend, consensus)
+	// Entity to consensus governance transition should fail for KM runtimes too.
+	re.Runtime.GovernanceModel = api.GovernanceConsensus
+	re.MustNotRegister(t, backend, consensus)
+
+	re, err = NewTestRuntime([]byte("Runtime re-registration test 3"), entity, false)
+	require.NoError(err, "NewTestRuntime (re-registration test 3)")
+	re.MustRegister(t, backend, consensus)
+	// Entity to consensus governance transition should fail.
+	re.Runtime.GovernanceModel = api.GovernanceConsensus
+	re.MustNotRegister(t, backend, consensus)
 
 	// No way to de-register the runtime or the controlling entity, so it will be left there.
 
@@ -864,8 +989,7 @@ type invalidNodeRegistration struct {
 
 // Register attempts to register a node.
 func (n *TestNode) Register(consensus consensusAPI.Backend, sigNode *node.MultiSignedNode) error {
-	// NOTE: Node registrations in tests are entity-signed.
-	return consensusAPI.SignAndSubmitTx(context.Background(), consensus, n.Entity.Signer, api.NewRegisterNodeTx(0, nil, sigNode))
+	return consensusAPI.SignAndSubmitTx(context.Background(), consensus, n.Signer, api.NewRegisterNodeTx(0, nil, sigNode))
 }
 
 func randomIdentity(rng *drbg.Drbg) *identity.Identity {
@@ -876,11 +1000,20 @@ func randomIdentity(rng *drbg.Drbg) *identity.Identity {
 		}
 		return signer
 	}
+	mustGenerateScalar := func() pvss.Scalar {
+		// Note: This is non-deterministic, but that's ok for now.
+		scalar, _, err := pvss.NewKeyPair()
+		if err != nil {
+			panic(err)
+		}
+		return *scalar
+	}
 
 	ident := &identity.Identity{
 		NodeSigner:      mustGenerateSigner(),
 		P2PSigner:       mustGenerateSigner(),
 		ConsensusSigner: mustGenerateSigner(),
+		BeaconScalar:    mustGenerateScalar(),
 	}
 
 	cert, err := tls.Generate(identity.CommonName)
@@ -894,7 +1027,7 @@ func randomIdentity(rng *drbg.Drbg) *identity.Identity {
 
 // NewTestNodes returns the specified number of TestNodes, generated
 // deterministically using the entity's public key as the seed.
-func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runtimes []*node.Runtime, expiration epochtime.EpochTime, consensus consensusAPI.Backend) ([]*TestNode, error) { // nolint: gocyclo
+func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runtimes []*node.Runtime, expiration beacon.EpochTime, consensus consensusAPI.Backend) ([]*TestNode, error) { // nolint: gocyclo
 	if nCompute <= 0 || nStorage <= 0 || nCompute > 254 || nStorage > 254 {
 		return nil, errors.New("registry/tests: test node count out of bounds")
 	}
@@ -910,7 +1043,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		nodeIdentity := randomIdentity(rng)
 		nodeSigners := []signature.Signer{
 			nodeIdentity.NodeSigner,
-			ent.Signer,
 			nodeIdentity.P2PSigner,
 			nodeIdentity.ConsensusSigner,
 			nodeIdentity.GetTLSSigner(),
@@ -925,7 +1057,7 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		if i < nCompute {
 			role = node.RoleComputeWorker
 		} else {
-			role = node.RoleStorageWorker
+			role = node.RoleStorageWorker | node.RoleStorageRPC
 		}
 
 		nod.Node = &node.Node{
@@ -933,8 +1065,11 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 			ID:         nod.Signer.Public(),
 			EntityID:   ent.Entity.ID,
 			Expiration: uint64(expiration),
-			Runtimes:   runtimes,
-			Roles:      role,
+			Beacon: &node.BeaconInfo{
+				Point: nodeIdentity.BeaconScalar.Point(),
+			},
+			Runtimes: runtimes,
+			Roles:    role,
 		}
 		addr := node.Address{
 			TCPAddr: net.TCPAddr{
@@ -958,6 +1093,9 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		if err != nil {
 			return nil, err
 		}
+
+		// Append node's ID to entity's list of nodes, so we can register it.
+		ent.Entity.Nodes = append(ent.Entity.Nodes, nod.Node.ID)
 
 		// Add a registration with no P2P addresses.
 		if nod.Node.Roles&node.RoleComputeWorker != 0 {
@@ -994,7 +1132,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid3.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				nodeIdentity.NodeSigner,
-				ent.Signer,
 				nodeIdentity.P2PSigner,
 				nodeIdentity.ConsensusSigner,
 			},
@@ -1040,7 +1177,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 			invalid6.signed, err = node.MultiSignNode(
 				[]signature.Signer{
 					nodeIdentity.NodeSigner,
-					ent.Signer,
 					nodeIdentity.ConsensusSigner,
 					nodeIdentity.GetTLSSigner(),
 				},
@@ -1105,7 +1241,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid10.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				nodeIdentity.NodeSigner,
-				ent.Signer,
 				nodeIdentity.P2PSigner,
 				nodeIdentity.GetTLSSigner(),
 			},
@@ -1128,7 +1263,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid11.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				invalidIdentity.NodeSigner,
-				ent.Signer,
 				invalidIdentity.ConsensusSigner,
 				nodeIdentity.P2PSigner,
 				invalidIdentity.GetTLSSigner(),
@@ -1152,7 +1286,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid12.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				invalidIdentity.NodeSigner,
-				ent.Signer,
 				nodeIdentity.ConsensusSigner,
 				invalidIdentity.P2PSigner,
 				invalidIdentity.GetTLSSigner(),
@@ -1176,7 +1309,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid13.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				invalidIdentity.NodeSigner,
-				ent.Signer,
 				invalidIdentity.ConsensusSigner,
 				invalidIdentity.P2PSigner,
 				nodeIdentity.GetTLSSigner(),
@@ -1260,7 +1392,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid14.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				nodeIdentity.NodeSigner,
-				ent.Signer,
 				invalidIdentity.ConsensusSigner,
 				invalidIdentity.P2PSigner,
 				invalidIdentity.GetTLSSigner(),
@@ -1282,7 +1413,6 @@ func (ent *TestEntity) NewTestNodes(nCompute, nStorage int, idNonce []byte, runt
 		invalid15.signed, err = node.MultiSignNode(
 			[]signature.Signer{
 				nodeIdentity.NodeSigner,
-				ent.Signer,
 				nodeIdentity.ConsensusSigner,
 				nodeIdentity.P2PSigner,
 				nodeIdentity.GetTLSSigner(),
@@ -1316,9 +1446,8 @@ func NewTestEntities(seed []byte, n int) ([]*TestEntity, error) {
 			return nil, err
 		}
 		ent.Entity = &entity.Entity{
-			Versioned:              cbor.NewVersioned(entity.LatestEntityDescriptorVersion),
-			ID:                     ent.Signer.Public(),
-			AllowEntitySignedNodes: true,
+			Versioned: cbor.NewVersioned(entity.LatestDescriptorVersion),
+			ID:        ent.Signer.Public(),
 		}
 
 		ent.SignedRegistration, err = entity.SignEntity(ent.Signer, api.RegisterEntitySignatureContext, ent.Entity)
@@ -1364,10 +1493,7 @@ func (rt *TestRuntime) MustRegister(t *testing.T, backend api.Backend, consensus
 	require.NoError(err, "WatchRuntimes")
 	defer sub.Close()
 
-	signed, err := signature.SignSigned(rt.Signer, api.RegisterRuntimeSignatureContext, rt.Runtime)
-	require.NoError(err, "signed runtime descriptor")
-
-	tx := api.NewRegisterRuntimeTx(0, nil, &api.SignedRuntime{Signed: *signed})
+	tx := api.NewRegisterRuntimeTx(0, nil, rt.Runtime)
 	err = consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
 	require.NoError(err, "RegisterRuntime")
 
@@ -1415,11 +1541,8 @@ func (rt *TestRuntime) MustRegister(t *testing.T, backend api.Backend, consensus
 func (rt *TestRuntime) MustNotRegister(t *testing.T, backend api.Backend, consensus consensusAPI.Backend) {
 	require := require.New(t)
 
-	signed, err := signature.SignSigned(rt.Signer, api.RegisterRuntimeSignatureContext, rt.Runtime)
-	require.NoError(err, "signed runtime descriptor")
-
-	tx := api.NewRegisterRuntimeTx(0, nil, &api.SignedRuntime{Signed: *signed})
-	err = consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
+	tx := api.NewRegisterRuntimeTx(0, nil, rt.Runtime)
+	err := consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
 	require.Error(err, "RegisterRuntime failure")
 }
 
@@ -1447,12 +1570,33 @@ func BulkPopulate(t *testing.T, backend api.Backend, consensus consensusAPI.Back
 
 	entities, err := NewTestEntities(seed, 1)
 	require.NoError(err, "NewTestEntities")
-	entity := entities[0]
-	err = entity.Register(consensus, entity.SignedRegistration)
+	ent := entities[0]
+
+	var rts []*node.Runtime
+	for _, v := range runtimes {
+		v.MustRegister(t, backend, consensus)
+		rts = append(rts, &node.Runtime{ID: v.Runtime.ID})
+	}
+
+	epoch, err := consensus.Beacon().GetEpoch(context.Background(), consensusAPI.HeightLatest)
+	require.NoError(err, "GetEpoch")
+
+	numCompute := int(runtimes[0].Runtime.Executor.GroupSize + runtimes[0].Runtime.Executor.GroupBackupSize)
+	numStorage := int(runtimes[0].Runtime.Storage.GroupSize)
+	nodes, err := ent.NewTestNodes(numCompute, numStorage, nil, rts, epoch+testRuntimeNodeExpiration, consensus)
+	require.NoError(err, "NewTestNodes")
+
+	for _, n := range nodes {
+		ent.Entity.Nodes = addToNodeList(ent.Entity.Nodes, n.Node.ID)
+	}
+	ent.SignedRegistration, err = entity.SignEntity(ent.Signer, api.RegisterEntitySignatureContext, ent.Entity)
+	require.NoError(err, "SignEntity")
+
+	err = ent.Register(consensus, ent.SignedRegistration)
 	require.NoError(err, "RegisterEntity")
 	select {
 	case ev := <-entityCh:
-		require.EqualValues(entity.Entity, ev.Entity, "registered entity")
+		require.EqualValues(ent.Entity, ev.Entity, "registered entity")
 		require.True(ev.IsRegistration, "event is registration")
 
 		// Make sure that GetEvents also returns the registration event.
@@ -1474,26 +1618,12 @@ func BulkPopulate(t *testing.T, backend api.Backend, consensus consensusAPI.Back
 		t.Fatalf("failed to receive entity registration event")
 	}
 
-	var rts []*node.Runtime
-	for _, v := range runtimes {
-		v.MustRegister(t, backend, consensus)
-		rts = append(rts, &node.Runtime{ID: v.Runtime.ID})
-	}
-
 	// For the sake of simplicity, require that all runtimes have the same
 	// number of nodes for now.
 
 	nodeCh, nodeSub, err := backend.WatchNodes(context.Background())
 	require.NoError(err, "WatchNodes")
 	defer nodeSub.Close()
-
-	epoch, err := consensus.EpochTime().GetEpoch(context.Background(), consensusAPI.HeightLatest)
-	require.NoError(err, "GetEpoch")
-
-	numCompute := int(runtimes[0].Runtime.Executor.GroupSize + runtimes[0].Runtime.Executor.GroupBackupSize)
-	numStorage := int(runtimes[0].Runtime.Storage.GroupSize)
-	nodes, err := entity.NewTestNodes(numCompute, numStorage, nil, rts, epoch+testRuntimeNodeExpiration, consensus)
-	require.NoError(err, "NewTestNodes")
 
 	ret := make([]*node.Node, 0, numCompute+numStorage)
 	for _, node := range nodes {
@@ -1528,7 +1658,7 @@ func BulkPopulate(t *testing.T, backend api.Backend, consensus consensusAPI.Back
 	for _, v := range runtimes {
 		numNodes := v.Runtime.Executor.GroupSize + v.Runtime.Executor.GroupBackupSize + v.Runtime.Storage.GroupSize
 		require.EqualValues(len(nodes), numNodes, "runtime wants the expected number of nodes")
-		v.entity = entity
+		v.entity = ent
 		v.nodes = nodes
 	}
 
@@ -1556,8 +1686,8 @@ func (rt *TestRuntime) Cleanup(t *testing.T, backend api.Backend, consensus cons
 	defer nodeSub.Close()
 
 	// Make sure all nodes expire so we can remove the entity.
-	timeSource := consensus.EpochTime().(epochtime.SetableBackend)
-	_ = epochtimeTests.MustAdvanceEpoch(t, timeSource, uint64(testRuntimeNodeExpiration+2))
+	timeSource := consensus.Beacon().(beacon.SetableBackend)
+	_ = beaconTests.MustAdvanceEpoch(t, timeSource, uint64(testRuntimeNodeExpiration+2))
 
 	err = rt.entity.Deregister(consensus)
 	require.NoError(err, "DeregisterEntity")
@@ -1612,6 +1742,7 @@ func NewTestRuntime(seed []byte, ent *TestEntity, isKeyManager bool) (*TestRunti
 			GroupBackupSize:   5,
 			AllowedStragglers: 1,
 			RoundTimeout:      10,
+			MaxMessages:       32,
 		},
 		TxnScheduler: api.TxnSchedulerParameters{
 			Algorithm:         api.TxnSchedulerSimple,
@@ -1628,6 +1759,36 @@ func NewTestRuntime(seed []byte, ent *TestEntity, isKeyManager bool) (*TestRunti
 		},
 		AdmissionPolicy: api.RuntimeAdmissionPolicy{
 			AnyNode: &api.AnyNodeRuntimeAdmissionPolicy{},
+		},
+		Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]api.SchedulingConstraints{
+			scheduler.KindComputeExecutor: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &api.MinPoolSizeConstraint{
+						Limit: 3,
+					},
+				},
+				scheduler.RoleBackupWorker: {
+					MinPoolSize: &api.MinPoolSizeConstraint{
+						Limit: 5,
+					},
+				},
+			},
+			scheduler.KindStorage: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &api.MinPoolSizeConstraint{
+						Limit: 3,
+					},
+				},
+			},
+		},
+		GovernanceModel: api.GovernanceEntity,
+		Staking: api.RuntimeStakingParameters{
+			Slashing: map[staking.SlashReason]staking.Slash{
+				staking.SlashRuntimeEquivocation: {
+					Amount: *quantity.NewFromUint64(math.MaxInt64),
+				},
+			},
+			RewardSlashEquvocationRuntimePercent: 100,
 		},
 	}
 	// TODO: Test with non-empty state root when enabled.

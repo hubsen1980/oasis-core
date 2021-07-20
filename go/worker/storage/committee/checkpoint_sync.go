@@ -13,15 +13,18 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	"github.com/oasisprotocol/oasis-core/go/runtime/committee"
-	schedulerApi "github.com/oasisprotocol/oasis-core/go/scheduler/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/nodes/grpc"
 	storageApi "github.com/oasisprotocol/oasis-core/go/storage/api"
 	storageClient "github.com/oasisprotocol/oasis-core/go/storage/client"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
 
 const (
+	// cpListTimeout is the timeout for fetching a list of checkpoints from a node.
+	cpListTimeout = 5 * time.Second
+	// cpRestoreTimeout is the timeout for restoring a checkpoint chunk from a node.
+	cpRestoreTimeout = 60 * time.Second
+
 	retryInterval = 1 * time.Second
 	maxRetries    = 30
 
@@ -62,18 +65,18 @@ func (h *chunkHeap) Pop() interface{} {
 	return ret
 }
 
-// goWithCommittee runs the given operation with all the connections to the storage committee.
-func (n *Node) goWithCommittee(
-	committeeClient committee.Client,
-	fn func(context.Context, *committee.ClientConnWithMeta) error,
+// goWithNodes runs the given operation with all the connections in the provided nodesClient.
+func (n *Node) goWithNodes(
+	nodesClient grpc.NodesClient,
+	fn func(context.Context, *grpc.ConnWithNodeMeta) error,
 ) (
 	context.CancelFunc,
 	chan interface{},
 	error,
 ) {
-	connCh := make(chan []*committee.ClientConnWithMeta)
+	connCh := make(chan []*grpc.ConnWithNodeMeta)
 	connGetter := func() error {
-		conns := committeeClient.GetConnectionsWithMeta()
+		conns := nodesClient.GetConnectionsWithMeta()
 		if len(conns) == 0 {
 			return storageClient.ErrStorageNotAvailable
 		}
@@ -96,7 +99,7 @@ func (n *Node) goWithCommittee(
 
 	for _, conn := range conns {
 		workerGroup.Add(1)
-		go func(conn *committee.ClientConnWithMeta) {
+		go func(conn *grpc.ConnWithNodeMeta) {
 			defer workerGroup.Done()
 			op := func() error {
 				return fn(workerCtx, conn)
@@ -115,7 +118,7 @@ func (n *Node) goWithCommittee(
 
 func (n *Node) nodeWorker(
 	ctx context.Context,
-	conn *committee.ClientConnWithMeta,
+	conn *grpc.ConnWithNodeMeta,
 	chunkDispatchCh chan *checkpoint.ChunkMetadata,
 	chunkReturnCh chan *checkpoint.ChunkMetadata,
 	errorCh chan int,
@@ -133,18 +136,22 @@ func (n *Node) nodeWorker(
 			}
 		}
 
+		chunkCtx, cancel := context.WithTimeout(ctx, cpRestoreTimeout)
+		defer cancel()
+
 		restoreCh := make(chan *restoreResult)
 		rd, wr := io.Pipe()
 		go func() {
-			done, err := n.localStorage.Checkpointer().RestoreChunk(ctx, chunk.Index, rd)
+			done, err := n.localStorage.Checkpointer().RestoreChunk(chunkCtx, chunk.Index, rd)
 			restoreCh <- &restoreResult{
 				done: done,
 				err:  err,
 			}
 		}()
-		err := api.GetCheckpointChunk(ctx, chunk, wr)
+		err := api.GetCheckpointChunk(chunkCtx, chunk, wr)
 		wr.Close()
 		result := <-restoreCh
+		cancel()
 
 		// GetCheckpointChunk errors.
 		// The chunk probably always needs to be returned here
@@ -176,43 +183,63 @@ func (n *Node) nodeWorker(
 				"root", chunk.Root,
 				"err", result.err,
 			)
-			fallthrough
-		case errors.Is(result.err, checkpoint.ErrChunkCorrupted):
-			chunkReturnCh <- chunk
-			return result.err
-		case errors.Is(result.err, checkpoint.ErrChunkProofVerificationFailed):
-			errorCh <- checkpointStatusNext
-			return backoff.Permanent(result.err)
-		case result.err != nil:
-			errorCh <- checkpointStatusBail
-			return backoff.Permanent(result.err)
+			switch {
+			case errors.Is(result.err, checkpoint.ErrChunkCorrupted):
+				chunkReturnCh <- chunk
+				return result.err
+			case errors.Is(result.err, checkpoint.ErrChunkProofVerificationFailed):
+				errorCh <- checkpointStatusNext
+				return backoff.Permanent(result.err)
+			default:
+				errorCh <- checkpointStatusBail
+				return backoff.Permanent(result.err)
+			}
 		}
 	}
 }
 
-func (n *Node) handleCheckpoint(check *checkpoint.Metadata, committeeClient committee.Client, groupSize uint64) (int, error) {
+func (n *Node) handleCheckpoint(check *checkpoint.Metadata, nodesClient grpc.NodesClient, groupSize uint16) (cpStatus int, rerr error) {
+	if err := n.localStorage.Checkpointer().StartRestore(n.ctx, check); err != nil {
+		// Any previous restores were already aborted by the driver up the call stack, so
+		// things should have been going smoothly here; bail.
+		return checkpointStatusBail, fmt.Errorf("can't start checkpoint restore: %w", err)
+	}
+	// This defer has to be here so that we're sure no workers are running anymore during
+	// any potential aborts.
+	defer func() {
+		if cpStatus == checkpointStatusDone {
+			return
+		}
+		// Abort has to succeed even if we were interrupted by context cancellation.
+		ctx := context.Background()
+		if err := n.localStorage.Checkpointer().AbortRestore(ctx); err != nil {
+			cpStatus = checkpointStatusBail
+			n.logger.Error("error while aborting checkpoint restore on handler exit, aborting sync",
+				"err", err,
+			)
+		}
+	}()
+
 	chunkDispatchCh := make(chan *checkpoint.ChunkMetadata)
 	defer close(chunkDispatchCh)
 
 	chunkReturnCh := make(chan *checkpoint.ChunkMetadata, groupSize)
 	errorCh := make(chan int, groupSize)
 
-	worker := func(ctx context.Context, conn *committee.ClientConnWithMeta) error {
+	worker := func(ctx context.Context, conn *grpc.ConnWithNodeMeta) error {
 		return n.nodeWorker(ctx, conn, chunkDispatchCh, chunkReturnCh, errorCh)
 	}
 
-	cancel, doneCh, err := n.goWithCommittee(committeeClient, worker)
+	cancel, doneCh, err := n.goWithNodes(nodesClient, worker)
 	if err != nil {
 		return checkpointStatusBail, fmt.Errorf("can't fetch chunks from committee nodes: %w", err)
 	}
-	defer cancel()
-
-	err = n.localStorage.Checkpointer().StartRestore(n.ctx, check)
-	if err != nil {
-		// Any previous restores were already aborted by the driver up the call stack, so
-		// things should have been going smoothly here; bail.
-		return checkpointStatusBail, fmt.Errorf("can't start checkpoint restore: %w", err)
-	}
+	// Cancel on exit and wait for the worker pool to drain so that the abort
+	// above can proceed safely.
+	defer func() {
+		cancel()
+		<-doneCh
+	}()
 
 	// Prepare the heap of chunks.
 	chunks := &chunkHeap{
@@ -277,14 +304,17 @@ func (n *Node) handleCheckpoint(check *checkpoint.Metadata, committeeClient comm
 	}
 }
 
-func (n *Node) getCheckpointList(committeeClient committee.Client) ([]*checkpoint.Metadata, error) {
+func (n *Node) getCheckpointList(nodesClient grpc.NodesClient) ([]*checkpoint.Metadata, error) {
 	// Get checkpoint list from all current committee members.
 	listCh := make(chan []*checkpoint.Metadata)
 	req := &checkpoint.GetCheckpointsRequest{
 		Version:   1,
 		Namespace: n.commonNode.Runtime.ID(),
 	}
-	getter := func(ctx context.Context, conn *committee.ClientConnWithMeta) error {
+	getter := func(opCtx context.Context, conn *grpc.ConnWithNodeMeta) error {
+		ctx, cancel := context.WithTimeout(opCtx, cpListTimeout)
+		defer cancel()
+
 		api := storageApi.NewStorageClient(conn.ClientConn)
 		meta, err := api.GetCheckpoints(ctx, req)
 		if err != nil {
@@ -303,7 +333,7 @@ func (n *Node) getCheckpointList(committeeClient committee.Client) ([]*checkpoin
 		return nil
 	}
 
-	cancel, doneCh, err := n.goWithCommittee(committeeClient, getter)
+	cancel, doneCh, err := n.goWithNodes(nodesClient, getter)
 	if err != nil {
 		return nil, err
 	}
@@ -343,128 +373,116 @@ resultLoop:
 	return retList[:cursor], nil
 }
 
-func (n *Node) checkCheckpointUsable(cp *checkpoint.Metadata, remainingMask outstandingMask) outstandingMask {
+func (n *Node) checkCheckpointUsable(cp *checkpoint.Metadata, remainingMask outstandingMask) bool {
 	namespace := n.commonNode.Runtime.ID()
 	if !namespace.Equal(&cp.Root.Namespace) {
 		// Not for the right runtime.
-		return maskNone
+		return false
 	}
 	blk, err := n.commonNode.Runtime.History().GetBlock(n.ctx, cp.Root.Version)
 	if err != nil {
 		n.logger.Error("can't get block information for checkpoint, skipping", "err", err, "root", cp.Root)
-		return maskNone
+		return false
 	}
 	_, lastIORoot, lastStateRoot := n.GetLastSynced()
+	lastVersions := map[storageApi.RootType]uint64{
+		storageApi.RootTypeIO:    lastIORoot.Version,
+		storageApi.RootTypeState: lastStateRoot.Version,
+	}
 	if namespace.Equal(&blk.Header.Namespace) {
-		if blk.Header.IORoot.Equal(&cp.Root.Hash) {
-			// Do we already have this root?
-			if lastIORoot.Version < cp.Root.Version && remainingMask&maskIO != maskNone {
-				return maskIO
+		for _, root := range blk.Header.StorageRoots() {
+			if cp.Root.Type == root.Type && root.Hash.Equal(&cp.Root.Hash) {
+				// Do we already have this root?
+				if lastVersions[cp.Root.Type] < cp.Root.Version && remainingMask.contains(cp.Root.Type) {
+					return true
+				}
+				return false
 			}
-			return maskNone
-		}
-		if blk.Header.StateRoot.Equal(&cp.Root.Hash) {
-			// Do we already have this root?
-			if lastStateRoot.Version < cp.Root.Version && remainingMask&maskState != maskNone {
-				return maskState
-			}
-			return maskNone
 		}
 	}
 	n.logger.Info("checkpoint for unknown root skipped", "root", cp.Root)
-	return maskNone
+	return false
 }
 
-func (n *Node) syncCheckpoints() (*blockSummary, error) {
+func (n *Node) syncCheckpoints(genesisRound uint64) (*blockSummary, error) {
 	// Store roots and round info for checkpoints that finished syncing.
 	// Round and namespace info will get overwritten as rounds are skipped
 	// for errors, driven by remainingRoots.
 	var syncState blockSummary
 
-	// Start following the storage committee.
-	committeeWatcher, err := committee.NewWatcher(
-		n.ctx,
-		n.commonNode.Consensus.Scheduler(),
-		n.commonNode.Consensus.Registry(),
-		n.commonNode.Runtime.ID(),
-		schedulerApi.KindStorage,
-		committee.WithAutomaticEpochTransitions(),
-		committee.WithFilter(committee.IgnoreNodeFilter(n.commonNode.Identity.NodeSigner.Public())),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("can't establish storage committee watcher: %w", err)
-	}
-	committeeClient, err := committee.NewClient(n.ctx, committeeWatcher.Nodes(), committee.WithClientAuthentication(n.commonNode.Identity))
-	if err != nil {
-		return nil, fmt.Errorf("can't create committee client: %w", err)
-	}
-
-	descriptor, err := n.commonNode.Runtime.RegistryDescriptor(n.ctx)
+	// Try getting the active descriptor first.
+	descriptor, err := n.commonNode.Runtime.ActiveDescriptor(n.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("can't get runtime descriptor: %w", err)
 	}
 
 	// Fetch metadata from the current committee.
-	metadata, err := n.getCheckpointList(committeeClient)
+	metadata, err := n.getCheckpointList(n.storageNodesGrpc)
 	if err != nil {
 		return nil, fmt.Errorf("can't get checkpoint list from storage committee: %w", err)
 	}
 
 	// Try all the checkpoints now, from most recent backwards.
-	var prevVersion uint64
-	var mask outstandingMask
-	var doneRoots []hash.Hash
-	remainingRoots := maskAll
+	var (
+		prevVersion      uint64 = ^uint64(0)
+		multipartRunning bool
+		mask             outstandingMask
+	)
+	remainingRoots := outstandingMaskFull
+
+	defer func() {
+		if !multipartRunning {
+			return
+		}
+		if err := n.localStorage.NodeDB().AbortMultipartInsert(); err != nil {
+			n.logger.Error("error aborting multipart restore on exit from syncer",
+				"err", err,
+			)
+		}
+	}()
+
 	for _, check := range metadata {
-		mask = n.checkCheckpointUsable(check, remainingRoots)
-		if mask == maskNone {
+		if check.Root.Version < genesisRound || !n.checkCheckpointUsable(check, remainingRoots) {
 			continue
 		}
 
 		if check.Root.Version != prevVersion {
-			// Kill any previous restores that might be active. This should kill
-			// the restorer's state as well as the underlying DB multipart bookkeeping.
-			if err := n.localStorage.Checkpointer().AbortRestore(n.ctx); err != nil {
-				return nil, fmt.Errorf("error aborting previous restore for checkpoint sync: %w", err)
+			// Starting a new round, so we need to clean up all state from
+			// previous retores. Aborting multipart works with no multipart in
+			// progress too.
+			multipartRunning = false
+			if err := n.localStorage.NodeDB().AbortMultipartInsert(); err != nil {
+				return nil, fmt.Errorf("error aborting previous multipart restore: %w", err)
 			}
-			remainingRoots = maskAll
+			if err := n.localStorage.NodeDB().StartMultipartInsert(check.Root.Version); err != nil {
+				return nil, fmt.Errorf("error starting multipart insert for round %d: %w", check.Root.Version, err)
+			}
+			multipartRunning = true
+			remainingRoots = outstandingMaskFull
 			prevVersion = check.Root.Version
-			doneRoots = []hash.Hash{}
+			syncState.Roots = nil
 		}
 
-		status, err := n.handleCheckpoint(check, committeeClient, descriptor.Storage.GroupSize)
+		status, err := n.handleCheckpoint(check, n.storageNodesGrpc, descriptor.Storage.GroupSize)
 		switch status {
 		case checkpointStatusDone:
 			n.logger.Info("successfully restored from checkpoint", "root", check.Root, "mask", mask)
 
 			syncState.Namespace = check.Root.Namespace
 			syncState.Round = check.Root.Version
-			switch mask {
-			case maskIO:
-				syncState.IORoot = check.Root
-			case maskState:
-				syncState.StateRoot = check.Root
-			}
-
-			doneRoots = append(doneRoots, check.Root.Hash)
-			remainingRoots &= ^mask
-			if remainingRoots == maskNone {
-				if err = n.localStorage.NodeDB().Finalize(n.ctx, prevVersion, doneRoots); err != nil {
+			syncState.Roots = append(syncState.Roots, check.Root)
+			remainingRoots.remove(check.Root.Type)
+			if remainingRoots.isEmpty() {
+				if err = n.localStorage.NodeDB().Finalize(n.ctx, syncState.Roots); err != nil {
 					n.logger.Error("can't finalize version after all checkpoints restored",
 						"err", err,
 						"version", prevVersion,
-						"roots", doneRoots,
+						"roots", syncState.Roots,
 					)
-					// Since finalize failed, we need to make sure to abort multipart insert
-					// otherwise all normal batch operations will continue to fail.
-					if abortErr := n.localStorage.NodeDB().AbortMultipartInsert(); abortErr != nil {
-						n.logger.Error("can't abort multipart insert after finalization failure",
-							"err", err,
-						)
-					}
 					// Likely a local problem, so just bail.
 					return nil, fmt.Errorf("can't finalize version after checkpoints restored: %w", err)
 				}
+				multipartRunning = false
 				return &syncState, nil
 			}
 			continue

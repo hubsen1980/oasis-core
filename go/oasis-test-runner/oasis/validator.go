@@ -17,9 +17,7 @@ const validatorIdentitySeedTemplate = "ekiden node validator %d"
 
 // Validator is an Oasis validator.
 type Validator struct {
-	Node
-
-	entity *Entity
+	*Node
 
 	sentries []*Sentry
 
@@ -32,8 +30,6 @@ type Validator struct {
 // ValidatorCfg is the Oasis validator provisioning configuration.
 type ValidatorCfg struct {
 	NodeCfg
-
-	Entity *Entity
 
 	Sentries []*Sentry
 }
@@ -73,15 +69,10 @@ func (val *Validator) ExternalGRPCAddress() string {
 	return fmt.Sprintf("127.0.0.1:%d", val.clientPort)
 }
 
-// Start starts an Oasis node.
-func (val *Validator) Start() error {
-	return val.startNode()
-}
-
-func (val *Validator) startNode() error {
-	args := newArgBuilder().
-		debugDontBlameOasis().
+func (val *Validator) AddArgs(args *argBuilder) error {
+	args.debugDontBlameOasis().
 		debugAllowTestKeys().
+		debugEnableProfiling(val.Node.pprofPort).
 		workerCertificateRotation(true).
 		consensusValidator().
 		tendermintCoreAddress(val.consensusPort).
@@ -89,26 +80,20 @@ func (val *Validator) startNode() error {
 		tendermintSubmissionGasPrice(val.consensus.SubmissionGasPrice).
 		tendermintPrune(val.consensus.PruneNumKept).
 		tendermintRecoverCorruptedWAL(val.consensus.TendermintRecoverCorruptedWAL).
+		configureDebugCrashPoints(val.crashPointsProbability).
+		tendermintSupplementarySanity(val.supplementarySanityInterval).
 		appendNetwork(val.net).
 		appendEntity(val.entity)
 
 	if len(val.sentries) > 0 {
-		args = args.addSentries(val.sentries).
+		args.addSentries(val.sentries).
 			tendermintDisablePeerExchange()
 	} else {
-		args = args.appendSeedNodes(val.net.seeds)
+		args.appendSeedNodes(val.net.seeds)
 	}
 	if val.consensus.EnableConsensusRPCWorker {
-		args = args.workerClientPort(val.clientPort).
+		args.workerClientPort(val.clientPort).
 			workerConsensusRPCEnabled()
-	}
-
-	if len(val.net.validators) >= 1 && val == val.net.validators[0] {
-		args = args.tendermintSupplementarySanityEnabled()
-	}
-
-	if err := val.net.startOasisNode(&val.Node, nil, args); err != nil {
-		return fmt.Errorf("oasis/validator: failed to launch node %s: %w", val.Name, err)
 	}
 
 	return nil
@@ -117,34 +102,17 @@ func (val *Validator) startNode() error {
 // NewValidator provisions a new validator and adds it to the network.
 func (net *Network) NewValidator(cfg *ValidatorCfg) (*Validator, error) {
 	valName := fmt.Sprintf("validator-%d", len(net.validators))
-
-	valDir, err := net.baseDir.NewSubDir(valName)
+	host, err := net.GetNamedNode(valName, &cfg.NodeCfg)
 	if err != nil {
-		net.logger.Error("failed to create validator subdir",
-			"err", err,
-			"validator_name", valName,
-		)
-		return nil, fmt.Errorf("oasis/validator: failed to create validator subdir: %w", err)
+		return nil, err
 	}
 
 	val := &Validator{
-		Node: Node{
-			Name:                                     valName,
-			net:                                      net,
-			dir:                                      valDir,
-			termEarlyOk:                              cfg.AllowEarlyTermination,
-			termErrorOk:                              cfg.AllowErrorTermination,
-			disableDefaultLogWatcherHandlerFactories: cfg.DisableDefaultLogWatcherHandlerFactories,
-			logWatcherHandlerFactories:               cfg.LogWatcherHandlerFactories,
-			consensus:                                cfg.Consensus,
-			noAutoStart:                              cfg.NoAutoStart,
-		},
-		entity:        cfg.Entity,
+		Node:          host,
 		sentries:      cfg.Sentries,
-		consensusPort: net.nextNodePort,
-		clientPort:    net.nextNodePort + 1,
+		consensusPort: host.getProvisionedPort(nodePortConsensus),
+		clientPort:    host.getProvisionedPort(nodePortClient),
 	}
-	val.doStartNode = val.startNode
 
 	var consensusAddrs []interface{ String() string }
 	localhost := netPkg.ParseIP("127.0.0.1")
@@ -167,21 +135,16 @@ func (net *Network) NewValidator(cfg *ValidatorCfg) (*Validator, error) {
 
 	// Load node's identity, so that we can pass the validator's Tendermint
 	// address to sentry node(s) to configure it as a private peer.
-	seed := fmt.Sprintf(validatorIdentitySeedTemplate, len(net.validators))
-	valNodeKey, valP2PKey, sentryClientCert, err := net.provisionNodeIdentity(valDir, seed, false)
+	err = host.setProvisionedIdentity(false, fmt.Sprintf(validatorIdentitySeedTemplate, len(net.validators)))
 	if err != nil {
 		return nil, fmt.Errorf("oasis/validator: failed to provision node identity: %w", err)
 	}
-	copy(val.NodeID[:], valNodeKey[:])
-	val.tmAddress = crypto.PublicKeyToTendermint(&valP2PKey).Address().String()
-	if err = cfg.Entity.addNode(val.NodeID); err != nil {
-		return nil, err
-	}
+	val.tmAddress = crypto.PublicKeyToTendermint(&host.p2pSigner).Address().String()
 
 	// Sentry client cert.
-	pk, ok := sentryClientCert.PublicKey.(ed25519.PublicKey)
+	pk, ok := host.sentryCert.PublicKey.(ed25519.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("oasis/validator: bad sentry client public key type (expected: Ed25519 got: %T)", sentryClientCert.PublicKey)
+		return nil, fmt.Errorf("oasis/validator: bad sentry client public key type (expected: Ed25519 got: %T)", host.sentryCert.PublicKey)
 	}
 	if err = val.sentryPubKey.UnmarshalBinary(pk[:]); err != nil {
 		return nil, fmt.Errorf("oasis/validator: sentry client public key unmarshal failure: %w", err)
@@ -192,6 +155,7 @@ func (net *Network) NewValidator(cfg *ValidatorCfg) (*Validator, error) {
 		"--" + cmdCommon.CfgDataDir, val.dir.String(),
 		"--" + cmdRegNode.CfgExpiration, "1",
 		"--" + cmdRegNode.CfgRole, "validator",
+		"--" + cmdRegNode.CfgEntityID, cfg.Entity.ID().String(),
 	}
 	for _, v := range consensusAddrs {
 		args = append(args, []string{"--" + cmdRegNode.CfgConsensusAddress, v.String()}...)
@@ -213,15 +177,8 @@ func (net *Network) NewValidator(cfg *ValidatorCfg) (*Validator, error) {
 	}
 
 	net.validators = append(net.validators, val)
-	net.nextNodePort += 2
-
-	if err := net.AddLogWatcher(&val.Node); err != nil {
-		net.logger.Error("failed to add log watcher",
-			"err", err,
-			"validator_name", valName,
-		)
-		return nil, fmt.Errorf("oasis/validator: failed to add log watcher for %s: %w", valName, err)
-	}
+	host.features = append(host.features, val)
+	host.hasValidators = true
 
 	return val, nil
 }

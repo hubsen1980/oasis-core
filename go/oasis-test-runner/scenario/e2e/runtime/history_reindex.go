@@ -11,6 +11,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
 const (
@@ -26,7 +27,7 @@ type historyReindexImpl struct {
 
 func newHistoryReindexImpl() scenario.Scenario {
 	return &historyReindexImpl{
-		runtimeImpl: *newRuntimeImpl("history-reindex", "simple-keyvalue-enc-client", nil),
+		runtimeImpl: *newRuntimeImpl("history-reindex", BasicKVEncTestClient),
 	}
 }
 
@@ -35,9 +36,6 @@ func (sc *historyReindexImpl) Fixture() (*oasis.NetworkFixture, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// We need IAS proxy to use the registry as we are registering runtimes dynamically.
-	f.Network.IAS.UseRegistry = true
 
 	f.ComputeWorkers = []oasis.ComputeWorkerFixture{
 		{
@@ -68,6 +66,8 @@ func (sc *historyReindexImpl) Fixture() (*oasis.NetworkFixture, error) {
 	// Use a single compute node.
 	f.Runtimes[rtIdx].Executor.GroupSize = 1
 	f.Runtimes[rtIdx].Executor.GroupBackupSize = 0
+	f.Runtimes[rtIdx].Constraints[scheduler.KindComputeExecutor][scheduler.RoleWorker].MinPoolSize.Limit = 1
+	f.Runtimes[rtIdx].Constraints[scheduler.KindComputeExecutor][scheduler.RoleBackupWorker].MinPoolSize.Limit = 0
 
 	return f, nil
 }
@@ -132,9 +132,8 @@ func (sc *historyReindexImpl) Run(childEnv *env.Env) error {
 
 	// Register runtime.
 	compRt := sc.Net.Runtimes()[rtIdx]
-	compRtDesc := compRt.ToRuntimeDescriptor()
 	txPath := filepath.Join(childEnv.Dir(), "register_compute_runtime.json")
-	if err := cli.Registry.GenerateRegisterRuntimeTx(0, compRtDesc, txPath, compRt.GetGenesisStatePath()); err != nil {
+	if err := cli.Registry.GenerateRegisterRuntimeTx(childEnv.Dir(), compRt.ToRuntimeDescriptor(), 0, txPath); err != nil {
 		return fmt.Errorf("failed to generate register compute runtime tx: %w", err)
 	}
 	if err := cli.Consensus.SubmitTx(txPath); err != nil {
@@ -153,14 +152,9 @@ func (sc *historyReindexImpl) Run(childEnv *env.Env) error {
 
 	// Run client to ensure runtime works.
 	sc.Logger.Info("Starting the basic client")
-	cmd, err := sc.startClient(childEnv)
-	if err != nil {
+	if err = sc.startTestClientOnly(ctx, childEnv); err != nil {
 		return err
 	}
-	clientErrCh := make(chan error)
-	go func() {
-		clientErrCh <- cmd.Wait()
-	}()
 
-	return sc.wait(childEnv, cmd, clientErrCh)
+	return sc.waitTestClient()
 }

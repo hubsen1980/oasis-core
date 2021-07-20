@@ -19,10 +19,12 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	tmapi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	app "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash"
+	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
@@ -78,48 +80,61 @@ type serviceClient struct {
 	trackedRuntime map[common.Namespace]*trackedRuntime
 }
 
-func (sc *serviceClient) GetGenesisBlock(ctx context.Context, id common.Namespace, height int64) (*block.Block, error) {
+// Implements api.Backend.
+func (sc *serviceClient) GetGenesisBlock(ctx context.Context, request *api.RuntimeRequest) (*block.Block, error) {
 	// First check if we have the genesis blocks cached. They are immutable so easy
 	// to cache to avoid repeated requests to the Tendermint app.
 	sc.RLock()
-	if blk := sc.genesisBlocks[id]; blk != nil {
+	if blk := sc.genesisBlocks[request.RuntimeID]; blk != nil {
 		sc.RUnlock()
 		return blk, nil
 	}
 	sc.RUnlock()
 
-	q, err := sc.querier.QueryAt(ctx, height)
+	q, err := sc.querier.QueryAt(ctx, request.Height)
 	if err != nil {
 		return nil, err
 	}
 
-	blk, err := q.GenesisBlock(ctx, id)
+	blk, err := q.GenesisBlock(ctx, request.RuntimeID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Update the genesis block cache.
 	sc.Lock()
-	sc.genesisBlocks[id] = blk
+	sc.genesisBlocks[request.RuntimeID] = blk
 	sc.Unlock()
 
 	return blk, nil
 }
 
-func (sc *serviceClient) GetLatestBlock(ctx context.Context, id common.Namespace, height int64) (*block.Block, error) {
-	return sc.getLatestBlockAt(ctx, id, height)
+// Implements api.Backend.
+func (sc *serviceClient) GetLatestBlock(ctx context.Context, request *api.RuntimeRequest) (*block.Block, error) {
+	return sc.getLatestBlockAt(ctx, request.RuntimeID, request.Height)
 }
 
-func (sc *serviceClient) getLatestBlockAt(ctx context.Context, id common.Namespace, height int64) (*block.Block, error) {
+func (sc *serviceClient) getLatestBlockAt(ctx context.Context, runtimeID common.Namespace, height int64) (*block.Block, error) {
 	q, err := sc.querier.QueryAt(ctx, height)
 	if err != nil {
 		return nil, err
 	}
 
-	return q.LatestBlock(ctx, id)
+	return q.LatestBlock(ctx, runtimeID)
 }
 
-func (sc *serviceClient) WatchBlocks(id common.Namespace) (<-chan *api.AnnotatedBlock, *pubsub.Subscription, error) {
+// Implements api.Backend.
+func (sc *serviceClient) GetRuntimeState(ctx context.Context, request *api.RuntimeRequest) (*api.RuntimeState, error) {
+	q, err := sc.querier.QueryAt(ctx, request.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.RuntimeState(ctx, request.RuntimeID)
+}
+
+// Implements api.Backend.
+func (sc *serviceClient) WatchBlocks(ctx context.Context, id common.Namespace) (<-chan *api.AnnotatedBlock, pubsub.ClosableSubscription, error) {
 	notifiers := sc.getRuntimeNotifiers(id)
 
 	sub := notifiers.blockNotifier.SubscribeEx(-1, func(ch channels.Channel) {
@@ -175,7 +190,8 @@ func (sc *serviceClient) WatchAllBlocks() (<-chan *block.Block, *pubsub.Subscrip
 	return ch, sub
 }
 
-func (sc *serviceClient) WatchEvents(id common.Namespace) (<-chan *api.Event, *pubsub.Subscription, error) {
+// Implements api.Backend.
+func (sc *serviceClient) WatchEvents(ctx context.Context, id common.Namespace) (<-chan *api.Event, pubsub.ClosableSubscription, error) {
 	notifiers := sc.getRuntimeNotifiers(id)
 	sub := notifiers.eventNotifier.Subscribe()
 	ch := make(chan *api.Event)
@@ -190,6 +206,7 @@ func (sc *serviceClient) WatchEvents(id common.Namespace) (<-chan *api.Event, *p
 	return ch, sub, nil
 }
 
+// Implements api.Backend.
 func (sc *serviceClient) TrackRuntime(ctx context.Context, history api.BlockHistory) error {
 	return sc.trackRuntime(ctx, history.RuntimeID(), history)
 }
@@ -208,31 +225,98 @@ func (sc *serviceClient) trackRuntime(ctx context.Context, id common.Namespace, 
 	return nil
 }
 
+// Implements api.Backend.
 func (sc *serviceClient) StateToGenesis(ctx context.Context, height int64) (*api.Genesis, error) {
 	q, err := sc.querier.QueryAt(ctx, height)
 	if err != nil {
 		return nil, err
 	}
 
-	return q.Genesis(ctx)
+	g, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add any last emitted events for the given runtime.
+	//
+	// NOTE: This requires historic lookups.
+	for runtimeID, rt := range g.RuntimeStates {
+		state, err := sc.GetRuntimeState(ctx, &api.RuntimeRequest{
+			RuntimeID: runtimeID,
+			Height:    height,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		rr, err := sc.getRoundResults(ctx, runtimeID, state.LastNormalHeight)
+		if err != nil {
+			return nil, fmt.Errorf("roothash: failed to get last message results for runtime %s: %w", runtimeID, err)
+		}
+		rt.MessageResults = rr.Messages
+	}
+
+	return g, nil
 }
 
-func (sc *serviceClient) GetEvents(ctx context.Context, height int64) ([]*api.Event, error) {
+func (sc *serviceClient) getNodeEntities(ctx context.Context, height int64, nodes []signature.PublicKey) ([]signature.PublicKey, error) {
+	var entities []signature.PublicKey
+	seen := make(map[signature.PublicKey]bool)
+	for _, id := range nodes {
+		node, err := sc.backend.Registry().GetNode(ctx, &registry.IDQuery{
+			Height: height,
+			ID:     id,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch node %s: %w", id, err)
+		}
+
+		if seen[node.EntityID] {
+			continue
+		}
+		seen[node.EntityID] = true
+		entities = append(entities, node.EntityID)
+	}
+	return entities, nil
+}
+
+func (sc *serviceClient) getRoundResults(ctx context.Context, runtimeID common.Namespace, height int64) (*api.RoundResults, error) {
+	evs, err := sc.getEvents(ctx, height, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	results := new(api.RoundResults)
+	for _, ev := range evs {
+		switch {
+		case !ev.RuntimeID.Equal(&runtimeID):
+			continue
+		case ev.Message != nil:
+			// Runtime message processed event.
+			results.Messages = append(results.Messages, ev.Message)
+		case ev.Finalized != nil:
+			// Round finalized event.
+			results.GoodComputeEntities, err = sc.getNodeEntities(ctx, height, ev.Finalized.GoodComputeNodes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve good compute entities: %w", err)
+			}
+
+			results.BadComputeEntities, err = sc.getNodeEntities(ctx, height, ev.Finalized.BadComputeNodes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve bad compute entities: %w", err)
+			}
+		default:
+		}
+	}
+	return results, nil
+}
+
+func (sc *serviceClient) getEvents(ctx context.Context, height int64, txns [][]byte) ([]*api.Event, error) {
 	// Get block results at given height.
 	var results *tmrpctypes.ResultBlockResults
 	results, err := sc.backend.GetBlockResults(ctx, height)
 	if err != nil {
 		sc.logger.Error("failed to get tendermint block results",
-			"err", err,
-			"height", height,
-		)
-		return nil, err
-	}
-
-	// Get transactions at given height.
-	txns, err := sc.backend.GetTransactions(ctx, height)
-	if err != nil {
-		sc.logger.Error("failed to get tendermint transactions",
 			"err", err,
 			"height", height,
 		)
@@ -258,7 +342,11 @@ func (sc *serviceClient) GetEvents(ctx context.Context, height int64) ([]*api.Ev
 		// The order of transactions in txns and results.TxsResults is
 		// supposed to match, so the same index in both slices refers to the
 		// same transaction.
-		evs, txErr := EventsFromTendermint(txns[txIdx], results.Height, txResult.Events)
+		var tx tmtypes.Tx
+		if txns != nil {
+			tx = txns[txIdx]
+		}
+		evs, txErr := EventsFromTendermint(tx, results.Height, txResult.Events)
 		if txErr != nil {
 			return nil, txErr
 		}
@@ -268,6 +356,22 @@ func (sc *serviceClient) GetEvents(ctx context.Context, height int64) ([]*api.Ev
 	return events, nil
 }
 
+// Implements api.Backend.
+func (sc *serviceClient) GetEvents(ctx context.Context, height int64) ([]*api.Event, error) {
+	// Get transactions at given height.
+	txns, err := sc.backend.GetTransactions(ctx, height)
+	if err != nil {
+		sc.logger.Error("failed to get tendermint transactions",
+			"err", err,
+			"height", height,
+		)
+		return nil, err
+	}
+
+	return sc.getEvents(ctx, height, txns)
+}
+
+// Implements api.Backend.
 func (sc *serviceClient) Cleanup() {
 }
 
@@ -287,9 +391,10 @@ func (sc *serviceClient) getRuntimeNotifiers(id common.Namespace) *runtimeBroker
 	return notifiers
 }
 
-func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory) error {
+func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory) (uint64, error) {
+	lastRound := api.RoundInvalid
 	if currentHeight <= 0 {
-		return nil
+		return lastRound, nil
 	}
 
 	logger := sc.logger.With("runtime_id", bh.RuntimeID())
@@ -300,7 +405,7 @@ func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory)
 		sc.logger.Error("failed to get last indexed height",
 			"err", err,
 		)
-		return fmt.Errorf("failed to get last indexed height: %w", err)
+		return lastRound, fmt.Errorf("failed to get last indexed height: %w", err)
 	}
 	// +1 since we want the last non-seen height.
 	lastHeight++
@@ -308,7 +413,7 @@ func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory)
 	// Take prune strategy into account.
 	lastRetainedHeight, err := sc.backend.GetLastRetainedVersion(sc.ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get last retained height: %w", err)
+		return lastRound, fmt.Errorf("failed to get last retained height: %w", err)
 	}
 	if lastHeight < lastRetainedHeight {
 		logger.Debug("last height pruned, skipping until last retained",
@@ -321,7 +426,7 @@ func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory)
 	// Take initial genesis height into account.
 	genesisDoc, err := sc.backend.GetGenesisDocument(sc.ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get genesis document: %w", err)
+		return lastRound, fmt.Errorf("failed to get genesis document: %w", err)
 	}
 	if lastHeight < genesisDoc.Height {
 		lastHeight = genesisDoc.Height
@@ -344,7 +449,7 @@ func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory)
 				"err", err,
 				"height", height,
 			)
-			return fmt.Errorf("failed to get tendermint block results: %w", err)
+			return lastRound, fmt.Errorf("failed to get tendermint block results: %w", err)
 		}
 
 		// Index block.
@@ -365,24 +470,38 @@ func (sc *serviceClient) reindexBlocks(currentHeight int64, bh api.BlockHistory)
 							"err", err,
 							"height", height,
 						)
-						return fmt.Errorf("failed to unmarshal finalized event: %w", err)
+						return 0, fmt.Errorf("failed to unmarshal finalized event: %w", err)
 					}
 
 					// Only process finalized events for tracked runtimes.
 					if sc.trackedRuntime[value.ID] == nil {
 						continue
 					}
-					if err = sc.processFinalizedEvent(sc.ctx, height, value.ID, &value.Round, false); err != nil {
-						return fmt.Errorf("failed to process finalized event: %w", err)
+					if err = sc.processFinalizedEvent(sc.ctx, height, value.ID, &value.Event.Round, false); err != nil {
+						return 0, fmt.Errorf("failed to process finalized event: %w", err)
 					}
+					lastRound = value.Event.Round
 				}
 			}
 		}
 	}
 
-	sc.logger.Debug("block reindex complete")
+	if lastRound == api.RoundInvalid {
+		sc.logger.Debug("no new round reindexed, return latest known round")
+		switch blk, err := bh.GetLatestBlock(sc.ctx); err {
+		case api.ErrNotFound:
+		case nil:
+			lastRound = blk.Header.Round
+		default:
+			return lastRound, fmt.Errorf("failed to get latest block: %w", err)
+		}
+	}
 
-	return nil
+	sc.logger.Debug("block reindex complete",
+		"last_round", lastRound,
+	)
+
+	return lastRound, nil
 }
 
 // Implements api.ServiceClient.
@@ -442,7 +561,7 @@ func (sc *serviceClient) DeliverEvent(ctx context.Context, height int64, tx tmty
 
 	for _, ev := range events {
 		// Notify non-finalized events.
-		if ev.FinalizedEvent == nil {
+		if ev.Finalized == nil {
 			notifiers := sc.getRuntimeNotifiers(ev.RuntimeID)
 			notifiers.eventNotifier.Broadcast(ev)
 			continue
@@ -452,7 +571,7 @@ func (sc *serviceClient) DeliverEvent(ctx context.Context, height int64, tx tmty
 		if sc.trackedRuntime[ev.RuntimeID] == nil {
 			continue
 		}
-		if err = sc.processFinalizedEvent(ctx, height, ev.RuntimeID, &ev.FinalizedEvent.Round, true); err != nil {
+		if err = sc.processFinalizedEvent(ctx, height, ev.RuntimeID, &ev.Finalized.Round, true); err != nil {
 			return fmt.Errorf("roothash: failed to process finalized event: %w", err)
 		}
 	}
@@ -506,6 +625,16 @@ func (sc *serviceClient) processFinalizedEvent(
 		return fmt.Errorf("roothash: finalized event/query round mismatch")
 	}
 
+	roundResults, err := sc.getRoundResults(ctx, runtimeID, height)
+	if err != nil {
+		sc.logger.Error("failed to fetch round results",
+			"err", err,
+			"height", height,
+			"runtime_id", runtimeID,
+		)
+		return fmt.Errorf("roothash: failed to fetch round results: %w", err)
+	}
+
 	annBlk := &api.AnnotatedBlock{
 		Height: height,
 		Block:  blk,
@@ -516,10 +645,11 @@ func (sc *serviceClient) processFinalizedEvent(
 		crash.Here(crashPointBlockBeforeIndex)
 
 		// Perform reindex if required.
+		lastRound := api.RoundInvalid
 		if reindex && !tr.reindexDone {
 			// Note that we need to reindex up to the previous height as the current height is
 			// already being processed right now.
-			if err = sc.reindexBlocks(height-1, tr.blockHistory); err != nil {
+			if lastRound, err = sc.reindexBlocks(height-1, tr.blockHistory); err != nil {
 				sc.logger.Error("failed to reindex blocks",
 					"err", err,
 					"runtime_id", runtimeID,
@@ -529,21 +659,26 @@ func (sc *serviceClient) processFinalizedEvent(
 			tr.reindexDone = true
 		}
 
-		sc.logger.Debug("commit block",
-			"runtime_id", runtimeID,
-			"height", height,
-			"round", blk.Header.Round,
-		)
-
-		err = tr.blockHistory.Commit(annBlk)
-		if err != nil {
-			sc.logger.Error("failed to commit block to history keeper",
-				"err", err,
+		// Only commit the block in case it was not already committed during reindex. Note that even
+		// in case we only reindex up to height-1 this can still happen on the first emitted block
+		// since that height is not guaranteed to be the one that contains a round finalized event.
+		if lastRound == api.RoundInvalid || blk.Header.Round > lastRound {
+			sc.logger.Debug("commit block",
 				"runtime_id", runtimeID,
 				"height", height,
 				"round", blk.Header.Round,
 			)
-			return fmt.Errorf("failed to commit block to history keeper: %w", err)
+
+			err = tr.blockHistory.Commit(annBlk, roundResults)
+			if err != nil {
+				sc.logger.Error("failed to commit block to history keeper",
+					"err", err,
+					"runtime_id", runtimeID,
+					"height", height,
+					"round", blk.Header.Round,
+				)
+				return fmt.Errorf("failed to commit block to history keeper: %w", err)
+			}
 		}
 	}
 
@@ -601,7 +736,7 @@ func EventsFromTendermint(
 					continue
 				}
 
-				ev := &api.Event{RuntimeID: value.ID, Height: height, TxHash: txHash, FinalizedEvent: &api.FinalizedEvent{Round: value.Round}}
+				ev := &api.Event{RuntimeID: value.ID, Height: height, TxHash: txHash, Finalized: &value.Event}
 				events = append(events, ev)
 			case bytes.Equal(key, app.KeyExecutionDiscrepancyDetected):
 				// An execution discrepancy has been detected.
@@ -622,6 +757,16 @@ func EventsFromTendermint(
 				}
 
 				ev := &api.Event{RuntimeID: value.ID, Height: height, TxHash: txHash, ExecutorCommitted: &value.Event}
+				events = append(events, ev)
+			case bytes.Equal(key, app.KeyMessage):
+				// Runtime message has been processed.
+				var value app.ValueMessage
+				if err := cbor.Unmarshal(val, &value); err != nil {
+					errs = multierror.Append(errs, fmt.Errorf("roothash: corrupt message event: %w", err))
+					continue
+				}
+
+				ev := &api.Event{RuntimeID: value.ID, Height: height, TxHash: txHash, Message: &value.Event}
 				events = append(events, ev)
 			case bytes.Equal(key, app.KeyRuntimeID):
 				// Runtime ID attribute (Base64-encoded to allow queries).

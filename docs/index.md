@@ -51,19 +51,16 @@ implementations.
     * [Staking](consensus/staking.md)
     * [Registry](consensus/registry.md)
     * [Committee Scheduler](consensus/scheduler.md)
+    * [Governance](consensus/governance.md)
     * [Root Hash](consensus/roothash.md)
     * [Key Manager](consensus/keymanager.md)
   * [Genesis Document](consensus/genesis.md)
   * [Transaction Test Vectors](consensus/test-vectors.md)
 * [Runtime Layer](runtime/index.md)
-  * [Runtimes](runtime/index.md#runtimes)
-    * [Operation Model](runtime/index.md#operation-model)
-    * [Runtime Host Protocol](runtime/runtime-host-protocol.md)
-    * [Identifiers](runtime/identifiers.md)
-  * Transaction Processing Pipeline
-    * Executor Nodes
-    * Storage Nodes
-    * Key Manager Nodes
+  * [Operation Model](runtime/index.md#operation-model)
+  * [Runtime Host Protocol](runtime/runtime-host-protocol.md)
+  * [Identifiers](runtime/identifiers.md)
+  * [Messages](runtime/messages.md)
 * Oasis Node (`oasis-node`)
   * [RPC](oasis-node/rpc.md)
   * [Metrics](oasis-node/metrics.md)
@@ -82,3 +79,4 @@ implementations.
 * [Architectural Decision Records](adr/index.md)
 * [Release Process](release-process.md)
 * [Versioning](versioning.md)
+* [Security](../SECURITY.md)

@@ -22,6 +22,10 @@ var (
 
 	// methodSubmitTx is the SubmitTx method.
 	methodSubmitTx = serviceName.NewMethod("SubmitTx", SubmitTxRequest{})
+	// methodSubmitTxNoWait is the SubmitTxNoWait method.
+	methodSubmitTxNoWait = serviceName.NewMethod("SubmitTxNoWait", SubmitTxRequest{})
+	// methodCheckTx is the CheckTx method.
+	methodCheckTx = serviceName.NewMethod("CheckTx", CheckTxRequest{})
 	// methodGetGenesisBlock is the GetGenesisBlock method.
 	methodGetGenesisBlock = serviceName.NewMethod("GetGenesisBlock", common.Namespace{})
 	// methodGetBlock is the GetBlock method.
@@ -34,6 +38,12 @@ var (
 	methodGetTxByBlockHash = serviceName.NewMethod("GetTxByBlockHash", GetTxByBlockHashRequest{})
 	// methodGetTxs is the GetTxs method.
 	methodGetTxs = serviceName.NewMethod("GetTxs", GetTxsRequest{})
+	// methodGetTransactions is the GetTransactions method.
+	methodGetTransactions = serviceName.NewMethod("GetTransactions", GetTransactionsRequest{})
+	// methodGetEvents is the GetEvents method.
+	methodGetEvents = serviceName.NewMethod("GetEvents", GetEventsRequest{})
+	// methodQuery is the Query method.
+	methodQuery = serviceName.NewMethod("Query", QueryRequest{})
 	// methodQueryTx is the QueryTx method.
 	methodQueryTx = serviceName.NewMethod("QueryTx", QueryTxRequest{})
 	// methodQueryTxs is the QueryTxs method.
@@ -52,6 +62,14 @@ var (
 			{
 				MethodName: methodSubmitTx.ShortName(),
 				Handler:    handlerSubmitTx,
+			},
+			{
+				MethodName: methodSubmitTxNoWait.ShortName(),
+				Handler:    handlerSubmitTxNoWait,
+			},
+			{
+				MethodName: methodCheckTx.ShortName(),
+				Handler:    handlerCheckTx,
 			},
 			{
 				MethodName: methodGetGenesisBlock.ShortName(),
@@ -76,6 +94,18 @@ var (
 			{
 				MethodName: methodGetTxs.ShortName(),
 				Handler:    handlerGetTxs,
+			},
+			{
+				MethodName: methodGetTransactions.ShortName(),
+				Handler:    handlerGetTransactions,
+			},
+			{
+				MethodName: methodGetEvents.ShortName(),
+				Handler:    handlerGetEvents,
+			},
+			{
+				MethodName: methodQuery.ShortName(),
+				Handler:    handlerQuery,
 			},
 			{
 				MethodName: methodQueryTx.ShortName(),
@@ -119,6 +149,52 @@ func handlerSubmitTx( // nolint: golint
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimeClient).SubmitTx(ctx, req.(*SubmitTxRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerSubmitTxNoWait( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq SubmitTxRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return nil, srv.(RuntimeClient).SubmitTxNoWait(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodSubmitTxNoWait.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, srv.(RuntimeClient).SubmitTxNoWait(ctx, req.(*SubmitTxRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerCheckTx( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq CheckTxRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return nil, srv.(RuntimeClient).CheckTx(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodCheckTx.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, srv.(RuntimeClient).CheckTx(ctx, req.(*CheckTxRequest))
 	}
 	return interceptor(ctx, &rq, info, handler)
 }
@@ -298,6 +374,77 @@ func handlerGetTxs( // nolint: golint
 	return interceptor(ctx, &rq, info, handler)
 }
 
+func handlerGetTransactions( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq GetTransactionsRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetTransactions(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetTransactions.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetTransactions(ctx, req.(*GetTransactionsRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerGetEvents( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq GetEventsRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetEvents(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetEvents.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetEvents(ctx, req.(*GetEventsRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerQuery( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq QueryRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		rsp, err := srv.(RuntimeClient).Query(ctx, &rq)
+		return rsp, errorWrapNotFound(err)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodQuery.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		rsp, err := srv.(RuntimeClient).Query(ctx, req.(*QueryRequest))
+		return rsp, errorWrapNotFound(err)
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
 func handlerQueryTx( // nolint: golint
 	srv interface{},
 	ctx context.Context,
@@ -417,6 +564,14 @@ func (c *runtimeClient) SubmitTx(ctx context.Context, request *SubmitTxRequest) 
 	return rsp, nil
 }
 
+func (c *runtimeClient) SubmitTxNoWait(ctx context.Context, request *SubmitTxRequest) error {
+	return c.conn.Invoke(ctx, methodSubmitTxNoWait.FullName(), request, nil)
+}
+
+func (c *runtimeClient) CheckTx(ctx context.Context, request *CheckTxRequest) error {
+	return c.conn.Invoke(ctx, methodCheckTx.FullName(), request, nil)
+}
+
 func (c *runtimeClient) GetGenesisBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error) {
 	var rsp block.Block
 	if err := c.conn.Invoke(ctx, methodGetGenesisBlock.FullName(), runtimeID, &rsp); err != nil {
@@ -463,6 +618,30 @@ func (c *runtimeClient) GetTxs(ctx context.Context, request *GetTxsRequest) ([][
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (c *runtimeClient) GetTransactions(ctx context.Context, request *GetTransactionsRequest) ([][]byte, error) {
+	var rsp [][]byte
+	if err := c.conn.Invoke(ctx, methodGetTransactions.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *runtimeClient) GetEvents(ctx context.Context, request *GetEventsRequest) ([]*Event, error) {
+	var rsp []*Event
+	if err := c.conn.Invoke(ctx, methodGetEvents.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *runtimeClient) Query(ctx context.Context, request *QueryRequest) (*QueryResponse, error) {
+	var rsp QueryResponse
+	if err := c.conn.Invoke(ctx, methodQuery.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
 }
 
 func (c *runtimeClient) QueryTx(ctx context.Context, request *QueryTxRequest) (*TxResult, error) {
@@ -518,9 +697,6 @@ func (c *runtimeClient) WatchBlocks(ctx context.Context, runtimeID common.Namesp
 	}()
 
 	return ch, sub, nil
-}
-
-func (c *runtimeClient) Cleanup() {
 }
 
 // NewRuntimeClient creates a new gRPC runtime client service.

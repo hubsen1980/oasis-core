@@ -24,6 +24,7 @@
     * [Staking](consensus/staking.md)
     * [Registry](consensus/registry.md)
     * [Committee Scheduler](consensus/scheduler.md)
+    * [Governance](consensus/governance.md)
     * [Root Hash](consensus/roothash.md)
     * [Key Manager](consensus/keymanager.md)
   * [Genesis Document](consensus/genesis.md)
@@ -31,6 +32,7 @@
 * [Runtime Layer](runtime/index.md)
   * [Runtime Host Protocol](runtime/runtime-host-protocol.md)
   * [Identifiers](runtime/identifiers.md)
+  * [Messages](runtime/messages.md)
 * Oasis Node
   * [RPC](oasis-node/rpc.md)
   * [Metrics](oasis-node/metrics.md)
@@ -49,3 +51,4 @@
 * [Architectural Decision Records](adr/index.md)
 * [Release Process](release-process.md)
 * [Versioning](versioning.md)
+* [Security](../SECURITY.md)

@@ -9,11 +9,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	registryTests "github.com/oasisprotocol/oasis-core/go/registry/tests"
 	"github.com/oasisprotocol/oasis-core/go/scheduler/api"
@@ -24,6 +24,7 @@ const recvTimeout = 5 * time.Second
 // SchedulerImplementationTests exercises the basic functionality of a
 // scheduler backend.
 func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend, consensus consensusAPI.Backend) {
+	ctx := context.Background()
 	seed := []byte("SchedulerImplementationTests/" + name)
 
 	require := require.New(t)
@@ -34,13 +35,16 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 	// Populate the registry with an entity and nodes.
 	nodes := rt.Populate(t, consensus.Registry(), consensus, seed)
 
-	ch, sub, err := backend.WatchCommittees(context.Background())
+	// Query genesis parameters.
+	_, err = backend.ConsensusParameters(ctx, consensusAPI.HeightLatest)
+
+	ch, sub, err := backend.WatchCommittees(ctx)
 	require.NoError(err, "WatchCommittees")
 	defer sub.Close()
 
 	// Advance the epoch.
-	epochtime := consensus.EpochTime().(epochtime.SetableBackend)
-	epoch := epochtimeTests.MustAdvanceEpoch(t, epochtime, 1)
+	timeSource := consensus.Beacon().(beacon.SetableBackend)
+	epoch := beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 	ensureValidCommittees := func(expectedExecutor, expectedStorage int) {
 		var executor, storage *api.Committee
@@ -114,11 +118,14 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 	// Re-register the runtime with less nodes.
 	rt.Runtime.Executor.GroupSize = 2
 	rt.Runtime.Executor.GroupBackupSize = 1
+	rt.Runtime.Constraints[api.KindComputeExecutor][api.RoleWorker].MinPoolSize.Limit = 2
+	rt.Runtime.Constraints[api.KindComputeExecutor][api.RoleBackupWorker].MinPoolSize.Limit = 1
 	rt.Runtime.Storage.GroupSize = 1
+	rt.Runtime.Constraints[api.KindStorage][api.RoleWorker].MinPoolSize.Limit = 1
 	rt.Runtime.Storage.MinWriteReplication = 1
 	rt.MustRegister(t, consensus.Registry(), consensus)
 
-	epoch = epochtimeTests.MustAdvanceEpoch(t, epochtime, 1)
+	epoch = beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 	ensureValidCommittees(
 		3,
@@ -148,12 +155,9 @@ func requireValidCommitteeMembers(t *testing.T, committee *api.Committee, runtim
 	}
 
 	var workers, backups int
-	seenMap := make(map[signature.PublicKey]bool)
 	for _, member := range committee.Members {
 		id := member.PublicKey
 		require.NotNil(nodeMap[id], "member is a node")
-		require.False(seenMap[id], "member is unique")
-		seenMap[id] = true
 
 		switch member.Role {
 		case api.RoleWorker:

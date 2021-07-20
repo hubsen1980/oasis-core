@@ -35,6 +35,8 @@ func (sc *consensusStateSyncImpl) Fixture() (*oasis.NetworkFixture, error) {
 		return nil, err
 	}
 
+	f.Network.SetInsecureBeacon()
+
 	// Enable checkpoints.
 	f.Network.Consensus.Parameters.StateCheckpointInterval = 10
 	f.Network.Consensus.Parameters.StateCheckpointNumKept = 100
@@ -146,6 +148,21 @@ func (sc *consensusStateSyncImpl) Run(childEnv *env.Env) error {
 	}
 	if err = valCtrl.WaitSync(ctx); err != nil {
 		return err
+	}
+
+	// Query the validator status.
+	ctrl, err := oasis.NewController(val.SocketPath())
+	if err != nil {
+		return fmt.Errorf("failed to create controller for validator %s: %w", val.Name, err)
+	}
+	status, err := ctrl.GetStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch validator status: %w", err)
+	}
+
+	// Make sure that the last retained height has been set correctly.
+	if lrh := status.Consensus.LastRetainedHeight; lrh < 20 {
+		return fmt.Errorf("unexpected last retained height from state synced node (got: %d)", lrh)
 	}
 
 	return nil

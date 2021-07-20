@@ -11,7 +11,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
@@ -29,8 +29,6 @@ type Document struct {
 	Time time.Time `json:"genesis_time"`
 	// ChainID is the ID of the chain.
 	ChainID string `json:"chain_id"`
-	// EpochTime is the timekeeping genesis state.
-	EpochTime epochtime.Genesis `json:"epochtime"`
 	// Registry is the registry genesis state.
 	Registry registry.Genesis `json:"registry"`
 	// RootHash is the roothash genesis state.
@@ -43,11 +41,13 @@ type Document struct {
 	Scheduler scheduler.Genesis `json:"scheduler"`
 	// Beacon is the beacon genesis state.
 	Beacon beacon.Genesis `json:"beacon"`
+	// Governance is the governance genesis state.
+	Governance governance.Genesis `json:"governance"`
 	// Consensus is the consensus genesis state.
 	Consensus consensus.Genesis `json:"consensus"`
 	// HaltEpoch is the epoch height at which the network will stop processing
 	// any transactions and will halt.
-	HaltEpoch epochtime.EpochTime `json:"halt_epoch"`
+	HaltEpoch beacon.EpochTime `json:"halt_epoch"`
 	// Extra data is arbitrary extra data that is part of the
 	// genesis block but is otherwise ignored by the protocol.
 	ExtraData map[string][]byte `json:"extra_data"`
@@ -76,14 +76,29 @@ func (d *Document) SetChainContext() {
 	signature.SetChainContext(d.ChainContext())
 }
 
-// WriteFileJSON writes the genesis document into a JSON file.
+// CanonicalJSON returns the canonical form of the genesis document serialized
+// into a file.
+//
+// This is a pretty-printed JSON file with 2-space indents following Go
+// encoding/json package's JSON marshalling rules with a newline at the end.
+func (d *Document) CanonicalJSON() ([]byte, error) {
+	canonJSON, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return []byte{}, fmt.Errorf("CanonicalJSON: failed to marshal genesis document: %w", err)
+	}
+	// Append a newline at the end.
+	canonJSON = append(canonJSON, []byte("\n")...)
+	return canonJSON, nil
+}
+
+// WriteFileJSON writes the canonical form of genesis document into a file.
 func (d *Document) WriteFileJSON(filename string) error {
-	docJSON, err := json.Marshal(d)
+	canonJSON, err := d.CanonicalJSON()
 	if err != nil {
 		return err
 	}
 
-	if err = ioutil.WriteFile(filename, docJSON, filePerm); err != nil {
+	if err = ioutil.WriteFile(filename, canonJSON, filePerm); err != nil {
 		return fmt.Errorf("WriteFileJSON: failed to write genesis file: %w", err)
 	}
 	return nil

@@ -4,15 +4,25 @@ import (
 	"fmt"
 	"reflect"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
-	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api/block"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/message"
 	"github.com/oasisprotocol/oasis-core/go/runtime/transaction"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
+
+// MethodQueryBatchWeightLimits is the name of the runtime batch weight limits query method.
+const MethodQueryBatchWeightLimits = "internal.BatchWeightLimits"
 
 // NOTE: Bump RuntimeProtocol version in go/common/version if you
 //       change any of the structures below.
@@ -48,7 +58,6 @@ type Message struct {
 	ID          uint64      `json:"id"`
 	MessageType MessageType `json:"message_type"`
 	Body        Body        `json:"body"`
-	SpanContext []byte      `json:"span_context"`
 }
 
 // Body is a protocol message body.
@@ -79,6 +88,8 @@ type Body struct {
 	RuntimeAbortResponse                  *Empty                                 `json:",omitempty"`
 	RuntimeKeyManagerPolicyUpdateRequest  *RuntimeKeyManagerPolicyUpdateRequest  `json:",omitempty"`
 	RuntimeKeyManagerPolicyUpdateResponse *Empty                                 `json:",omitempty"`
+	RuntimeQueryRequest                   *RuntimeQueryRequest                   `json:",omitempty"`
+	RuntimeQueryResponse                  *RuntimeQueryResponse                  `json:",omitempty"`
 
 	// Host interface.
 	HostRPCCallRequest          *HostRPCCallRequest          `json:",omitempty"`
@@ -113,19 +124,38 @@ type Error struct {
 	Message string `json:"message,omitempty"`
 }
 
+// String returns a string representation of this runtime error.
+func (e Error) String() string {
+	return fmt.Sprintf("runtime error: module: %s code: %d message: %s", e.Module, e.Code, e.Message)
+}
+
 // RuntimeInfoRequest is a worker info request message body.
 type RuntimeInfoRequest struct {
 	// RuntimeID is the assigned runtime ID of the loaded runtime.
 	RuntimeID common.Namespace `json:"runtime_id"`
+
+	// ConsensusBackend is the name of the consensus backend that is in use for the consensus layer.
+	ConsensusBackend string `json:"consensus_backend"`
+	// ConsensusProtocolVersion is the consensus protocol version that is in use for the consensus
+	// layer.
+	ConsensusProtocolVersion version.Version `json:"consensus_protocol_version"`
+	// ConsensusChainContext is the consensus layer chain domain separation context.
+	ConsensusChainContext string `json:"consensus_chain_context"`
+
+	// LocalConfig is the node-local runtime configuration.
+	//
+	// This configuration must not be used in any context which requires determinism across
+	// replicated runtime instances.
+	LocalConfig map[string]interface{} `json:"local_config,omitempty"`
 }
 
 // RuntimeInfoResponse is a worker info response message body.
 type RuntimeInfoResponse struct {
 	// ProtocolVersion is the runtime protocol version supported by the worker.
-	ProtocolVersion uint64 `json:"protocol_version"`
+	ProtocolVersion version.Version `json:"protocol_version"`
 
 	// RuntimeVersion is the version of the runtime.
-	RuntimeVersion uint64 `json:"runtime_version"`
+	RuntimeVersion version.Version `json:"runtime_version"`
 }
 
 // RuntimeCapabilityTEERakInitRequest is a worker RFC 0009 CapabilityTEE
@@ -172,16 +202,57 @@ type RuntimeLocalRPCCallResponse struct {
 
 // RuntimeCheckTxBatchRequest is a worker check tx batch request message body.
 type RuntimeCheckTxBatchRequest struct {
+	// ConsensusBlock is the consensus light block at the last finalized round
+	// height (e.g., corresponding to .Block.Header.Round).
+	ConsensusBlock consensus.LightBlock `json:"consensus_block"`
+
 	// Batch of runtime inputs to check.
 	Inputs transaction.RawBatch `json:"inputs"`
 	// Block on which the batch check should be based.
-	Block roothash.Block `json:"block"`
+	Block block.Block `json:"block"`
+	// Epoch is the current epoch number.
+	Epoch beacon.EpochTime `json:"epoch"`
+}
+
+// CheckTxResult contains the result of a CheckTx operation.
+type CheckTxResult struct {
+	// Error is the error (if any) that resulted from the operation.
+	Error Error `json:"error"`
+
+	// Meta contains metadata that can be used for scheduling transactions by the scheduler.
+	Meta *CheckTxMetadata `json:"meta,omitempty"`
+}
+
+// CheckTxMetadata is the transaction check-tx metadata.
+type CheckTxMetadata struct {
+	// Priority is the transaction's priority.
+	Priority uint64 `json:"priority,omitempty"`
+
+	// Weight are runtime specific transaction weights.
+	Weights map[transaction.Weight]uint64 `json:"weights,omitempty"`
+}
+
+// IsSuccess returns true if transaction execution was successful.
+func (r *CheckTxResult) IsSuccess() bool {
+	return r.Error.Code == errors.CodeNoError
+}
+
+// ToCheckedTransaction creates CheckedTransaction from CheckTx result.
+//
+// Assumes a successful result.
+func (r *CheckTxResult) ToCheckedTransaction(rawTx []byte) *transaction.CheckedTransaction {
+	switch r.Meta {
+	case nil:
+		return transaction.NewCheckedTransaction(rawTx, 0, nil)
+	default:
+		return transaction.NewCheckedTransaction(rawTx, r.Meta.Priority, r.Meta.Weights)
+	}
 }
 
 // RuntimeCheckTxBatchResponse is a worker check tx batch response message body.
 type RuntimeCheckTxBatchResponse struct {
-	// Batch of runtime check results.
-	Results transaction.RawBatch `json:"results"`
+	// Batch of CheckTx results corresponding to transactions passed on input.
+	Results []CheckTxResult `json:"results"`
 }
 
 // ComputedBatch is a computed batch.
@@ -195,6 +266,8 @@ type ComputedBatch struct {
 	// If this runtime uses a TEE, then this is the signature of Header with
 	// node's RAK for this runtime.
 	RakSig signature.RawSignature `json:"rak_sig"`
+	// Messages are the emitted runtime messages.
+	Messages []message.Message `json:"messages"`
 }
 
 // String returns a string representation of a computed batch.
@@ -204,24 +277,58 @@ func (b *ComputedBatch) String() string {
 
 // RuntimeExecuteTxBatchRequest is a worker execute tx batch request message body.
 type RuntimeExecuteTxBatchRequest struct {
+	// ConsensusBlock is the consensus light block at the last finalized round
+	// height (e.g., corresponding to .Block.Header.Round).
+	ConsensusBlock consensus.LightBlock `json:"consensus_block"`
+
+	// RoundResults are the results of executing the previous successful round.
+	RoundResults *roothash.RoundResults `json:"round_results"`
+
 	// IORoot is the I/O root containing the inputs (transactions) that
 	// the compute node should use. It must match what is passed in "inputs".
 	IORoot hash.Hash `json:"io_root"`
 	// Batch of inputs (transactions).
 	Inputs transaction.RawBatch `json:"inputs"`
 	// Block on which the batch computation should be based.
-	Block roothash.Block `json:"block"`
+	Block block.Block `json:"block"`
+	// Epoch is the current epoch number.
+	Epoch beacon.EpochTime `json:"epoch"`
+
+	// MaxMessages is the maximum number of messages that can be emitted in this
+	// round. Any more messages will be rejected by the consensus layer.
+	MaxMessages uint32 `json:"max_messages"`
 }
 
 // RuntimeExecuteTxBatchResponse is a worker execute tx batch response message body.
 type RuntimeExecuteTxBatchResponse struct {
-	Batch ComputedBatch `json:"batch"`
+	Batch             ComputedBatch                 `json:"batch"`
+	BatchWeightLimits map[transaction.Weight]uint64 `json:"batch_weight_limits"`
 }
 
 // RuntimeKeyManagerPolicyUpdateRequest is a runtime key manager policy request
 // message body.
 type RuntimeKeyManagerPolicyUpdateRequest struct {
 	SignedPolicyRaw []byte `json:"signed_policy_raw"`
+}
+
+// RuntimeQueryRequest is a runtime query request message body.
+type RuntimeQueryRequest struct {
+	// ConsensusBlock is the consensus light block at the last finalized round
+	// height (e.g., corresponding to .Header.Round).
+	ConsensusBlock consensus.LightBlock `json:"consensus_block"`
+
+	// Header is the current block header.
+	Header block.Header `json:"header"`
+	// Epoch is the current epoch number.
+	Epoch beacon.EpochTime `json:"epoch"`
+
+	Method string          `json:"method"`
+	Args   cbor.RawMessage `json:"args,omitempty"`
+}
+
+// RuntimeQueryRequest is a runtime query response message body.
+type RuntimeQueryResponse struct {
+	Data cbor.RawMessage `json:"data,omitempty"`
 }
 
 // HostRPCCallRequest is a host RPC call request message body.
@@ -235,8 +342,21 @@ type HostRPCCallResponse struct {
 	Response []byte `json:"response"`
 }
 
+// HostStorageEndpoint is the host storage endpoint.
+type HostStorageEndpoint uint8
+
+const (
+	// HostStorageEndpointRuntime is the runtime state storage endpoint.
+	HostStorageEndpointRuntime HostStorageEndpoint = 0
+	// HostStorageEndpointConsensus is the consensus layer state storage endpoint.
+	HostStorageEndpointConsensus HostStorageEndpoint = 1
+)
+
 // HostStorageSyncRequest is a host storage read syncer request message body.
 type HostStorageSyncRequest struct {
+	// Endpoint is the storage endpoint to which this request should be routed.
+	Endpoint HostStorageEndpoint `json:"endpoint,omitempty"`
+
 	SyncGet         *storage.GetRequest         `json:",omitempty"`
 	SyncGetPrefixes *storage.GetPrefixesRequest `json:",omitempty"`
 	SyncIterate     *storage.IterateRequest     `json:",omitempty"`

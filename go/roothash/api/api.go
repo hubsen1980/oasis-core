@@ -4,15 +4,18 @@ package api
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
+	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
-	"github.com/oasisprotocol/oasis-core/go/registry/api"
+	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 )
@@ -20,6 +23,9 @@ import (
 const (
 	// ModuleName is a unique module name for the roothash module.
 	ModuleName = "roothash"
+
+	// RoundInvalid is a special round number that refers to an invalid round.
+	RoundInvalid uint64 = math.MaxUint64
 
 	// LogEventExecutionDiscrepancyDetected is a log event value that signals
 	// an execution discrepancy has been detected.
@@ -54,29 +60,50 @@ var (
 	// ErrProposerTimeoutNotAllowed is the error returned when proposer timeout is not allowed.
 	ErrProposerTimeoutNotAllowed = errors.New(ModuleName, 6, "roothash: proposer timeout not allowed")
 
+	// ErrMaxMessagesTooBig is the error returned when the MaxMessages parameter is set to a value
+	// larger than the MaxRuntimeMessages specified in consensus parameters.
+	ErrMaxMessagesTooBig = errors.New(ModuleName, 7, "roothash: max runtime messages is too big")
+
+	// ErrRuntimeDoesNotSlash is the error returned when misbehaviour evidence is submitted for a
+	// runtime that does not slash.
+	ErrRuntimeDoesNotSlash = errors.New(ModuleName, 8, "roothash: runtime does not slash")
+
+	// ErrDuplicateEvidence is the error returned when submitting already existing evidence.
+	ErrDuplicateEvidence = errors.New(ModuleName, 9, "roothash: duplicate evidence")
+
+	// ErrInvalidEvidence is the error return when an invalid evidence is submitted.
+	ErrInvalidEvidence = errors.New(ModuleName, 10, "roothash: invalid evidence")
+
 	// MethodExecutorCommit is the method name for executor commit submission.
 	MethodExecutorCommit = transaction.NewMethodName(ModuleName, "ExecutorCommit", ExecutorCommit{})
 
-	// MethodExecutorProposerTimeout is the method name for executor.
+	// MethodExecutorProposerTimeout is the method name for executor proposer timeout.
 	MethodExecutorProposerTimeout = transaction.NewMethodName(ModuleName, "ExecutorProposerTimeout", ExecutorProposerTimeoutRequest{})
+
+	// MethodEvidence is the method name for submitting evidence of node misbehavior.
+	MethodEvidence = transaction.NewMethodName(ModuleName, "Evidence", Evidence{})
 
 	// Methods is a list of all methods supported by the roothash backend.
 	Methods = []transaction.MethodName{
 		MethodExecutorCommit,
 		MethodExecutorProposerTimeout,
+		MethodEvidence,
 	}
 )
 
 // Backend is a root hash implementation.
 type Backend interface {
 	// GetGenesisBlock returns the genesis block.
-	GetGenesisBlock(ctx context.Context, runtimeID common.Namespace, height int64) (*block.Block, error)
+	GetGenesisBlock(ctx context.Context, request *RuntimeRequest) (*block.Block, error)
 
 	// GetLatestBlock returns the latest block.
 	//
 	// The metadata contained in this block can be further used to get
 	// the latest state from the storage backend.
-	GetLatestBlock(ctx context.Context, runtimeID common.Namespace, height int64) (*block.Block, error)
+	GetLatestBlock(ctx context.Context, request *RuntimeRequest) (*block.Block, error)
+
+	// GetRuntimeState returns the given runtime's state.
+	GetRuntimeState(ctx context.Context, request *RuntimeRequest) (*RuntimeState, error)
 
 	// WatchBlocks returns a channel that produces a stream of
 	// annotated blocks.
@@ -84,10 +111,10 @@ type Backend interface {
 	// The latest block if any will get pushed to the stream immediately.
 	// Subsequent blocks will be pushed into the stream as they are
 	// confirmed.
-	WatchBlocks(runtimeID common.Namespace) (<-chan *AnnotatedBlock, *pubsub.Subscription, error)
+	WatchBlocks(ctx context.Context, runtimeID common.Namespace) (<-chan *AnnotatedBlock, pubsub.ClosableSubscription, error)
 
 	// WatchEvents returns a stream of protocol events.
-	WatchEvents(runtimeID common.Namespace) (<-chan *Event, *pubsub.Subscription, error)
+	WatchEvents(ctx context.Context, runtimeID common.Namespace) (<-chan *Event, pubsub.ClosableSubscription, error)
 
 	// TrackRuntime adds a runtime the history of which should be tracked.
 	TrackRuntime(ctx context.Context, history BlockHistory) error
@@ -100,6 +127,12 @@ type Backend interface {
 
 	// Cleanup cleans up the roothash backend.
 	Cleanup()
+}
+
+// RuntimeRequest is a generic roothash get request for a specific runtime.
+type RuntimeRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Height    int64            `json:"height"`
 }
 
 // ExecutorCommit is the argument set for the ExecutorCommit method.
@@ -130,6 +163,168 @@ func NewRequestProposerTimeoutTx(nonce uint64, fee *transaction.Fee, runtimeID c
 	})
 }
 
+// EvidenceKind is the evidence kind.
+type EvidenceKind uint8
+
+const (
+	// EvidenceKindEquivocation is the evidence kind for equivocation.
+	EvidenceKindEquivocation = 1
+)
+
+// Evidence is an evidence of node misbehaviour.
+type Evidence struct {
+	ID common.Namespace `json:"id"`
+
+	EquivocationExecutor *EquivocationExecutorEvidence `json:"equivocation_executor,omitempty"`
+	EquivocationBatch    *EquivocationBatchEvidence    `json:"equivocation_batch,omitempty"`
+}
+
+// Hash computes the evidence hash.
+//
+// Hash is derived by hashing the evidence kind and the public key of the signer.
+// Assumes evidence has been validated.
+func (ev *Evidence) Hash() (hash.Hash, error) {
+	switch {
+	case ev.EquivocationBatch != nil:
+		return hash.NewFromBytes([]byte{EvidenceKindEquivocation}, ev.EquivocationBatch.BatchA.Signature.PublicKey[:]), nil
+	case ev.EquivocationExecutor != nil:
+		return hash.NewFromBytes([]byte{EvidenceKindEquivocation}, ev.EquivocationExecutor.CommitA.Signature.PublicKey[:]), nil
+	default:
+		return hash.Hash{}, fmt.Errorf("cannot compute hash, invalid evidence")
+	}
+}
+
+// ValidateBasic performs basic evidence validity checks.
+func (ev *Evidence) ValidateBasic() error {
+	switch {
+	case ev.EquivocationExecutor != nil && ev.EquivocationBatch != nil:
+		return fmt.Errorf("evidence has multiple fields set")
+	case ev.EquivocationExecutor != nil:
+		return ev.EquivocationExecutor.ValidateBasic(ev.ID)
+	case ev.EquivocationBatch != nil:
+		return ev.EquivocationBatch.ValidateBasic(ev.ID)
+	default:
+		return fmt.Errorf("evidence content has no fields set")
+	}
+}
+
+// EquivocationExecutorEvidence is evidence of executor commitment equivocation.
+type EquivocationExecutorEvidence struct {
+	CommitA commitment.ExecutorCommitment `json:"commit_a"`
+	CommitB commitment.ExecutorCommitment `json:"commit_b"`
+}
+
+// ValidateBasic performs stateless executor evidence validation checks.
+//
+// Particularly evidence is not verified to not be expired as this requires stateful checks.
+func (ev *EquivocationExecutorEvidence) ValidateBasic(id common.Namespace) error {
+	if ev.CommitA.Equal(&ev.CommitB) {
+		return fmt.Errorf("commits are equal, no sign of equivocation")
+	}
+
+	if !ev.CommitA.Signature.PublicKey.Equal(ev.CommitB.Signature.PublicKey) {
+		return fmt.Errorf("equivocation executor evidence signature public keys don't match")
+	}
+
+	a, err := ev.CommitA.Open(id)
+	if err != nil {
+		return fmt.Errorf("opening CommitA: %w", err)
+	}
+	b, err := ev.CommitB.Open(id)
+	if err != nil {
+		return fmt.Errorf("opening CommitB: %w", err)
+	}
+
+	if a.Body.Header.Round != b.Body.Header.Round {
+		return fmt.Errorf("equivocation evidence commit headers not for same round")
+	}
+
+	if err := a.Body.ValidateBasic(); err != nil {
+		return fmt.Errorf("equivocation evidence commit A not valid: %w", err)
+	}
+	if err := b.Body.ValidateBasic(); err != nil {
+		return fmt.Errorf("equivocation evidence commit B not valid: %w", err)
+	}
+
+	switch {
+	// Note: ValidBasics checks above ensure that none of these fields are nil.
+	case a.Body.Failure == commitment.FailureNone && b.Body.Failure == commitment.FailureNone:
+		if a.Body.Header.PreviousHash.Equal(&b.Body.Header.PreviousHash) &&
+			a.Body.Header.IORoot.Equal(b.Body.Header.IORoot) &&
+			a.Body.Header.StateRoot.Equal(b.Body.Header.StateRoot) &&
+			a.Body.Header.MessagesHash.Equal(b.Body.Header.MessagesHash) {
+			return fmt.Errorf("equivocation evidence commit headers match, no sign of equivocation")
+		}
+	default:
+		if a.Body.Failure == b.Body.Failure {
+			return fmt.Errorf("equivocation evidence failure indication fields match, no sign of equivocation")
+		}
+	}
+
+	return nil
+}
+
+// EquivocationBatchEvidence is evidence of executor proposed batch equivocation.
+type EquivocationBatchEvidence struct {
+	BatchA commitment.SignedProposedBatch `json:"batch_a"`
+	BatchB commitment.SignedProposedBatch `json:"batch_b"`
+}
+
+// ValidateBasic performs stateless batch evidence validation checks.
+//
+// Particularly evidence is not verified to not be expired as this requires stateful checks.
+func (ev *EquivocationBatchEvidence) ValidateBasic(id common.Namespace) error {
+	if ev.BatchA.Equal(&ev.BatchB) {
+		return fmt.Errorf("batches are equal, no sign of equivocation")
+	}
+
+	if !ev.BatchA.Signature.PublicKey.Equal(ev.BatchB.Signature.PublicKey) {
+		return fmt.Errorf("equivocation batch evidence signature public keys don't match")
+	}
+
+	var a, b commitment.ProposedBatch
+	if err := ev.BatchA.Open(&a, id); err != nil {
+		return fmt.Errorf("opening BatchA: %w", err)
+	}
+	if err := ev.BatchB.Open(&b, id); err != nil {
+		return fmt.Errorf("opening BatchB: %w", err)
+	}
+
+	if a.Header.Round != b.Header.Round {
+		return fmt.Errorf("equivocation evidence batch header rounds don't match")
+	}
+
+	if a.IORoot.Equal(&b.IORoot) && a.Header.MostlyEqual(&b.Header) {
+		return fmt.Errorf("equivocation evidence batch io roots match, no sign of equivocation")
+	}
+
+	return nil
+}
+
+// NewEvidenceTx creates a new evidence transaction.
+func NewEvidenceTx(nonce uint64, fee *transaction.Fee, evidence *Evidence) *transaction.Transaction {
+	return transaction.NewTransaction(nonce, fee, MethodEvidence, evidence)
+}
+
+// RuntimeState is the per-runtime state.
+type RuntimeState struct {
+	Runtime   *registry.Runtime `json:"runtime"`
+	Suspended bool              `json:"suspended,omitempty"`
+
+	GenesisBlock *block.Block `json:"genesis_block"`
+
+	CurrentBlock       *block.Block `json:"current_block"`
+	CurrentBlockHeight int64        `json:"current_block_height"`
+
+	// LastNormalRound is the runtime round which was normally processed by the runtime. This is
+	// also the round that contains the message results for the last processed runtime messages.
+	LastNormalRound uint64 `json:"last_normal_round"`
+	// LastNormalHeight is the consensus block height corresponding to LastNormalRound.
+	LastNormalHeight int64 `json:"last_normal_height"`
+
+	ExecutorPool *commitment.Pool `json:"executor_pool"`
+}
+
 // AnnotatedBlock is an annotated roothash block.
 type AnnotatedBlock struct {
 	// Height is the underlying roothash backend's block height that
@@ -154,7 +349,28 @@ type ExecutionDiscrepancyDetectedEvent struct {
 
 // FinalizedEvent is a finalized event.
 type FinalizedEvent struct {
+	// Round is the round that was finalized.
 	Round uint64 `json:"round"`
+
+	// GoodComputeNodes are the public keys of compute nodes that positively contributed to the
+	// round by replicating the computation correctly.
+	GoodComputeNodes []signature.PublicKey `json:"good_compute_nodes,omitempty"`
+
+	// BadComputeNodes are the public keys of compute nodes that negatively contributed to the round
+	// by causing discrepancies.
+	BadComputeNodes []signature.PublicKey `json:"bad_compute_nodes,omitempty"`
+}
+
+// MessageEvent is a runtime message processed event.
+type MessageEvent struct {
+	Module string `json:"module,omitempty"`
+	Code   uint32 `json:"code,omitempty"`
+	Index  uint32 `json:"index,omitempty"`
+}
+
+// IsSuccess returns true if the event indicates that the message was successfully processed.
+func (me *MessageEvent) IsSuccess() bool {
+	return me.Code == errors.CodeNoError
 }
 
 // Event is a roothash event.
@@ -166,7 +382,8 @@ type Event struct {
 
 	ExecutorCommitted            *ExecutorCommittedEvent            `json:"executor_committed,omitempty"`
 	ExecutionDiscrepancyDetected *ExecutionDiscrepancyDetectedEvent `json:"execution_discrepancy,omitempty"`
-	FinalizedEvent               *FinalizedEvent                    `json:"finalized,omitempty"`
+	Finalized                    *FinalizedEvent                    `json:"finalized,omitempty"`
+	Message                      *MessageEvent                      `json:"message,omitempty"`
 }
 
 // MetricsMonitorable is the interface exposed by backends capable of
@@ -179,13 +396,21 @@ type MetricsMonitorable interface {
 	WatchAllBlocks() (<-chan *block.Block, *pubsub.Subscription)
 }
 
+// GenesisRuntimeState contains state for runtimes that are restored in a genesis block.
+type GenesisRuntimeState struct {
+	registry.RuntimeGenesis
+
+	// MessageResults are the message results emitted at the last processed round.
+	MessageResults []*MessageEvent `json:"message_results,omitempty"`
+}
+
 // Genesis is the roothash genesis state.
 type Genesis struct {
 	// Parameters are the roothash consensus parameters.
 	Parameters ConsensusParameters `json:"params"`
 
-	// RuntimeStates is the per-runtime map of genesis blocks.
-	RuntimeStates map[common.Namespace]*api.RuntimeGenesis `json:"runtime_states,omitempty"`
+	// RuntimeStates are the runtime states at genesis.
+	RuntimeStates map[common.Namespace]*GenesisRuntimeState `json:"runtime_states,omitempty"`
 }
 
 // ConsensusParameters are the roothash consensus parameters.
@@ -200,6 +425,13 @@ type ConsensusParameters struct {
 	// DebugBypassStake is true iff the roothash should bypass all of the staking
 	// related checks and operations.
 	DebugBypassStake bool `json:"debug_bypass_stake,omitempty"`
+
+	// MaxRuntimeMessages is the maximum number of allowed messages that can be emitted by a runtime
+	// in a single round.
+	MaxRuntimeMessages uint32 `json:"max_runtime_messages"`
+
+	// MaxEvidenceAge is the maximum age of submitted evidence in the number of rounds.
+	MaxEvidenceAge uint64 `json:"max_evidence_age"`
 }
 
 const (
@@ -208,6 +440,9 @@ const (
 
 	// GasOpProposerTimeout is the gas operation identifier for executor propose timeout cost.
 	GasOpProposerTimeout transaction.Op = "proposer_timeout"
+
+	// GasOpEvidence is the gas operation identifier for evidence submission transaction cost.
+	GasOpEvidence transaction.Op = "evidence"
 )
 
 // XXX: Define reasonable default gas costs.
@@ -216,6 +451,7 @@ const (
 var DefaultGasCosts = transaction.Costs{
 	GasOpComputeCommit:   1000,
 	GasOpProposerTimeout: 1000,
+	GasOpEvidence:        1000,
 }
 
 // SanityCheckBlocks examines the blocks table.
@@ -242,6 +478,15 @@ func (g *Genesis) SanityCheck() error {
 		if err := rtg.SanityCheck(true); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// VerifyRuntimeParameters verifies whether the runtime parameters are valid in the context of the
+// roothash service.
+func VerifyRuntimeParameters(logger *logging.Logger, rt *registry.Runtime, params *ConsensusParameters) error {
+	if rt.Executor.MaxMessages > params.MaxRuntimeMessages {
+		return ErrMaxMessagesTooBig
 	}
 	return nil
 }

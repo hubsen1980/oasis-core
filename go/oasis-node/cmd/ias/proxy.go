@@ -3,6 +3,7 @@ package ias
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,7 +37,6 @@ const (
 	cfgQuoteSigType  = "ias.quote.signature_type"
 	cfgDebugMock     = "ias.debug.mock"
 	cfgDebugSkipAuth = "ias.debug.skip_auth"
-	cfgUseGenesis    = "ias.use_genesis"
 	cfgWaitRuntimes  = "ias.wait_runtimes"
 
 	tlsKeyFilename  = "ias_proxy.pem"
@@ -107,6 +107,10 @@ func doProxy(cmd *cobra.Command, args []string) {
 		)
 		return
 	}
+
+	logger.Info("loaded/generated IAS TLS certificate",
+		"public_key", cert.PrivateKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey),
+	)
 
 	endpoint, err := iasEndpointFromFlags()
 	if err != nil {
@@ -231,9 +235,6 @@ func grpcAuthenticatorFromFlags(ctx context.Context, cmd *cobra.Command) (iasPro
 		logger.Warn("IAS gRPC authentication disabled, proxy is open")
 		return nil, nil
 	}
-	if viper.GetBool(cfgUseGenesis) {
-		return newGenesisAuthenticator()
-	}
 
 	return newRegistryAuthenticator(ctx, cmd)
 }
@@ -253,7 +254,6 @@ func init() {
 	proxyFlags.Bool(cfgIsProduction, false, "use the production IAS endpoint")
 	proxyFlags.Bool(cfgDebugMock, false, "generate mock IAS AVR responses (UNSAFE)")
 	proxyFlags.Bool(cfgDebugSkipAuth, false, "disable proxy authentication (UNSAFE)")
-	proxyFlags.Bool(cfgUseGenesis, false, "use a genesis document instead of the registry")
 	proxyFlags.Int(cfgWaitRuntimes, 0, "wait for N runtimes to be registered before servicing requests")
 
 	_ = proxyFlags.MarkHidden(cfgDebugMock)

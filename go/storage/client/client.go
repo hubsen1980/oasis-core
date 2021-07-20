@@ -1,5 +1,5 @@
 // Package client implements a client for Oasis storage nodes.
-// The client obtains storage info by following scheduler committees.
+// The client connects to nodes as directed by the node watcher.
 package client
 
 import (
@@ -18,10 +18,11 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/mathrand"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
-	"github.com/oasisprotocol/oasis-core/go/runtime/committee"
+	"github.com/oasisprotocol/oasis-core/go/runtime/nodes/grpc"
 	"github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
@@ -39,22 +40,40 @@ const (
 	maxRetries    = 15
 )
 
+// Option is a storage client option.
+type Option func(b *storageClientBackend)
+
+// WithBackendOverride overrides the storage backend for the specified node. The passed backend is
+// used instead of the gRPC backend when performing storage requests.
+func WithBackendOverride(nodeID signature.PublicKey, backend api.Backend) Option {
+	return func(b *storageClientBackend) {
+		if b.backendOverrides == nil {
+			b.backendOverrides = make(map[signature.PublicKey]api.Backend)
+		}
+
+		b.backendOverrides[nodeID] = backend
+	}
+}
+
 // storageClientBackend contains all information about the client storage API
-// backend, including the backend state and the connected storage committee
-// nodes' state.
+// backend, including the backend state and the connected storage nodes' state.
 type storageClientBackend struct {
 	ctx context.Context
 
 	logger *logging.Logger
 
-	committeeClient committee.Client
-	runtime         registry.RuntimeDescriptorProvider
+	nodesClient grpc.NodesClient
+	runtime     registry.RuntimeDescriptorProvider
+
+	// backendOverrides is a map of per-node storage backend overrides. This map can only be mutated
+	// during initialization via options so no lock is needed.
+	backendOverrides map[signature.PublicKey]api.Backend
 }
 
 // Implements api.StorageClient.
 func (b *storageClientBackend) GetConnectedNodes() []*node.Node {
 	var nodes []*node.Node
-	for _, conn := range b.committeeClient.GetConnectionsWithMeta() {
+	for _, conn := range b.nodesClient.GetConnectionsWithMeta() {
 		nodes = append(nodes, conn.Node)
 	}
 	return nodes
@@ -62,7 +81,7 @@ func (b *storageClientBackend) GetConnectedNodes() []*node.Node {
 
 // Implements api.StorageClient.
 func (b *storageClientBackend) EnsureCommitteeVersion(ctx context.Context, version int64) error {
-	return b.committeeClient.EnsureVersion(ctx, version)
+	return b.nodesClient.EnsureVersion(ctx, version)
 }
 
 type grpcResponse struct {
@@ -72,14 +91,15 @@ type grpcResponse struct {
 	node *node.Node
 }
 
-func (b *storageClientBackend) writeWithClient(
+func (b *storageClientBackend) writeWithClient( // nolint: gocyclo
 	ctx context.Context,
 	ns common.Namespace,
 	round uint64,
 	fn func(context.Context, api.Backend, *node.Node) (interface{}, error),
+	expectedNewRootTypes []api.RootType,
 	expectedNewRoots []hash.Hash,
 ) ([]*api.Receipt, error) {
-	conns := b.committeeClient.GetConnectionsWithMeta()
+	conns := b.nodesClient.GetConnectionsWithMeta()
 	n := len(conns)
 	if n == 0 {
 		b.logger.Error("writeWithClient: no connected nodes for runtime",
@@ -89,11 +109,11 @@ func (b *storageClientBackend) writeWithClient(
 	}
 
 	// Determine the minimum replication factor. In case we don't have a runtime descriptor provider
-	// we make the safe choice of assuming that the replication factor is the same as the size of
-	// the storage committee.
+	// we make the safe choice of assuming that the replication factor is the same as the number of
+	// connected nodes.
 	minWriteReplication := n
 	if b.runtime != nil {
-		rt, err := b.runtime.RegistryDescriptor(ctx)
+		rt, err := b.runtime.ActiveDescriptor(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch registry descriptor: %w", err)
 		}
@@ -104,12 +124,32 @@ func (b *storageClientBackend) writeWithClient(
 	// Use a buffered channel to allow all "write" goroutines to return as soon
 	// as they are finished.
 	ch := make(chan *grpcResponse, n)
+	connCount := 0
 	for _, conn := range conns {
-		go func(conn *committee.ClientConnWithMeta) {
+		if api.IsNodeBlacklistedInContext(ctx, conn.Node) {
+			continue
+		}
+		connCount++
+		go func(conn *grpc.ConnWithNodeMeta) {
 			var resp interface{}
 			op := func() error {
+				// If a backend override is configured, use it instead of going through gRPC.
+				var backend api.Backend
+				if override, ok := b.backendOverrides[conn.Node.ID]; ok {
+					backend = override
+				} else {
+					backend = api.NewStorageClient(conn.ClientConn)
+				}
+
 				var rerr error
-				resp, rerr = fn(ctx, api.NewStorageClient(conn.ClientConn), conn.Node)
+				resp, rerr = fn(ctx, backend, conn.Node)
+				if rerr != nil {
+					b.logger.Debug("storage write request error",
+						"err", rerr,
+						"node", conn.Node,
+						"status_code", status.Code(rerr),
+					)
+				}
 				switch {
 				case status.Code(rerr) == codes.Unavailable:
 					// Storage node may be temporarily unavailable.
@@ -140,8 +180,8 @@ func (b *storageClientBackend) writeWithClient(
 	}
 
 	// Accumulate the responses.
-	receipts := make([]*api.Receipt, 0, n)
-	for i := 0; i < n; i++ {
+	receipts := make([]*api.Receipt, 0, connCount)
+	for i := 0; i < connCount; i++ {
 		var response *grpcResponse
 		select {
 		case <-ctx.Done():
@@ -206,11 +246,11 @@ func (b *storageClientBackend) writeWithClient(
 			equal = false
 		}
 		if expectedNewRoots != nil {
-			if len(receiptBody.Roots) != len(expectedNewRoots) {
+			if len(receiptBody.Roots) != len(expectedNewRoots) || len(receiptBody.RootTypes) != len(expectedNewRootTypes) {
 				equal = false
 			} else {
 				for i := range receiptBody.Roots {
-					if receiptBody.Roots[i] != expectedNewRoots[i] {
+					if receiptBody.Roots[i] != expectedNewRoots[i] || receiptBody.RootTypes[i] != expectedNewRootTypes[i] {
 						equal = false
 						break
 					}
@@ -220,7 +260,9 @@ func (b *storageClientBackend) writeWithClient(
 		if !equal {
 			b.logger.Error("obtained root(s) don't equal the expected new root(s)",
 				"node", response.node,
+				"obtainedRootTypes", receiptBody.RootTypes,
 				"obtainedRoots", receiptBody.Roots,
+				"expectedNewRootTypes", expectedNewRootTypes,
 				"expectedNewRoots", expectedNewRoots,
 			)
 			continue
@@ -262,14 +304,17 @@ func (b *storageClientBackend) Apply(ctx context.Context, request *api.ApplyRequ
 		func(ctx context.Context, c api.Backend, node *node.Node) (interface{}, error) {
 			return c.Apply(ctx, request)
 		},
+		[]api.RootType{request.RootType},
 		[]hash.Hash{request.DstRoot},
 	)
 }
 
 func (b *storageClientBackend) ApplyBatch(ctx context.Context, request *api.ApplyBatchRequest) ([]*api.Receipt, error) {
 	expectedNewRoots := make([]hash.Hash, 0, len(request.Ops))
+	expectedNewRootTypes := make([]api.RootType, 0, len(request.Ops))
 	for _, op := range request.Ops {
 		expectedNewRoots = append(expectedNewRoots, op.DstRoot)
+		expectedNewRootTypes = append(expectedNewRootTypes, op.RootType)
 	}
 
 	return b.writeWithClient(
@@ -279,6 +324,7 @@ func (b *storageClientBackend) ApplyBatch(ctx context.Context, request *api.Appl
 		func(ctx context.Context, c api.Backend, node *node.Node) (interface{}, error) {
 			return c.ApplyBatch(ctx, request)
 		},
+		expectedNewRootTypes,
 		expectedNewRoots,
 	)
 }
@@ -290,7 +336,7 @@ func (b *storageClientBackend) readWithClient(
 ) (interface{}, error) {
 	var resp interface{}
 	op := func() error {
-		conns := b.committeeClient.GetConnectionsMap()
+		conns := b.nodesClient.GetConnectionsMap()
 		if len(conns) == 0 {
 			b.logger.Error("readWithClient: no connected nodes for runtime",
 				"runtime_id", ns,
@@ -298,21 +344,26 @@ func (b *storageClientBackend) readWithClient(
 			return ErrStorageNotAvailable
 		}
 
-		var nodes []*committee.ClientConnWithMeta
+		var nodes []*grpc.ConnWithNodeMeta
 		// If a storage node priority hint is set, prioritize overlapping nodes.
 		for _, nodeID := range api.NodePriorityHintFromContext(ctx) {
 			c, ok := conns[nodeID]
 			if !ok {
 				continue
 			}
-			nodes = append(nodes, c)
+			if !api.IsNodeBlacklistedInContext(ctx, c.Node) {
+				nodes = append(nodes, c)
+			}
 			delete(conns, nodeID)
 		}
 		prioritySlots := len(nodes)
 		// Then add the rest of the nodes in random order.
 		for _, c := range conns {
-			nodes = append(nodes, c)
+			if !api.IsNodeBlacklistedInContext(ctx, c.Node) {
+				nodes = append(nodes, c)
+			}
 		}
+
 		// TODO: Use a more clever approach to choose the order in which to read
 		// from the connected nodes:
 		// https://github.com/oasisprotocol/oasis-core/issues/1815.
@@ -324,7 +375,15 @@ func (b *storageClientBackend) readWithClient(
 
 		var err error
 		for _, conn := range nodes {
-			resp, err = fn(ctx, api.NewStorageClient(conn.ClientConn))
+			// If a backend override is configured, use it instead of going through gRPC.
+			var backend api.Backend
+			if override, ok := b.backendOverrides[conn.Node.ID]; ok {
+				backend = override
+			} else {
+				backend = api.NewStorageClient(conn.ClientConn)
+			}
+
+			resp, err = fn(ctx, backend)
 			if ctx.Err() != nil {
 				return backoff.Permanent(ctx.Err())
 			}
@@ -335,6 +394,10 @@ func (b *storageClientBackend) readWithClient(
 					"runtime_id", ns,
 				)
 				continue
+			}
+			cb := api.NodeSelectionCallbackFromContext(ctx)
+			if cb != nil {
+				cb(conn.Node)
 			}
 			return nil
 		}
@@ -431,5 +494,5 @@ func (b *storageClientBackend) Cleanup() {
 }
 
 func (b *storageClientBackend) Initialized() <-chan struct{} {
-	return b.committeeClient.Initialized()
+	return b.nodesClient.Initialized()
 }

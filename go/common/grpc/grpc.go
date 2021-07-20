@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/prometheus/client_golang/prometheus"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -36,6 +34,8 @@ const (
 
 	maxRecvMsgSize = 104857600 // 100 MiB
 	maxSendMsgSize = 104857600 // 100 MiB
+
+	gracefulStopWaitPeriod = 5 * time.Second
 )
 
 var (
@@ -506,7 +506,19 @@ func (s *Server) Stop() {
 			}
 		default:
 		}
-		s.server.GracefulStop() // Repeated calls are ok.
+
+		// Attempt to stop gracefully, but if that doesn't work, stop forcibly.
+		gracefulCh := make(chan struct{})
+		go func() {
+			s.server.GracefulStop()
+			close(gracefulCh)
+		}()
+		select {
+		case <-gracefulCh:
+		case <-time.After(gracefulStopWaitPeriod):
+			s.Logger.Warn("graceful stop failed, forcing stop")
+			s.server.Stop()
+		}
 		s.server = nil
 	}
 }
@@ -591,13 +603,11 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	var wrapper *grpcWrapper
 	unaryInterceptors := []grpc.UnaryServerInterceptor{
 		logAdapter.unaryLogger,
-		grpc_opentracing.UnaryServerInterceptor(),
 		serverUnaryErrorMapper,
 		auth.UnaryServerInterceptor(config.AuthFunc),
 	}
 	streamInterceptors := []grpc.StreamServerInterceptor{
 		logAdapter.streamLogger,
-		grpc_opentracing.StreamServerInterceptor(),
 		serverStreamErrorMapper,
 		auth.StreamServerInterceptor(config.AuthFunc),
 	}
@@ -607,12 +617,12 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		streamInterceptors = append(streamInterceptors, wrapper.streamInterceptor)
 	}
 	sOpts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unaryInterceptors...)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(streamInterceptors...)),
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(streamInterceptors...),
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.MaxSendMsgSize(maxSendMsgSize),
 		grpc.KeepaliveParams(serverKeepAliveParams),
-		grpc.CustomCodec(&CBORCodec{}), // nolint: staticcheck
+		grpc.ForceServerCodec(&CBORCodec{}),
 	}
 	if config.Identity != nil && config.Identity.GetTLSCertificate() != nil {
 		tlsConfig := &tls.Config{

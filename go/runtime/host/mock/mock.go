@@ -6,7 +6,9 @@ import (
 	"fmt"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
@@ -51,6 +53,7 @@ func (r *runtime) Call(ctx context.Context, body *protocol.Body) (*protocol.Body
 		emptyRoot := mkvsNode.Root{
 			Namespace: rq.Block.Header.Namespace,
 			Version:   rq.Block.Header.Round + 1,
+			Type:      mkvsNode.RootTypeIO,
 		}
 		emptyRoot.Hash.Empty()
 
@@ -71,8 +74,9 @@ func (r *runtime) Call(ctx context.Context, body *protocol.Body) (*protocol.Body
 			return nil, fmt.Errorf("(mock) failed to create I/O tree: %w", err)
 		}
 
-		var stateRoot hash.Hash
+		var stateRoot, msgsHash hash.Hash
 		stateRoot.Empty()
+		msgsHash.Empty()
 
 		return &protocol.Body{RuntimeExecuteTxBatchResponse: &protocol.RuntimeExecuteTxBatchResponse{
 			Batch: protocol.ComputedBatch{
@@ -81,11 +85,41 @@ func (r *runtime) Call(ctx context.Context, body *protocol.Body) (*protocol.Body
 					PreviousHash: rq.Block.Header.EncodedHash(),
 					IORoot:       &ioRoot,
 					StateRoot:    &stateRoot,
+					MessagesHash: &msgsHash,
 				},
 				IOWriteLog: ioWriteLog,
 			},
 			// No RakSig in mock response.
 		}}, nil
+	case body.RuntimeCheckTxBatchRequest != nil:
+		rq := body.RuntimeCheckTxBatchRequest
+
+		var results []protocol.CheckTxResult
+		for range rq.Inputs {
+			results = append(results, protocol.CheckTxResult{
+				Error: protocol.Error{
+					Code: errors.CodeNoError,
+				},
+			})
+		}
+
+		return &protocol.Body{RuntimeCheckTxBatchResponse: &protocol.RuntimeCheckTxBatchResponse{
+			Results: results,
+		}}, nil
+	case body.RuntimeQueryRequest != nil:
+		rq := body.RuntimeQueryRequest
+
+		switch rq.Method {
+		// Handle Batch Weight Limits request.
+		case protocol.MethodQueryBatchWeightLimits:
+			return &protocol.Body{RuntimeQueryResponse: &protocol.RuntimeQueryResponse{
+				Data: cbor.Marshal(map[transaction.Weight]uint64{}),
+			}}, nil
+		default:
+			return &protocol.Body{RuntimeQueryResponse: &protocol.RuntimeQueryResponse{
+				Data: cbor.Marshal(rq.Method + " world"),
+			}}, nil
+		}
 	default:
 		return nil, fmt.Errorf("(mock) method not supported")
 	}

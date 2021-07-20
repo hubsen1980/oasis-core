@@ -36,6 +36,7 @@ docker_plugin_default_config: &docker_plugin_default_config
     - "LANG=C.UTF-8"
     - "CARGO_TARGET_DIR=/var/tmp/artifacts"
     - "CARGO_INSTALL_ROOT=/root/.cargo"
+    - "CARGO_INCREMENTAL=0"
     - "GOPROXY=https://proxy.golang.org/"
   propagate-environment: true
   unconfined: true
@@ -52,6 +53,7 @@ docker_plugin_sgx_config: &docker_plugin_sgx_config
     - "LANG=C.UTF-8"
     - "CARGO_TARGET_DIR=/var/tmp/artifacts"
     - "CARGO_INSTALL_ROOT=/root/.cargo"
+    - "CARGO_INCREMENTAL=0"
     - "GOPROXY=https://proxy.golang.org/"
 
 docker_plugin: &docker_plugin
@@ -68,6 +70,18 @@ retry: &retry_agent_failure
       limit: 2
 
 steps:
+  # Require explicit confirmation for some PRs to avoid CI spam.
+  - block: Confirm CI run
+    prompt: Run CI for this pull request?
+    blocked_state: running
+    if: |
+      build.pull_request.id != null &&
+      !(build.pull_request.labels includes "s:ready-ci") &&
+      (
+        build.pull_request.draft ||
+        !(build.creator.teams includes "everyone")
+      )
+
   ###########
   # Lint jobs
   ###########
@@ -115,19 +129,10 @@ steps:
   - label: Build Rust runtime loader
     command:
       - .buildkite/rust/build_generic.sh /workdir -p oasis-core-runtime-loader
-      - .buildkite/rust/build_generic.sh /workdir -p test-long-term-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-enc-client
-      - .buildkite/rust/build_generic.sh /workdir -p simple-keyvalue-ops-client
 
       # Upload the built artifacts.
       - cd /var/tmp/artifacts/default/debug
       - buildkite-agent artifact upload oasis-core-runtime-loader
-      # Clients for E2E tests.
-      - buildkite-agent artifact upload test-long-term-client
-      - buildkite-agent artifact upload simple-keyvalue-client
-      - buildkite-agent artifact upload simple-keyvalue-enc-client
-      - buildkite-agent artifact upload simple-keyvalue-ops-client
     retry:
       <<: *retry_agent_failure
     plugins:
@@ -184,7 +189,6 @@ steps:
       # TODO: Consider making this a part of the development Docker image.
       - go get -u github.com/dvyukov/go-fuzz/go-fuzz github.com/dvyukov/go-fuzz/go-fuzz-build
       - make -C go build-fuzz
-    soft_fail: true
     retry:
       <<: *retry_agent_failure
     plugins:
@@ -197,9 +201,7 @@ steps:
     command:
       - .buildkite/go/test_and_coverage.sh
     artifact_paths:
-      - coverage-misc.txt
-      - coverage-oasis-node.txt
-      - coverage-mkvs.txt
+      - coverage-*.txt
       - /tmp/oasis-node-test_*/test-node.log
     retry:
       <<: *retry_agent_failure
@@ -211,7 +213,7 @@ steps:
   ###############
   - label: E2E tests
     parallelism: 7
-    timeout_in_minutes: 15
+    timeout_in_minutes: 32
     command:
       - .buildkite/scripts/download_e2e_test_artifacts.sh
       - .buildkite/scripts/test_e2e.sh
@@ -231,19 +233,18 @@ steps:
   ###########################
   # E2E test jobs - intel-sgx
   ###########################
-  - label: E2E tests - intel-sgx
-    parallelism: 5
-    timeout_in_minutes: 21
+  - label: E2E tests - intel-sgx (basic)
+    branches: "!master !stable/*"
+    timeout_in_minutes: 40
     command:
       - .buildkite/scripts/download_e2e_test_artifacts.sh
       # Only run runtime scenarios as others do not use SGX.
-      - .buildkite/scripts/test_e2e.sh --scenario e2e/runtime/.*
+      - .buildkite/scripts/test_e2e.sh --scenario e2e/runtime/runtime
     artifact_paths:
       - coverage-merged-e2e-*.txt
       - /tmp/e2e/**/*.log
     env:
       OASIS_E2E_COVERAGE: enable
-      OASIS_EXCLUDE_E2E: e2e/runtime/txsource-multi
       TEST_BASE_DIR: /tmp
       # libp2p logging.
       IPFS_LOGGING: debug
@@ -254,11 +255,36 @@ steps:
     plugins:
       <<: *docker_plugin_sgx
 
-  ###############################
-  # E2E test - intel-sgx with IAS
-  ###############################
+  - label: E2E tests - intel-sgx (full)
+    branches: master stable/*
+    parallelism: 5
+    timeout_in_minutes: 40
+    command:
+      - .buildkite/scripts/download_e2e_test_artifacts.sh
+      # Only run runtime scenarios as others do not use SGX.
+      - .buildkite/scripts/test_e2e.sh --scenario e2e/runtime/.*
+    artifact_paths:
+      - coverage-merged-e2e-*.txt
+      - /tmp/e2e/**/*.log
+    env:
+      OASIS_E2E_COVERAGE: enable
+      OASIS_EXCLUDE_E2E: e2e/runtime/txsource-multi,e2e/runtime/txsource-multi-short
+      TEST_BASE_DIR: /tmp
+      # libp2p logging.
+      IPFS_LOGGING: debug
+    agents:
+      queue: intel-sgx
+    retry:
+      <<: *retry_agent_failure
+    plugins:
+      <<: *docker_plugin_sgx
+
+  ################################################
+  # E2E test - intel-sgx with IAS (only on master)
+  ################################################
   - label: E2E tests - intel-sgx - IAS
-    timeout_in_minutes: 10
+    branches: master stable/*
+    timeout_in_minutes: 15
     command:
       - .buildkite/scripts/sgx_ias_tests.sh
     # A unique string to identify the step. The value is available in the
@@ -280,30 +306,12 @@ steps:
     plugins:
       <<: *docker_plugin_sgx
 
-  ###############
-  # Consensus simulator tests
-  ###############
-  - label: Consensus simulator tests
-    timeout_in_minutes: 3
-    command:
-      - .buildkite/scripts/download_e2e_test_artifacts.sh
-      - .buildkite/scripts/test_consim.sh
-    artifact_paths:
-      - /tmp/consim-datadir/*.json
-      - /tmp/consim-datadir/consim.log
-    env:
-      TEST_BASE_DIR: /tmp
-    retry:
-      <<: *retry_agent_failure
-    plugins:
-      <<: *docker_plugin
-
   ####################################
   # Rust coverage job (only on master)
   ####################################
 
   - label: Coverage Rust crates
-    branches: master
+    branches: master stable/*
     command:
       # Build storage interoperability test helpers first.
       - make build-helpers

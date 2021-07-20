@@ -3,7 +3,7 @@ package upgrade
 import (
 	"context"
 
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
 
@@ -15,7 +15,15 @@ func (u *dummyUpgradeManager) SubmitDescriptor(ctx context.Context, descriptor *
 	return nil
 }
 
-func (u *dummyUpgradeManager) CancelUpgrade(ctx context.Context) error {
+func (u *dummyUpgradeManager) PendingUpgrades(ctx context.Context) ([]*api.PendingUpgrade, error) {
+	return nil, nil
+}
+
+func (u *dummyUpgradeManager) HasPendingUpgradeAt(ctx context.Context, height int64) (bool, error) {
+	return false, nil
+}
+
+func (u *dummyUpgradeManager) CancelUpgrade(ctx context.Context, descriptor *api.Descriptor) error {
 	return nil
 }
 
@@ -23,7 +31,7 @@ func (u *dummyUpgradeManager) StartupUpgrade() error {
 	return nil
 }
 
-func (u *dummyUpgradeManager) ConsensusUpgrade(privateCtx interface{}, currentEpoch epochtime.EpochTime, currentHeight int64) error {
+func (u *dummyUpgradeManager) ConsensusUpgrade(privateCtx interface{}, currentEpoch beacon.EpochTime, currentHeight int64) error {
 	return nil
 }
 

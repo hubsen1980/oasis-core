@@ -3,14 +3,16 @@ package supplementarysanity
 import (
 	"fmt"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	abciAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
+	governanceState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/governance/state"
 	keymanagerState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/keymanager/state"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
 	roothashState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash/state"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
@@ -18,8 +20,8 @@ import (
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-func checkEpochTime(ctx *abciAPI.Context, now epochtime.EpochTime) error {
-	if now == epochtime.EpochInvalid {
+func checkEpochTime(ctx *abciAPI.Context, now beacon.EpochTime) error {
+	if now == beacon.EpochInvalid {
 		return fmt.Errorf("current epoch is invalid")
 	}
 
@@ -27,7 +29,7 @@ func checkEpochTime(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	return nil
 }
 
-func checkRegistry(ctx *abciAPI.Context, now epochtime.EpochTime) error {
+func checkRegistry(ctx *abciAPI.Context, now beacon.EpochTime) error {
 	st := registryState.NewMutableState(ctx.State())
 
 	params, err := st.ConsensusParameters(ctx)
@@ -46,16 +48,16 @@ func checkRegistry(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	}
 
 	// Check runtimes.
-	signedRuntimes, err := st.SignedRuntimes(ctx)
+	runtimes, err := st.Runtimes(ctx)
 	if err != nil {
-		return fmt.Errorf("AllSignedRuntimes: %w", err)
+		return fmt.Errorf("Runtimes: %w", err)
 	}
 	suspendedRuntimes, err := st.SuspendedRuntimes(ctx)
 	if err != nil {
 		return fmt.Errorf("SuspendedRuntimes: %w", err)
 	}
 
-	runtimeLookup, err := registry.SanityCheckRuntimes(logger, params, signedRuntimes, suspendedRuntimes, false)
+	runtimeLookup, err := registry.SanityCheckRuntimes(logger, params, runtimes, suspendedRuntimes, false)
 	if err != nil {
 		return fmt.Errorf("SanityCheckRuntimes: %w", err)
 	}
@@ -65,7 +67,7 @@ func checkRegistry(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	if err != nil {
 		return fmt.Errorf("SignedNodes: %w", err)
 	}
-	_, err = registry.SanityCheckNodes(logger, params, signedNodes, seenEntities, runtimeLookup, false, now)
+	_, err = registry.SanityCheckNodes(logger, params, signedNodes, seenEntities, runtimeLookup, false, now, ctx.Now())
 	if err != nil {
 		return fmt.Errorf("SanityCheckNodes: %w", err)
 	}
@@ -73,7 +75,7 @@ func checkRegistry(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	return nil
 }
 
-func checkRootHash(ctx *abciAPI.Context, now epochtime.EpochTime) error {
+func checkRootHash(ctx *abciAPI.Context, now beacon.EpochTime) error {
 	st := roothashState.NewMutableState(ctx.State())
 
 	// Check blocks.
@@ -83,7 +85,7 @@ func checkRootHash(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	}
 
 	blocks := make(map[common.Namespace]*block.Block)
-	runtimesByID := make(map[common.Namespace]*roothashState.RuntimeState)
+	runtimesByID := make(map[common.Namespace]*roothash.RuntimeState)
 	for _, rt := range runtimes {
 		blocks[rt.Runtime.ID] = rt.CurrentBlock
 		runtimesByID[rt.Runtime.ID] = rt
@@ -112,7 +114,7 @@ func checkRootHash(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	return nil
 }
 
-func checkStaking(ctx *abciAPI.Context, now epochtime.EpochTime) error {
+func checkStaking(ctx *abciAPI.Context, now beacon.EpochTime) error {
 	st := stakingState.NewMutableState(ctx.State())
 
 	parameters, err := st.ConsensusParameters(ctx)
@@ -163,12 +165,21 @@ func checkStaking(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 		return fmt.Errorf("common pool %v is invalid", commonPool)
 	}
 
+	governanceDeposits, err := st.GovernanceDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("GovernanceDeposits: %w", err)
+	}
+	if !governanceDeposits.IsValid() {
+		return fmt.Errorf("governance deposits %v is invalid", governanceDeposits)
+	}
+
+	_ = total.Add(governanceDeposits)
 	_ = total.Add(commonPool)
 	_ = total.Add(totalFees)
 	if total.Cmp(totalSupply) != 0 {
 		return fmt.Errorf(
-			"balances in accounts plus common pool (%s) plus last block fees (%s) does not add up to total supply (%s)",
-			total.String(), totalFees.String(), totalSupply.String(),
+			"balances in accounts plus governance deposits (%s), plus common pool (%s), plus last block fees (%s), does not add up to total supply (%s)",
+			governanceDeposits.String(), commonPool.String(), totalFees.String(), totalSupply.String(),
 		)
 	}
 
@@ -219,7 +230,7 @@ func checkStaking(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	return nil
 }
 
-func checkKeyManager(ctx *abciAPI.Context, now epochtime.EpochTime) error {
+func checkKeyManager(ctx *abciAPI.Context, now beacon.EpochTime) error {
 	st := keymanagerState.NewMutableState(ctx.State())
 
 	statuses, err := st.Statuses(ctx)
@@ -234,27 +245,77 @@ func checkKeyManager(ctx *abciAPI.Context, now epochtime.EpochTime) error {
 	return nil
 }
 
-func checkScheduler(*abciAPI.Context, epochtime.EpochTime) error {
+func checkGovernance(ctx *abciAPI.Context, epoch beacon.EpochTime) error {
+	st := governanceState.NewMutableState(ctx.State())
+	stakingState := stakingState.NewMutableState(ctx.State())
+	govDeposits, err := stakingState.GovernanceDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("GovernanceDeposits: %w", err)
+	}
+
+	params, err := st.ConsensusParameters(ctx)
+	if err != nil {
+		return fmt.Errorf("ConsensusParameters: %w", err)
+	}
+	err = params.SanityCheck()
+	if err != nil {
+		return fmt.Errorf("SanityCheck ConsensusParameters: %w", err)
+	}
+	// Sanity check proposals.
+	proposals, err := st.Proposals(ctx)
+	if err != nil {
+		return fmt.Errorf("Proposals: %w", err)
+	}
+	err = governance.SanityCheckProposals(proposals, epoch, govDeposits)
+	if err != nil {
+		return fmt.Errorf("SanityCheck Proposals: %w", err)
+	}
+	// Sanity check votes.
+	for _, p := range proposals {
+		var votes []*governance.VoteEntry
+		votes, err = st.Votes(ctx, p.ID)
+		if err != nil {
+			return fmt.Errorf("Votes: %w", err)
+		}
+		err = governance.SanityCheckVotes(p, votes)
+		if err != nil {
+			return fmt.Errorf("SanityCheck Votes: %w", err)
+		}
+	}
+	// Sanity check pending upgrades.
+	pendingUpgrades, err := st.PendingUpgrades(ctx)
+	if err != nil {
+		return fmt.Errorf("PendingUpgrades: %w", err)
+	}
+	err = governance.SanityCheckPendingUpgrades(pendingUpgrades, epoch, params)
+	if err != nil {
+		return fmt.Errorf("SanityCheck PendingUpgrades: %w", err)
+	}
+
+	return nil
+}
+
+func checkScheduler(*abciAPI.Context, beacon.EpochTime) error {
 	// nothing to check yet
 	return nil
 }
 
-func checkBeacon(*abciAPI.Context, epochtime.EpochTime) error {
+func checkBeacon(*abciAPI.Context, beacon.EpochTime) error {
 	// nothing to check yet
 	return nil
 }
 
-func checkConsensus(*abciAPI.Context, epochtime.EpochTime) error {
+func checkConsensus(*abciAPI.Context, beacon.EpochTime) error {
 	// nothing to check yet
 	return nil
 }
 
-func checkHalt(*abciAPI.Context, epochtime.EpochTime) error {
+func checkHalt(*abciAPI.Context, beacon.EpochTime) error {
 	// nothing to check yet
 	return nil
 }
 
-func checkStakeClaims(ctx *abciAPI.Context, now epochtime.EpochTime) error {
+func checkStakeClaims(ctx *abciAPI.Context, now beacon.EpochTime) error {
 	regSt := registryState.NewMutableState(ctx.State())
 	stakingSt := stakingState.NewMutableState(ctx.State())
 

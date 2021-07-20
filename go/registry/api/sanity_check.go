@@ -5,20 +5,22 @@ import (
 	"fmt"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/pvss"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
 // SanityCheck does basic sanity checking on the genesis state.
 func (g *Genesis) SanityCheck(
-	baseEpoch epochtime.EpochTime,
+	now time.Time,
+	baseEpoch beacon.EpochTime,
 	stakeLedger map[staking.Address]*staking.Account,
 	stakeThresholds map[staking.ThresholdKind]quantity.Quantity,
 	publicKeyBlacklist map[signature.PublicKey]bool,
@@ -26,7 +28,7 @@ func (g *Genesis) SanityCheck(
 	logger := logging.GetLogger("genesis/sanity-check")
 
 	if !flags.DebugDontBlameOasis() {
-		if g.Parameters.DebugAllowUnroutableAddresses || g.Parameters.DebugBypassStake || g.Parameters.DebugAllowEntitySignedNodeRegistration {
+		if g.Parameters.DebugAllowUnroutableAddresses || g.Parameters.DebugBypassStake {
 			return fmt.Errorf("registry: sanity check failed: one or more unsafe debug flags set")
 		}
 		if g.Parameters.MaxNodeExpiration == 0 {
@@ -47,7 +49,7 @@ func (g *Genesis) SanityCheck(
 	}
 
 	// Check nodes.
-	nodeLookup, err := SanityCheckNodes(logger, &g.Parameters, g.Nodes, seenEntities, runtimesLookup, true, baseEpoch)
+	nodeLookup, err := SanityCheckNodes(logger, &g.Parameters, g.Nodes, seenEntities, runtimesLookup, true, baseEpoch, now)
 	if err != nil {
 		return err
 	}
@@ -106,24 +108,22 @@ func SanityCheckEntities(logger *logging.Logger, entities []*entity.SignedEntity
 func SanityCheckRuntimes(
 	logger *logging.Logger,
 	params *ConsensusParameters,
-	runtimes []*SignedRuntime,
-	suspendedRuntimes []*SignedRuntime,
+	runtimes []*Runtime,
+	suspendedRuntimes []*Runtime,
 	isGenesis bool,
 ) (RuntimeLookup, error) {
 	// First go through all runtimes and perform general sanity checks.
 	seenRuntimes := []*Runtime{}
-	for _, signedRt := range runtimes {
-		rt, err := VerifyRegisterRuntimeArgs(params, logger, signedRt, isGenesis, true)
-		if err != nil {
+	for _, rt := range runtimes {
+		if err := VerifyRuntime(params, logger, rt, isGenesis, true); err != nil {
 			return nil, fmt.Errorf("runtime sanity check failed: %w", err)
 		}
 		seenRuntimes = append(seenRuntimes, rt)
 	}
 
 	seenSuspendedRuntimes := []*Runtime{}
-	for _, signedRt := range suspendedRuntimes {
-		rt, err := VerifyRegisterRuntimeArgs(params, logger, signedRt, isGenesis, true)
-		if err != nil {
+	for _, rt := range suspendedRuntimes {
+		if err := VerifyRuntime(params, logger, rt, isGenesis, true); err != nil {
 			return nil, fmt.Errorf("runtime sanity check failed: %w", err)
 		}
 		seenSuspendedRuntimes = append(seenSuspendedRuntimes, rt)
@@ -158,11 +158,13 @@ func SanityCheckNodes(
 	seenEntities map[signature.PublicKey]*entity.Entity,
 	runtimesLookup RuntimeLookup,
 	isGenesis bool,
-	epoch epochtime.EpochTime,
+	epoch beacon.EpochTime,
+	now time.Time,
 ) (NodeLookup, error) { // nolint: gocyclo
 
 	nodeLookup := &sanityCheckNodeLookup{
-		nodes: make(map[signature.PublicKey]*node.Node),
+		nodes:        make(map[signature.PublicKey]*node.Node),
+		nodesByPoint: make(map[string]*node.Node),
 	}
 
 	for _, signedNode := range nodes {
@@ -186,7 +188,7 @@ func SanityCheckNodes(
 			logger,
 			signedNode,
 			entity,
-			time.Now(),
+			now,
 			isGenesis,
 			true,
 			epoch,
@@ -201,6 +203,13 @@ func SanityCheckNodes(
 		nodeLookup.nodes[node.Consensus.ID] = node
 		nodeLookup.nodes[node.P2P.ID] = node
 		nodeLookup.nodes[node.TLS.PubKey] = node
+		if node.Beacon != nil {
+			raw, err := node.Beacon.Point.MarshalBinary()
+			if err != nil {
+				return nil, fmt.Errorf("registry: node sanity check failed: ID: %s, can't serialize beacon point : %w", n.ID.String(), err)
+			}
+			nodeLookup.nodesByPoint[string(raw)] = node
+		}
 		nodeLookup.nodesList = append(nodeLookup.nodesList, node)
 	}
 
@@ -245,10 +254,32 @@ func SanityCheckStake(
 		generatedEscrows[addr] = escrow
 	}
 
+	// Also generate escrow accounts for all runtimes that are using the
+	// runtime governance model.
 	runtimeMap := make(map[common.Namespace]*Runtime)
 	for _, rt := range runtimes {
 		runtimeMap[rt.ID] = rt
+
+		if rt.GovernanceModel == GovernanceRuntime {
+			// Generate escrow account for the runtime.
+			var escrow *staking.EscrowAccount
+			addr := staking.NewRuntimeAddress(rt.ID)
+			acct, ok := accounts[addr]
+			if ok {
+				escrow = &staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     acct.Escrow.Active.Balance,
+						TotalShares: acct.Escrow.Active.TotalShares,
+					},
+				}
+			} else {
+				escrow = &staking.EscrowAccount{}
+			}
+
+			generatedEscrows[addr] = escrow
+		}
 	}
+
 	for _, node := range nodes {
 		var nodeRts []*Runtime
 		for _, rt := range node.Runtimes {
@@ -260,8 +291,12 @@ func SanityCheckStake(
 	}
 	for _, rt := range runtimes {
 		// Add runtime stake claims.
-		addr := staking.NewAddress(rt.EntityID)
-		generatedEscrows[addr].StakeAccumulator.AddClaimUnchecked(StakeClaimForRuntime(rt.ID), StakeThresholdsForRuntime(rt))
+		addr := rt.StakingAddress()
+		if addr == nil {
+			continue
+		}
+
+		generatedEscrows[*addr].StakeAccumulator.AddClaimUnchecked(StakeClaimForRuntime(rt.ID), StakeThresholdsForRuntime(rt))
 	}
 
 	// Compare entities' generated escrow accounts with actual ones.
@@ -406,13 +441,27 @@ func (r *sanityCheckRuntimeLookup) AllRuntimes(ctx context.Context) ([]*Runtime,
 
 // Node lookup used in sanity checks.
 type sanityCheckNodeLookup struct {
-	nodes map[signature.PublicKey]*node.Node
+	nodes        map[signature.PublicKey]*node.Node
+	nodesByPoint map[string]*node.Node
 
 	nodesList []*node.Node
 }
 
 func (n *sanityCheckNodeLookup) NodeBySubKey(ctx context.Context, key signature.PublicKey) (*node.Node, error) {
 	node, ok := n.nodes[key]
+	if !ok {
+		return nil, ErrNoSuchNode
+	}
+	return node, nil
+}
+
+func (n *sanityCheckNodeLookup) NodeByBeaconPoint(ctx context.Context, point pvss.Point) (*node.Node, error) {
+	raw, err := point.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	node, ok := n.nodesByPoint[string(raw)]
 	if !ok {
 		return nil, ErrNoSuchNode
 	}

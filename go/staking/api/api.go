@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
@@ -13,7 +14,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/staking/api/token"
 )
 
@@ -38,6 +38,12 @@ var (
 	// The address is reserved to prevent it being accidentally used in the actual ledger.
 	FeeAccumulatorAddress = NewReservedAddress(
 		signature.NewPublicKey("1abe11edfeeaccffffffffffffffffffffffffffffffffffffffffffffffffff"),
+	)
+
+	// GovernanceDepositsAddress is the governance deposits address.
+	// This address is reserved to prevent it from being accidentally used in the actual ledger.
+	GovernanceDepositsAddress = NewReservedAddress(
+		signature.NewPublicKey("1abe11eddeaccfffffffffffffffffffffffffffffffffffffffffffffffffff"),
 	)
 
 	// ErrInvalidArgument is the error returned on malformed arguments.
@@ -65,6 +71,11 @@ var (
 	// ErrTooManyAllowances is the error returned when the number of allowances per account would
 	// exceed the maximum allowed number.
 	ErrTooManyAllowances = errors.New(ModuleName, 7, "staking: too many allowances")
+
+	// ErrUnderMinDelegationAmount is the error returned when the given escrow
+	// amount is lower than the minimum delegation amount specified in the
+	// consensus parameters.
+	ErrUnderMinDelegationAmount = errors.New(ModuleName, 8, "staking: amount is lower than the minimum delegation amount")
 
 	// MethodTransfer is the method name for transfers.
 	MethodTransfer = transaction.NewMethodName(ModuleName, "Transfer", Transfer{})
@@ -125,6 +136,9 @@ type Backend interface {
 	// LastBlockFees returns the collected fees for previous block.
 	LastBlockFees(ctx context.Context, height int64) (*quantity.Quantity, error)
 
+	// GovernanceDeposits returns the governance deposits account balance.
+	GovernanceDeposits(ctx context.Context, height int64) (*quantity.Quantity, error)
+
 	// Threshold returns the specific staking threshold by kind.
 	Threshold(ctx context.Context, query *ThresholdQuery) (*quantity.Quantity, error)
 
@@ -135,13 +149,29 @@ type Backend interface {
 	// Account returns the account descriptor for the given account.
 	Account(ctx context.Context, query *OwnerQuery) (*Account, error)
 
-	// Delegations returns the list of delegations for the given owner
-	// (delegator).
-	Delegations(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
+	// DelegationsFor returns the list of (outgoing) delegations for the given
+	// owner (delegator).
+	DelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
 
-	// DebondingDelegations returns the list of debonding delegations for
-	// the given owner (delegator).
-	DebondingDelegations(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
+	// DelegationsInfosFor returns (outgoing) delegations with additional
+	// information for the given owner (delegator).
+	DelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address]*DelegationInfo, error)
+
+	// DelegationsTo returns the list of (incoming) delegations to the given
+	// account.
+	DelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
+
+	// DebondingDelegationsFor returns the list of (outgoing) debonding
+	// delegations for the given owner (delegator).
+	DebondingDelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
+
+	// DebondingDelegationsInfosFor returns (outgoing) debonding delegations
+	// with additional information for the given owner (delegator).
+	DebondingDelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegationInfo, error)
+
+	// DebondingDelegationsTo returns the list of (incoming) debonding
+	// delegations to the given account.
+	DebondingDelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
 
 	// Allowance looks up the allowance for the given owner/beneficiary combination.
 	Allowance(ctx context.Context, query *AllowanceQuery) (*quantity.Quantity, error)
@@ -189,17 +219,28 @@ type TransferEvent struct {
 	Amount quantity.Quantity `json:"amount"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *TransferEvent) EventKind() string {
+	return "transfer"
+}
+
 // BurnEvent is the event emitted when stake is destroyed via a call to Burn.
 type BurnEvent struct {
 	Owner  Address           `json:"owner"`
 	Amount quantity.Quantity `json:"amount"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *BurnEvent) EventKind() string {
+	return "burn"
+}
+
 // EscrowEvent is an escrow event.
 type EscrowEvent struct {
-	Add     *AddEscrowEvent     `json:"add,omitempty"`
-	Take    *TakeEscrowEvent    `json:"take,omitempty"`
-	Reclaim *ReclaimEscrowEvent `json:"reclaim,omitempty"`
+	Add            *AddEscrowEvent            `json:"add,omitempty"`
+	Take           *TakeEscrowEvent           `json:"take,omitempty"`
+	DebondingStart *DebondingStartEscrowEvent `json:"debonding_start,omitempty"`
+	Reclaim        *ReclaimEscrowEvent        `json:"reclaim,omitempty"`
 }
 
 // Event signifies a staking event, returned via GetEvents.
@@ -216,9 +257,15 @@ type Event struct {
 // AddEscrowEvent is the event emitted when stake is transferred into an escrow
 // account.
 type AddEscrowEvent struct {
-	Owner  Address           `json:"owner"`
-	Escrow Address           `json:"escrow"`
-	Amount quantity.Quantity `json:"amount"`
+	Owner     Address           `json:"owner"`
+	Escrow    Address           `json:"escrow"`
+	Amount    quantity.Quantity `json:"amount"`
+	NewShares quantity.Quantity `json:"new_shares"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *AddEscrowEvent) EventKind() string {
+	return "add_escrow"
 }
 
 // TakeEscrowEvent is the event emitted when stake is taken from an escrow
@@ -228,12 +275,43 @@ type TakeEscrowEvent struct {
 	Amount quantity.Quantity `json:"amount"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *TakeEscrowEvent) EventKind() string {
+	return "take_escrow"
+}
+
+// DebondingStartEvent is the event emitted when the debonding process has
+// started and the given number of active shares have been moved into the
+// debonding pool and started debonding.
+//
+// Note that the given amount is valid at the time of debonding start and
+// may not correspond to the final debonded amount in case any escrowed
+// stake is subject to slashing.
+type DebondingStartEscrowEvent struct {
+	Owner           Address           `json:"owner"`
+	Escrow          Address           `json:"escrow"`
+	Amount          quantity.Quantity `json:"amount"`
+	ActiveShares    quantity.Quantity `json:"active_shares"`
+	DebondingShares quantity.Quantity `json:"debonding_shares"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *DebondingStartEscrowEvent) EventKind() string {
+	return "debonding_start"
+}
+
 // ReclaimEscrowEvent is the event emitted when stake is reclaimed from an
 // escrow account back into owner's general account.
 type ReclaimEscrowEvent struct {
 	Owner  Address           `json:"owner"`
 	Escrow Address           `json:"escrow"`
 	Amount quantity.Quantity `json:"amount"`
+	Shares quantity.Quantity `json:"shares"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *ReclaimEscrowEvent) EventKind() string {
+	return "reclaim_escrow"
 }
 
 // AllowanceChangeEvent is the event emitted when allowance is changed for a beneficiary.
@@ -243,6 +321,11 @@ type AllowanceChangeEvent struct { // nolint: maligned
 	Allowance    quantity.Quantity `json:"allowance"`
 	Negative     bool              `json:"negative,omitempty"`
 	AmountChange quantity.Quantity `json:"amount_change"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *AllowanceChangeEvent) EventKind() string {
+	return "allowance_change"
 }
 
 // Transfer is a stake transfer.
@@ -305,9 +388,9 @@ type Escrow struct {
 // PrettyPrint writes a pretty-printed representation of Escrow to the given
 // writer.
 func (e Escrow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sAccount: %s\n", prefix, e.Account)
+	fmt.Fprintf(w, "%sTo:     %s\n", prefix, e.Account)
 
-	fmt.Fprintf(w, "%sAmount:  ", prefix)
+	fmt.Fprintf(w, "%sAmount: ", prefix)
 	token.PrettyPrintAmount(ctx, e.Amount, w)
 	fmt.Fprintln(w)
 }
@@ -332,9 +415,9 @@ type ReclaimEscrow struct {
 // PrettyPrint writes a pretty-printed representation of ReclaimEscrow to the
 // given writer.
 func (re ReclaimEscrow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sAccount: %s\n", prefix, re.Account)
+	fmt.Fprintf(w, "%sFrom:   %s\n", prefix, re.Account)
 
-	fmt.Fprintf(w, "%sShares:  %s\n", prefix, re.Shares)
+	fmt.Fprintf(w, "%sShares: %s\n", prefix, re.Shares)
 }
 
 // PrettyType returns a representation of Transfer that can be used for pretty
@@ -382,11 +465,14 @@ type Allow struct {
 func (aw Allow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
 	fmt.Fprintf(w, "%sBeneficiary:   %s\n", prefix, aw.Beneficiary)
 
-	var sign string
+	sign := "+"
 	if aw.Negative {
 		sign = "-"
 	}
-	fmt.Fprintf(w, "%sAmount Change: %s%s\n", prefix, sign, aw.AmountChange)
+	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueSign, sign)
+	fmt.Fprintf(w, "%sAmount change: ", prefix)
+	token.PrettyPrintAmount(ctx, aw.AmountChange, w)
+	fmt.Fprintln(w)
 }
 
 // PrettyType returns a representation of Allow that can be used for pretty printing.
@@ -408,7 +494,10 @@ type Withdraw struct {
 // PrettyPrint writes a pretty-printed representation of Withdraw to the given writer.
 func (wt Withdraw) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
 	fmt.Fprintf(w, "%sFrom:   %s\n", prefix, wt.From)
-	fmt.Fprintf(w, "%sAmount: %s\n", prefix, wt.Amount)
+
+	fmt.Fprintf(w, "%sAmount: ", prefix)
+	token.PrettyPrintAmount(ctx, wt.Amount, w)
+	fmt.Fprintln(w)
 }
 
 // PrettyType returns a representation of Withdraw that can be used for pretty printing.
@@ -474,30 +563,33 @@ func (p *SharePool) sharesForStake(amount *quantity.Quantity) (*quantity.Quantit
 }
 
 // Deposit moves stake into the combined balance, raising the shares.
+//
+// Returns the number of new shares created as a result of the deposit.
+//
 // If an error occurs, the pool and affected accounts are left in an invalid state.
-func (p *SharePool) Deposit(shareDst, stakeSrc, baseUnitsAmount *quantity.Quantity) error {
+func (p *SharePool) Deposit(shareDst, stakeSrc, baseUnitsAmount *quantity.Quantity) (*quantity.Quantity, error) {
 	shares, err := p.sharesForStake(baseUnitsAmount)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = quantity.Move(&p.Balance, stakeSrc, baseUnitsAmount); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = p.TotalShares.Add(shares); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = shareDst.Add(shares); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return shares, nil
 }
 
-// stakeForShares computes the amount of base units for the given amount of shares.
-func (p *SharePool) stakeForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
+// StakeForShares computes the amount of base units for the given amount of shares.
+func (p *SharePool) StakeForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
 	if amount.IsZero() || p.Balance.IsZero() || p.TotalShares.IsZero() {
 		// No existing shares or no balance means no base units.
 		return quantity.NewQuantity(), nil
@@ -522,7 +614,7 @@ func (p *SharePool) stakeForShares(amount *quantity.Quantity) (*quantity.Quantit
 // Withdraw moves stake out of the combined balance, reducing the shares.
 // If an error occurs, the pool and affected accounts are left in an invalid state.
 func (p *SharePool) Withdraw(stakeDst, shareSrc, shareAmount *quantity.Quantity) error {
-	baseUnits, err := p.stakeForShares(shareAmount)
+	baseUnits, err := p.StakeForShares(shareAmount)
 	if err != nil {
 		return err
 	}
@@ -923,10 +1015,40 @@ type Delegation struct {
 	Shares quantity.Quantity `json:"shares"`
 }
 
+// DelegationInfo is a delegation descriptor with additional information.
+//
+// Additional information contains the share pool the delegation belongs to.
+type DelegationInfo struct {
+	Delegation
+	Pool SharePool `json:"pool"`
+}
+
 // DebondingDelegation is a debonding delegation descriptor.
 type DebondingDelegation struct {
-	Shares        quantity.Quantity   `json:"shares"`
-	DebondEndTime epochtime.EpochTime `json:"debond_end"`
+	Shares        quantity.Quantity `json:"shares"`
+	DebondEndTime beacon.EpochTime  `json:"debond_end"`
+}
+
+// Merge merges debonding delegations with same debond end time by summing
+// the shares amounts.
+func (d *DebondingDelegation) Merge(other DebondingDelegation) error {
+	if d.DebondEndTime != other.DebondEndTime {
+		return fmt.Errorf("cannot merge debonding delegations, end time doesn't match")
+	}
+	if err := d.Shares.Add(&other.Shares); err != nil {
+		return fmt.Errorf("error adding debonding delegation shares: %w", err)
+	}
+	return nil
+}
+
+// DebondingDelegationInfo is a debonding delegation descriptor with additional
+// information.
+//
+// Additional information contains the share pool the debonding delegation
+// belongs to.
+type DebondingDelegationInfo struct {
+	DebondingDelegation
+	Pool SharePool `json:"pool"`
 }
 
 // Genesis is the initial staking state for use in the genesis block.
@@ -947,6 +1069,8 @@ type Genesis struct {
 	CommonPool quantity.Quantity `json:"common_pool"`
 	// LastBlockFees are the collected fees for previous block.
 	LastBlockFees quantity.Quantity `json:"last_block_fees"`
+	// GovernanceDeposits are network's governance deposits.
+	GovernanceDeposits quantity.Quantity `json:"governance_deposits"`
 
 	// Ledger is a map of staking accounts.
 	Ledger map[Address]*Account `json:"ledger,omitempty"`
@@ -962,7 +1086,7 @@ type Genesis struct {
 // ConsensusParameters are the staking consensus parameters.
 type ConsensusParameters struct { // nolint: maligned
 	Thresholds                        map[ThresholdKind]quantity.Quantity `json:"thresholds,omitempty"`
-	DebondingInterval                 epochtime.EpochTime                 `json:"debonding_interval,omitempty"`
+	DebondingInterval                 beacon.EpochTime                    `json:"debonding_interval,omitempty"`
 	RewardSchedule                    []RewardStep                        `json:"reward_schedule,omitempty"`
 	SigningRewardThresholdNumerator   uint64                              `json:"signing_reward_threshold_numerator,omitempty"`
 	SigningRewardThresholdDenominator uint64                              `json:"signing_reward_threshold_denominator,omitempty"`
@@ -974,6 +1098,10 @@ type ConsensusParameters struct { // nolint: maligned
 	DisableTransfers       bool             `json:"disable_transfers,omitempty"`
 	DisableDelegation      bool             `json:"disable_delegation,omitempty"`
 	UndisableTransfersFrom map[Address]bool `json:"undisable_transfers_from,omitempty"`
+
+	// AllowEscrowMessages can be used to allow runtimes to perform AddEscrow
+	// and ReclaimEscrow via runtime messages.
+	AllowEscrowMessages bool `json:"allow_escrow_messages,omitempty"`
 
 	// MaxAllowances is the maximum number of allowances an account can have. Zero means disabled.
 	MaxAllowances uint32 `json:"max_allowances,omitempty"`

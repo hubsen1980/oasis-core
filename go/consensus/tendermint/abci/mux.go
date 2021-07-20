@@ -4,20 +4,20 @@ package abci
 import (
 	"bytes"
 	"context"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tendermint/tendermint/abci/types"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
@@ -30,7 +30,7 @@ import (
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
 	abciState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci/state"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	storageApi "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
@@ -41,8 +41,7 @@ const (
 
 	metricsUpdateInterval = 10 * time.Second
 
-	// debugTxLifetime is the transaction mempool lifetime when CheckTx is disabled (debug only).
-	debugTxLifetime = 1 * time.Minute
+	blockHeightInvalid = -1
 
 	// LogEventABCIStateSyncComplete is a log event value that signals an ABCI state syncing
 	// completed event.
@@ -68,9 +67,8 @@ type ApplicationConfig struct { // nolint: maligned
 	DataDir         string
 	StorageBackend  string
 	Pruning         PruneConfig
-	HaltEpochHeight epochtime.EpochTime
+	HaltEpochHeight beacon.EpochTime
 	MinGasPrice     uint64
-	DisableCheckTx  bool
 
 	DisableCheckpointer       bool
 	CheckpointerCheckInterval time.Duration
@@ -139,14 +137,14 @@ func (a *ApplicationServer) Register(app api.Application) error {
 
 // RegisterHaltHook registers a function to be called when the
 // consensus Halt epoch height is reached.
-func (a *ApplicationServer) RegisterHaltHook(hook func(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime)) {
+func (a *ApplicationServer) RegisterHaltHook(hook consensus.HaltHook) {
 	a.mux.registerHaltHook(hook)
 }
 
 // SetEpochtime sets the mux epochtime.
 //
 // Epochtime must be set before the multiplexer can be used.
-func (a *ApplicationServer) SetEpochtime(epochTime epochtime.Backend) error {
+func (a *ApplicationServer) SetEpochtime(epochTime beacon.Backend) error {
 	if a.mux.state.timeSource != nil {
 		return fmt.Errorf("mux: epochtime already configured")
 	}
@@ -210,9 +208,8 @@ type abciMux struct {
 	sync.RWMutex
 	types.BaseApplication
 
-	logger   *logging.Logger
-	upgrader upgrade.Backend
-	state    *applicationState
+	logger *logging.Logger
+	state  *applicationState
 
 	appsByName     map[string]api.Application
 	appsByMethod   map[transaction.MethodName]api.Application
@@ -222,14 +219,13 @@ type abciMux struct {
 	lastBeginBlock int64
 	currentTime    time.Time
 
-	haltHooks []func(context.Context, int64, epochtime.EpochTime)
+	haltHooks []consensus.HaltHook
 
 	// invalidatedTxs maps transaction hashes (hash.Hash) to a subscriber
 	// waiting for that transaction to become invalid.
 	invalidatedTxs sync.Map
-	// debugExpiringTxs maps transaction hashes to the time at which they were created. This is only
-	// used in case CheckTx is disabled (for debug purposes only).
-	debugExpiringTxs map[hash.Hash]time.Time
+
+	md messageDispatcher
 }
 
 type invalidatedTxSubscription struct {
@@ -261,7 +257,7 @@ func (mux *abciMux) watchInvalidatedTx(txHash hash.Hash) (<-chan error, pubsub.C
 	return resultCh, sub, nil
 }
 
-func (mux *abciMux) registerHaltHook(hook func(context.Context, int64, epochtime.EpochTime)) {
+func (mux *abciMux) registerHaltHook(hook consensus.HaltHook) {
 	mux.Lock()
 	defer mux.Unlock()
 
@@ -290,28 +286,20 @@ func (mux *abciMux) InitChain(req types.RequestInitChain) types.ResponseInitChai
 		panic("mux: invalid genesis application state")
 	}
 
-	b, _ := json.Marshal(st)
-	mux.logger.Debug("Genesis ABCI application state",
-		"state", string(b),
-	)
-
 	mux.currentTime = st.Time
 
 	if st.Height != req.InitialHeight || uint64(st.Height) != mux.state.initialHeight {
 		panic(fmt.Errorf("mux: inconsistent initial height (genesis: %d abci: %d state: %d)", st.Height, req.InitialHeight, mux.state.initialHeight))
 	}
 
-	// Stick the digest of the genesis block (the RequestInitChain) into
-	// the state.
+	// Stick the digest of the genesis document into the state.
 	//
 	// This serves to keep bad things from happening if absolutely
 	// nothing writes to the state till the Commit() call, along with
 	// clearly separating chain instances based on the initialization
 	// state, forever.
-	tmp := bytes.NewBuffer(nil)
-	_ = types.WriteMessage(&req, tmp)
-	genesisDigest := sha512.Sum512_256(tmp.Bytes())
-	err = mux.state.deliverTxTree.Insert(mux.state.ctx, []byte(stateKeyGenesisDigest), genesisDigest[:])
+	chainContext := st.ChainContext()
+	err = mux.state.deliverTxTree.Insert(mux.state.ctx, []byte(stateKeyGenesisDigest), []byte(chainContext))
 	if err != nil {
 		panic(err)
 	}
@@ -372,6 +360,13 @@ func (mux *abciMux) InitChain(req types.RequestInitChain) types.ResponseInitChai
 	return resp
 }
 
+func (mux *abciMux) dispatchHaltHooks(blockHeight int64, currentEpoch beacon.EpochTime, err error) {
+	for _, hook := range mux.haltHooks {
+		hook(mux.state.ctx, blockHeight, currentEpoch, err)
+	}
+	mux.logger.Debug("halt hook dispatch complete")
+}
+
 func (mux *abciMux) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginBlock {
 	blockHeight := mux.state.BlockHeight()
 
@@ -382,9 +377,11 @@ func (mux *abciMux) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginB
 
 	// 99% sure this is a protocol violation.
 	if mux.lastBeginBlock == blockHeight {
-		panic("mux: redundant BeginBlock")
+		panic(fmt.Errorf("mux: redundant BeginBlock"))
 	}
-	mux.lastBeginBlock = blockHeight
+	defer func() {
+		atomic.StoreInt64(&mux.lastBeginBlock, blockHeight)
+	}()
 	mux.currentTime = req.Header.Time
 
 	params := mux.state.ConsensusParameters()
@@ -396,23 +393,31 @@ func (mux *abciMux) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginB
 	} else {
 		mux.state.blockCtx.Set(api.GasAccountantKey{}, api.NewNopGasAccountant())
 	}
+	mux.state.blockCtx.Set(api.BlockProposerKey{}, req.Header.ProposerAddress)
 	// Create BeginBlock context.
 	ctx := mux.state.NewContext(api.ContextBeginBlock, mux.currentTime)
 	defer ctx.Close()
 
 	currentEpoch, err := mux.state.GetCurrentEpoch(ctx)
 	if err != nil {
-		panic("mux: can't get current epoch in BeginBlock")
+		panic(fmt.Errorf("mux: can't get current epoch in BeginBlock: %w", err))
 	}
 
-	// Check if there are any upgrades pending or if we need to halt for an upgrade.
-	switch err = mux.upgrader.ConsensusUpgrade(ctx, currentEpoch, blockHeight); err {
-	case nil:
-		// Everything ok.
-	case upgrade.ErrStopForUpgrade:
-		panic("mux: reached upgrade epoch")
-	default:
-		panic(fmt.Sprintf("mux: error while trying to perform consensus upgrade: %v", err))
+	// Check if there are any upgrades pending or if we need to halt for an upgrade. Note that these
+	// checks must run on each block to make sure that any pending upgrade descriptors are cleared
+	// after consensus upgrade is performed.
+	if upgrader := mux.state.Upgrader(); upgrader != nil {
+		switch err := upgrader.ConsensusUpgrade(ctx, currentEpoch, ctx.BlockHeight()); err {
+		case nil:
+			// Everything ok.
+		case upgrade.ErrStopForUpgrade:
+			// Signal graceful stop for upgrade.
+			mux.logger.Debug("dispatching halt hooks for upgrade")
+			mux.dispatchHaltHooks(blockHeight, currentEpoch, err)
+			panic(err)
+		default:
+			panic(fmt.Errorf("mux: error while trying to perform consensus upgrade: %w", err))
+		}
 	}
 
 	switch mux.state.haltMode {
@@ -421,21 +426,15 @@ func (mux *abciMux) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginB
 			break
 		}
 		// On transition, trigger halt hooks.
-		mux.logger.Info("BeginBlock: halt mode transition, emitting empty blocks.",
+		mux.logger.Info("BeginBlock: halt mode transition, emitting empty block",
 			"block_height", blockHeight,
 			"epoch", mux.state.haltEpochHeight,
 		)
-		mux.logger.Debug("Dispatching halt hooks")
-		for _, hook := range mux.haltHooks {
-			hook(mux.state.ctx, blockHeight, mux.state.haltEpochHeight)
-		}
-		mux.logger.Debug("Halt hook dispatch complete")
+		mux.logger.Debug("dispatching halt hooks before halt epoch")
+		mux.dispatchHaltHooks(blockHeight, currentEpoch, nil)
 		return types.ResponseBeginBlock{}
 	case true:
-		if !mux.state.afterHaltEpoch(ctx) {
-			return types.ResponseBeginBlock{}
-		}
-
+		// After one block into the halt epoch, terminate.
 		mux.logger.Info("BeginBlock: after halt epoch, halting",
 			"block_height", blockHeight,
 		)
@@ -452,7 +451,11 @@ func (mux *abciMux) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginB
 				"err", err,
 				"app", app.Name(),
 			)
-			panic("mux: BeginBlock: fatal error in application: '" + app.Name() + "': " + err.Error())
+
+			mux.logger.Debug("dispatching halt hooks on begin block failure")
+			mux.dispatchHaltHooks(blockHeight, currentEpoch, err)
+
+			panic(fmt.Errorf("mux: BeginBlock: fatal error in application: '%s': %w", app.Name(), err))
 		}
 	}
 
@@ -525,10 +528,23 @@ func (mux *abciMux) decodeTx(ctx *api.Context, rawTx []byte) (*transaction.Trans
 }
 
 func (mux *abciMux) processTx(ctx *api.Context, tx *transaction.Transaction, txSize int) error {
+	// Lookup method handler.
+	app := mux.appsByMethod[tx.Method]
+	if app == nil {
+		ctx.Logger().Error("unknown method",
+			"tx", tx,
+			"method", tx.Method,
+		)
+		return fmt.Errorf("mux: unknown method: %s", tx.Method)
+	}
+
 	// Pass the transaction through the fee handler if configured.
-	if txAuthHandler := mux.state.txAuthHandler; txAuthHandler != nil {
+	//
+	// Ignore fees for critical protocol methods to ensure they are processed in a block. Note that
+	// this relies on method handlers to prevent DoS.
+	if txAuthHandler := mux.state.txAuthHandler; txAuthHandler != nil && !tx.Method.IsCritical() {
 		if err := txAuthHandler.AuthenticateTx(ctx, tx); err != nil {
-			ctx.Logger().Debug("failed to authenticate transaction",
+			ctx.Logger().Debug("failed to authenticate transaction (pre-execute)",
 				"tx", tx,
 				"tx_signer", ctx.TxSigner(),
 				"method", tx.Method,
@@ -545,15 +561,6 @@ func (mux *abciMux) processTx(ctx *api.Context, tx *transaction.Transaction, txS
 	}
 
 	// Route to correct handler.
-	app := mux.appsByMethod[tx.Method]
-	if app == nil {
-		ctx.Logger().Error("unknown method",
-			"tx", tx,
-			"method", tx.Method,
-		)
-		return fmt.Errorf("mux: unknown method: %s", tx.Method)
-	}
-
 	ctx.Logger().Debug("dispatching",
 		"app", app.Name(),
 		"tx", tx,
@@ -563,14 +570,15 @@ func (mux *abciMux) processTx(ctx *api.Context, tx *transaction.Transaction, txS
 		return err
 	}
 
-	// Run ForeignDeliverTx on all other applications so they can
-	// run their post-tx hooks.
-	for _, foreignApp := range mux.appsByLexOrder {
-		if foreignApp == app {
-			continue
-		}
-
-		if err := foreignApp.ForeignExecuteTx(ctx, app, tx); err != nil {
+	//  Pass the transaction through the PostExecuteTx handler if configured.
+	if txAuthHandler := mux.state.txAuthHandler; txAuthHandler != nil {
+		if err := txAuthHandler.PostExecuteTx(ctx, tx); err != nil {
+			ctx.Logger().Debug("failed to authenticate transaction (post-execute)",
+				"tx", tx,
+				"tx_signer", ctx.TxSigner(),
+				"method", tx.Method,
+				"err", err,
+			)
 			return err
 		}
 	}
@@ -587,10 +595,32 @@ func (mux *abciMux) executeTx(ctx *api.Context, rawTx []byte) error {
 	// Set authenticated transaction signer.
 	ctx.SetTxSigner(sigTx.Signature.PublicKey)
 
+	// If we are in CheckTx mode and there is a pending upgrade in this block, make sure to reject
+	// any transactions before processing as they may potentially query incompatible state.
+	if upgrader := mux.state.Upgrader(); upgrader != nil && ctx.IsCheckOnly() {
+		hasUpgrade, err := upgrader.HasPendingUpgradeAt(ctx, ctx.BlockHeight()+1)
+		if err != nil {
+			return fmt.Errorf("failed to check for pending upgrades: %w", err)
+		}
+		if hasUpgrade {
+			return transaction.ErrUpgradePending
+		}
+	}
+
 	return mux.processTx(ctx, tx, len(rawTx))
 }
 
 func (mux *abciMux) EstimateGas(caller signature.PublicKey, tx *transaction.Transaction) (transaction.Gas, error) {
+	if tx == nil {
+		return 0, consensus.ErrInvalidArgument
+	}
+
+	// Certain modules, in particular the beacon require InitChain or BeginBlock
+	// to have completed before initialization is complete.
+	if atomic.LoadInt64(&mux.lastBeginBlock) == blockHeightInvalid {
+		return 0, consensus.ErrNoCommittedBlocks
+	}
+
 	// As opposed to other transaction dispatch entry points (CheckTx/DeliverTx), this method can
 	// be called in parallel to the consensus layer and to other invocations.
 	//
@@ -634,40 +664,11 @@ func (mux *abciMux) notifyInvalidatedCheckTx(txHash hash.Hash, err error) {
 }
 
 func (mux *abciMux) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
-	if mux.state.disableCheckTx {
-		// Blindly accept all transactions if configured to do so. We still need to periodically
-		// remove old transactions as otherwise the mempool will fill up, so keep track of when
-		// transactions were added and invalidate them after the configured interval.
-		txHash := hash.NewFromBytes(req.Tx)
-
-		if req.Type == types.CheckTxType_Recheck {
-			// Check timestamp.
-			if ts, ok := mux.debugExpiringTxs[txHash]; ok && mux.currentTime.Sub(ts) > debugTxLifetime {
-				delete(mux.debugExpiringTxs, txHash)
-
-				err := fmt.Errorf("mux: transaction expired (debug only)")
-				mux.notifyInvalidatedCheckTx(txHash, err)
-
-				return types.ResponseCheckTx{
-					Codespace: errors.UnknownModule,
-					Code:      1,
-					Log:       err.Error(),
-				}
-			}
-		} else {
-			mux.debugExpiringTxs[txHash] = mux.currentTime
-		}
-
-		return types.ResponseCheckTx{
-			Code: types.CodeTypeOK,
-		}
-	}
-
 	ctx := mux.state.NewContext(api.ContextCheckTx, mux.currentTime)
 	defer ctx.Close()
 
 	if err := mux.executeTx(ctx, req.Tx); err != nil {
-		module, code := errors.Code(err)
+		module, code, context := errors.Code(err)
 
 		if req.Type == types.CheckTxType_Recheck {
 			// This is a re-check and the transaction just failed validation. Since
@@ -684,7 +685,7 @@ func (mux *abciMux) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
 		return types.ResponseCheckTx{
 			Codespace: module,
 			Code:      code,
-			Log:       err.Error(),
+			Log:       context,
 			GasWanted: int64(ctx.Gas().GasWanted()),
 			GasUsed:   int64(ctx.Gas().GasUsed()),
 		}
@@ -710,12 +711,12 @@ func (mux *abciMux) DeliverTx(req types.RequestDeliverTx) types.ResponseDeliverT
 			)
 			panic(err)
 		}
-		module, code := errors.Code(err)
+		module, code, context := errors.Code(err)
 
 		return types.ResponseDeliverTx{
 			Codespace: module,
 			Code:      code,
-			Log:       err.Error(),
+			Log:       context,
 			Events:    ctx.GetEvents(),
 			GasWanted: int64(ctx.Gas().GasWanted()),
 			GasUsed:   int64(ctx.Gas().GasUsed()),
@@ -754,10 +755,24 @@ func (mux *abciMux) EndBlock(req types.RequestEndBlock) types.ResponseEndBlock {
 				"err", err,
 				"app", app.Name(),
 			)
-			panic("mux: EndBlock: fatal error in application: '" + app.Name() + "': " + err.Error())
+			panic(fmt.Errorf("mux: EndBlock: fatal error in application: '%s': %w", app.Name(), err))
 		}
 		if app.Blessed() {
 			resp = newResp
+		}
+	}
+
+	// Run any EndBlock upgrade handlers when there is an upgrade.
+	if upgrader := mux.state.Upgrader(); upgrader != nil {
+		currentEpoch, err := mux.state.GetCurrentEpoch(ctx)
+		if err != nil {
+			panic(fmt.Errorf("mux: can't get current epoch in BeginBlock: %w", err))
+		}
+
+		err = upgrader.ConsensusUpgrade(ctx, currentEpoch, ctx.BlockHeight())
+		// This should never fail as all the checks were already performed in BeginBlock.
+		if err != nil {
+			panic(fmt.Errorf("mux: error while trying to perform consensus upgrade: %w", err))
 		}
 	}
 
@@ -893,6 +908,12 @@ func (mux *abciMux) OfferSnapshot(req types.RequestOfferSnapshot) types.Response
 	}
 
 	// Snapshot seems correct (e.g., it is for the correct root), start the restoration process.
+	if err := mux.state.storage.NodeDB().StartMultipartInsert(cp.Root.Version); err != nil {
+		mux.logger.Error("failed to start multipart restoration",
+			"err", err,
+		)
+		return types.ResponseOfferSnapshot{Result: types.ResponseOfferSnapshot_ABORT}
+	}
 	if err := mux.state.storage.Checkpointer().StartRestore(mux.state.ctx, &cp); err != nil {
 		mux.logger.Error("failed to start restore",
 			"err", err,
@@ -960,6 +981,16 @@ func (mux *abciMux) ApplySnapshotChunk(req types.RequestApplySnapshotChunk) type
 	case errors.Is(err, checkpoint.ErrNoRestoreInProgress):
 		// This should never happen.
 		mux.logger.Error("ApplySnapshotChunk called without OfferSnapshot, aborting state sync")
+		if err = mux.state.storage.Checkpointer().AbortRestore(mux.state.ctx); err != nil {
+			mux.logger.Error("failed to abort checkpoint restore: %w",
+				"err", err,
+			)
+		}
+		if err = mux.state.storage.NodeDB().AbortMultipartInsert(); err != nil {
+			mux.logger.Error("failed to abort multipart restore: %w",
+				"err", err,
+			)
+		}
 		return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ABORT}
 	case errors.Is(err, checkpoint.ErrChunkAlreadyRestored):
 		return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ACCEPT}
@@ -989,17 +1020,32 @@ func (mux *abciMux) ApplySnapshotChunk(req types.RequestApplySnapshotChunk) type
 		mux.logger.Error("error during chunk restoration, aborting state sync",
 			"err", err,
 		)
+		if err = mux.state.storage.Checkpointer().AbortRestore(mux.state.ctx); err != nil {
+			mux.logger.Error("failed to abort checkpoint restore: %w",
+				"err", err,
+			)
+		}
+		if err = mux.state.storage.NodeDB().AbortMultipartInsert(); err != nil {
+			mux.logger.Error("failed to abort multipart restore: %w",
+				"err", err,
+			)
+		}
 
 		return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ABORT}
 	}
 
 	// Check if we are done with the restoration. In this case, finalize the root.
 	if done {
-		err = mux.state.storage.NodeDB().Finalize(mux.state.ctx, cp.Root.Version, []hash.Hash{cp.Root.Hash})
+		err = mux.state.storage.NodeDB().Finalize(mux.state.ctx, []storageApi.Root{cp.Root})
 		if err != nil {
 			mux.logger.Error("failed to finalize restored root",
 				"err", err,
 			)
+			if err = mux.state.storage.NodeDB().AbortMultipartInsert(); err != nil {
+				mux.logger.Error("failed to abort multipart restore: %w",
+					"err", err,
+				)
+			}
 			return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ABORT}
 		}
 
@@ -1014,6 +1060,17 @@ func (mux *abciMux) ApplySnapshotChunk(req types.RequestApplySnapshotChunk) type
 			"root", cp.Root,
 			logging.LogEvent, LogEventABCIStateSyncComplete,
 		)
+
+		// Notify applications that state has been synced.
+		ctx := mux.state.NewContext(api.ContextEndBlock, mux.currentTime)
+		defer ctx.Close()
+
+		if err = mux.md.Publish(ctx, api.MessageStateSyncCompleted, nil); err != nil {
+			mux.logger.Error("failed to dispatch state sync completed message",
+				"err", err,
+			)
+			return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ABORT}
+		}
 	}
 
 	return types.ResponseApplySnapshotChunk{Result: types.ResponseApplySnapshotChunk_ACCEPT}
@@ -1049,7 +1106,7 @@ func (mux *abciMux) doRegister(app api.Application) error {
 	}
 	mux.rebuildAppLexOrdering() // Inefficient but not a lot of apps.
 
-	app.OnRegister(mux.state)
+	app.OnRegister(mux.state, &mux.md)
 	mux.logger.Debug("Registered new application",
 		"app", app.Name(),
 	)
@@ -1087,23 +1144,17 @@ func (mux *abciMux) checkDependencies() error {
 }
 
 func newABCIMux(ctx context.Context, upgrader upgrade.Backend, cfg *ApplicationConfig) (*abciMux, error) {
-	state, err := newApplicationState(ctx, cfg)
+	state, err := newApplicationState(ctx, upgrader, cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	mux := &abciMux{
 		logger:         logging.GetLogger("abci-mux"),
-		upgrader:       upgrader,
 		state:          state,
 		appsByName:     make(map[string]api.Application),
 		appsByMethod:   make(map[transaction.MethodName]api.Application),
-		lastBeginBlock: -1,
-	}
-
-	// Create a map of expiring transactions if CheckTx is disabled (debug only).
-	if state.disableCheckTx {
-		mux.debugExpiringTxs = make(map[hash.Hash]time.Time)
+		lastBeginBlock: blockHeightInvalid,
 	}
 
 	mux.logger.Debug("ABCI multiplexer initialized",

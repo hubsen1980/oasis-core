@@ -1,6 +1,7 @@
 //! Types used by the worker-host protocol.
-use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
-use serde_bytes;
+use std::collections::BTreeMap;
+
+use thiserror::Error;
 
 use crate::{
     common::{
@@ -8,16 +9,24 @@ use crate::{
             hash::Hash,
             signature::{PublicKey, Signature},
         },
-        roothash::{Block, ComputeResultsHeader},
-        runtime::RuntimeId,
+        namespace::Namespace,
         sgx::avr::AVR,
+        version::Version,
+    },
+    consensus::{
+        beacon::EpochTime,
+        roothash::{self, Block, ComputeResultsHeader, Header},
+        tendermint::LightBlock,
     },
     storage::mkvs::{sync, WriteLog},
     transaction::types::TxnBatch,
 };
 
+/// Name of the batch weight limit runtime query method.
+pub const BATCH_WEIGHT_LIMIT_QUERY_METHOD: &'static str = "internal.BatchWeightLimits";
+
 /// Computed batch.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, cbor::Encode, cbor::Decode)]
 pub struct ComputedBatch {
     /// Compute results header.
     pub header: ComputeResultsHeader,
@@ -28,59 +37,107 @@ pub struct ComputedBatch {
     /// If this runtime uses a TEE, then this is the signature of the batch's
     /// BatchSigMessage with the node's RAK for this runtime.
     pub rak_sig: Signature,
+    /// Messages emitted by the runtime.
+    pub messages: Vec<roothash::Message>,
 }
 
 /// Storage sync request.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, cbor::Encode, cbor::Decode)]
 pub enum StorageSyncRequest {
     SyncGet(sync::GetRequest),
     SyncGetPrefixes(sync::GetPrefixesRequest),
     SyncIterate(sync::IterateRequest),
 }
 
+#[derive(Debug)]
+pub struct StorageSyncRequestWithEndpoint {
+    pub endpoint: HostStorageEndpoint,
+    pub request: StorageSyncRequest,
+}
+
+impl cbor::Encode for StorageSyncRequestWithEndpoint {
+    fn into_cbor_value(self) -> cbor::Value {
+        let mut request = cbor::EncodeAsMap::into_cbor_map(self.request);
+        // Add endpoint to the given map.
+        let key = cbor::values::IntoCborValue::into_cbor_value("endpoint");
+        request.push((key, self.endpoint.into_cbor_value()));
+        cbor::Value::Map(request)
+    }
+}
+
+impl cbor::Decode for StorageSyncRequestWithEndpoint {
+    fn try_from_cbor_value(value: cbor::Value) -> Result<Self, cbor::DecodeError> {
+        match value {
+            cbor::Value::Map(mut items) => {
+                // Take the endpoint field from the map and decode the rest.
+                let key = cbor::values::IntoCborValue::into_cbor_value("endpoint");
+                let (index, _) = items
+                    .iter()
+                    .enumerate()
+                    .find(|(_, v)| v.0 == key)
+                    .ok_or(cbor::DecodeError::MissingField)?;
+                let endpoint = items.remove(index).1;
+
+                Ok(Self {
+                    endpoint: cbor::Decode::try_from_cbor_value(endpoint)?,
+                    request: cbor::Decode::try_from_cbor_value(cbor::Value::Map(items))?,
+                })
+            }
+            _ => Err(cbor::DecodeError::UnexpectedType),
+        }
+    }
+}
+
 /// Storage sync response.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, cbor::Encode, cbor::Decode)]
 pub enum StorageSyncResponse {
     ProofResponse(sync::ProofResponse),
 }
 
+/// Host storage endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
+#[repr(u8)]
+pub enum HostStorageEndpoint {
+    Runtime = 0,
+    Consensus = 1,
+}
+
 /// Runtime host protocol message body.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, cbor::Encode, cbor::Decode)]
 pub enum Body {
     // An empty body.
     Empty {},
 
     // An error response.
-    Error {
-        #[serde(default)]
-        module: String,
-        #[serde(default)]
-        code: u32,
-        #[serde(default)]
-        message: String,
-    },
+    Error(Error),
 
     // Runtime interface.
     RuntimeInfoRequest {
-        runtime_id: RuntimeId,
+        runtime_id: Namespace,
+        consensus_backend: String,
+        consensus_protocol_version: Version,
+        consensus_chain_context: String,
+
+        #[cbor(optional)]
+        #[cbor(default)]
+        #[cbor(skip_serializing_if = "BTreeMap::is_empty")]
+        local_config: BTreeMap<String, cbor::Value>,
     },
     RuntimeInfoResponse {
-        protocol_version: u64,
-        runtime_version: u64,
+        protocol_version: Version,
+        runtime_version: Version,
     },
     RuntimePingRequest {},
     RuntimeShutdownRequest {},
     RuntimeAbortRequest {},
     RuntimeAbortResponse {},
     RuntimeCapabilityTEERakInitRequest {
-        #[serde(with = "serde_bytes")]
         target_info: Vec<u8>,
     },
     RuntimeCapabilityTEERakInitResponse {},
     RuntimeCapabilityTEERakReportRequest {},
     RuntimeCapabilityTEERakReportResponse {
         rak_pub: PublicKey,
-        #[serde(with = "serde_bytes")]
         report: Vec<u8>,
         nonce: String,
     },
@@ -89,82 +146,165 @@ pub enum Body {
     },
     RuntimeCapabilityTEERakAvrResponse {},
     RuntimeRPCCallRequest {
-        #[serde(with = "serde_bytes")]
         request: Vec<u8>,
     },
     RuntimeRPCCallResponse {
-        #[serde(with = "serde_bytes")]
         response: Vec<u8>,
     },
     RuntimeLocalRPCCallRequest {
-        #[serde(with = "serde_bytes")]
         request: Vec<u8>,
     },
     RuntimeLocalRPCCallResponse {
-        #[serde(with = "serde_bytes")]
         response: Vec<u8>,
     },
     RuntimeCheckTxBatchRequest {
+        consensus_block: LightBlock,
         inputs: TxnBatch,
         block: Block,
+        epoch: EpochTime,
     },
     RuntimeCheckTxBatchResponse {
-        results: TxnBatch,
+        results: Vec<CheckTxResult>,
     },
     RuntimeExecuteTxBatchRequest {
+        consensus_block: LightBlock,
+        round_results: roothash::RoundResults,
         io_root: Hash,
-        inputs: TxnBatch,
+        #[cbor(optional)]
+        inputs: Option<TxnBatch>,
         block: Block,
+        epoch: EpochTime,
+        max_messages: u32,
     },
     RuntimeExecuteTxBatchResponse {
         batch: ComputedBatch,
+        #[cbor(optional)]
+        batch_weight_limits: Option<BTreeMap<TransactionWeight, u64>>,
     },
     RuntimeKeyManagerPolicyUpdateRequest {
-        #[serde(with = "serde_bytes")]
         signed_policy_raw: Vec<u8>,
     },
     RuntimeKeyManagerPolicyUpdateResponse {},
+    RuntimeQueryRequest {
+        consensus_block: LightBlock,
+        header: Header,
+        epoch: EpochTime,
+        method: String,
+        #[cbor(optional)]
+        args: cbor::Value,
+    },
+    RuntimeQueryResponse {
+        data: cbor::Value,
+    },
 
     // Host interface.
     HostRPCCallRequest {
         endpoint: String,
-        #[serde(with = "serde_bytes")]
         request: Vec<u8>,
     },
     HostRPCCallResponse {
-        #[serde(with = "serde_bytes")]
         response: Vec<u8>,
     },
-    HostStorageSyncRequest {
-        #[serde(flatten)]
-        request: StorageSyncRequest,
-    },
-    HostStorageSyncResponse {
-        #[serde(flatten)]
-        response: StorageSyncResponse,
-    },
-    HostStorageSyncSerializedResponse {
-        #[serde(with = "serde_bytes")]
-        serialized: Vec<u8>,
-    },
+    HostStorageSyncRequest(StorageSyncRequestWithEndpoint),
+    HostStorageSyncResponse(StorageSyncResponse),
     HostLocalStorageGetRequest {
-        #[serde(with = "serde_bytes")]
         key: Vec<u8>,
     },
     HostLocalStorageGetResponse {
-        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
     },
     HostLocalStorageSetRequest {
-        #[serde(with = "serde_bytes")]
         key: Vec<u8>,
-        #[serde(with = "serde_bytes")]
         value: Vec<u8>,
     },
     HostLocalStorageSetResponse {},
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A serializable error.
+#[derive(Clone, Debug, Default, Error, cbor::Encode, cbor::Decode)]
+#[error("module: {module} code: {code} message: {message}")]
+pub struct Error {
+    #[cbor(optional)]
+    #[cbor(default)]
+    pub module: String,
+
+    #[cbor(optional)]
+    #[cbor(default)]
+    pub code: u32,
+
+    #[cbor(optional)]
+    #[cbor(default)]
+    pub message: String,
+}
+
+impl Error {
+    /// Create a new error.
+    pub fn new(module: &str, code: u32, msg: &str) -> Self {
+        Self {
+            module: module.to_owned(),
+            code,
+            message: msg.to_owned(),
+        }
+    }
+}
+
+/// Result of a CheckTx operation.
+#[derive(Clone, Debug, Default, cbor::Encode, cbor::Decode)]
+pub struct CheckTxResult {
+    pub error: Error,
+    pub meta: Option<CheckTxMetadata>,
+}
+
+/// CheckTx transaction metadata.
+#[derive(Clone, Debug, Default, cbor::Encode, cbor::Decode)]
+pub struct CheckTxMetadata {
+    #[cbor(optional)]
+    #[cbor(default)]
+    #[cbor(skip_serializing_if = "num_traits::Zero::is_zero")]
+    pub priority: u64,
+
+    #[cbor(optional)]
+    pub weights: Option<BTreeMap<TransactionWeight, u64>>,
+}
+
+/// Transaction weight kind.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransactionWeight {
+    /// Consensus messages weight key.
+    ConsensusMessages,
+    /// Runtime specific weight key.
+    Custom(String),
+}
+
+impl From<&str> for TransactionWeight {
+    fn from(s: &str) -> Self {
+        match s {
+            "consensus_messages" => Self::ConsensusMessages,
+            _ => Self::Custom(s.to_string()),
+        }
+    }
+}
+
+impl cbor::Encode for TransactionWeight {
+    fn into_cbor_value(self) -> cbor::Value {
+        match self {
+            Self::ConsensusMessages => cbor::Value::TextString("consensus_messages".to_string()),
+            Self::Custom(other) => cbor::Value::TextString(other),
+        }
+    }
+}
+
+impl cbor::Decode for TransactionWeight {
+    fn try_from_cbor_value(value: cbor::Value) -> Result<Self, cbor::DecodeError> {
+        match value {
+            cbor::Value::TextString(v) if &v == "consensus_messages" => Ok(Self::ConsensusMessages),
+            cbor::Value::TextString(other) => Ok(Self::Custom(other)),
+            _ => Err(cbor::DecodeError::UnexpectedType),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, cbor::Encode, cbor::Decode)]
 #[repr(u8)]
 pub enum MessageType {
     /// Invalid message (should never be seen on the wire).
@@ -175,30 +315,8 @@ pub enum MessageType {
     Response = 2,
 }
 
-impl serde::Serialize for MessageType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u8(*self as u8)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for MessageType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match u8::deserialize(deserializer)? {
-            1 => Ok(MessageType::Request),
-            2 => Ok(MessageType::Response),
-            _ => Err(serde::de::Error::custom("invalid message type")),
-        }
-    }
-}
-
 /// Runtime protocol message.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, cbor::Encode, cbor::Decode)]
 pub struct Message {
     /// Unique request identifier.
     pub id: u64,
@@ -206,7 +324,29 @@ pub struct Message {
     pub message_type: MessageType,
     /// Message body.
     pub body: Body,
-    /// Opentracing's SpanContext serialized in binary format.
-    #[serde(with = "serde_bytes")]
-    pub span_context: Vec<u8>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_consistent_check_tx_weight() {
+        let tcs = vec![
+            (
+                "cmNvbnNlbnN1c19tZXNzYWdlcw==",
+                TransactionWeight::ConsensusMessages,
+            ),
+            ("cmNvbnNlbnN1c19tZXNzYWdlcw==", "consensus_messages".into()),
+            ("Y2dhcw==", "gas".into()),
+        ];
+        for (encoded_base64, rr) in tcs {
+            let dec: TransactionWeight = cbor::from_slice(&base64::decode(encoded_base64).unwrap())
+                .expect("TransactionWeight should deserialize correctly");
+            assert_eq!(
+                dec, rr,
+                "decoded TransactionWeight should match the expected value"
+            );
+        }
+    }
 }

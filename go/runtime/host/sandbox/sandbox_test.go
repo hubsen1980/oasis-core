@@ -4,7 +4,10 @@ import (
 	"os"
 	"testing"
 
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	tendermint "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/tests"
 )
 
@@ -25,6 +28,10 @@ func TestProvisionerSandbox(t *testing.T) {
 	t.Run("Naked", func(t *testing.T) {
 		tests.TestProvisioner(t, cfg, func() (host.Provisioner, error) {
 			return New(Config{
+				HostInfo: &protocol.HostInfo{
+					ConsensusBackend:         tendermint.BackendName,
+					ConsensusProtocolVersion: version.Versions.ConsensusProtocol,
+				},
 				InsecureNoSandbox: true,
 				SandboxBinaryPath: bwrapPath,
 			})
@@ -34,6 +41,10 @@ func TestProvisionerSandbox(t *testing.T) {
 	t.Run("Sandboxed", func(t *testing.T) {
 		tests.TestProvisioner(t, cfg, func() (host.Provisioner, error) {
 			return New(Config{
+				HostInfo: &protocol.HostInfo{
+					ConsensusBackend:         tendermint.BackendName,
+					ConsensusProtocolVersion: version.Versions.ConsensusProtocol,
+				},
 				SandboxBinaryPath: bwrapPath,
 			})
 		}, nil)

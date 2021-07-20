@@ -4,25 +4,21 @@ import (
 	"fmt"
 	"sync"
 
-	commonWorker "github.com/oasisprotocol/oasis-core/go/worker/common"
+	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 )
 
 const (
 	computeIdentitySeedTemplate = "ekiden node worker %d"
 
-	ByzantineDefaultIdentitySeed = "ekiden byzantine node worker" // slot 0
+	ByzantineDefaultIdentitySeed = "ekiden byzantine node worker, luck=6" // Slot 3.
 	ByzantineSlot1IdentitySeed   = "ekiden byzantine node worker, luck=1"
-	ByzantineSlot2IdentitySeed   = "ekiden byzantine node worker, luck=11"
-	ByzantineSlot3IdentitySeed   = "ekiden byzantine node worker, luck=6"
 )
 
 // Compute is an Oasis compute node.
 type Compute struct { // nolint: maligned
 	sync.RWMutex
 
-	Node
-
-	entity *Entity
+	*Node
 
 	runtimeProvisioner string
 
@@ -30,18 +26,18 @@ type Compute struct { // nolint: maligned
 	clientPort    uint16
 	p2pPort       uint16
 
-	runtimes []int
+	runtimes      []int
+	runtimeConfig map[int]map[string]interface{}
 }
 
 // ComputeCfg is the Oasis compute node configuration.
 type ComputeCfg struct {
 	NodeCfg
 
-	Entity *Entity
-
 	RuntimeProvisioner string
 
-	Runtimes []int
+	Runtimes      []int
+	RuntimeConfig map[int]map[string]interface{}
 }
 
 // UpdateRuntimes updates the worker node runtimes.
@@ -81,18 +77,13 @@ func (worker *Compute) ExportsPath() string {
 	return nodeExportsPath(worker.dir)
 }
 
-// Start starts an Oasis node.
-func (worker *Compute) Start() error {
-	return worker.startNode()
-}
-
-func (worker *Compute) startNode() error {
+func (worker *Compute) AddArgs(args *argBuilder) error {
 	worker.RLock()
 	defer worker.RUnlock()
 
-	args := newArgBuilder().
-		debugDontBlameOasis().
+	args.debugDontBlameOasis().
 		debugAllowTestKeys().
+		debugEnableProfiling(worker.Node.pprofPort).
 		workerCertificateRotation(true).
 		tendermintCoreAddress(worker.consensusPort).
 		tendermintSubmissionGasPrice(worker.consensus.SubmissionGasPrice).
@@ -101,9 +92,10 @@ func (worker *Compute) startNode() error {
 		workerClientPort(worker.clientPort).
 		workerP2pPort(worker.p2pPort).
 		workerComputeEnabled().
-		workerRuntimeProvisioner(worker.runtimeProvisioner).
-		workerRuntimeSGXLoader(worker.net.cfg.RuntimeSGXLoaderBinary).
-		workerExecutorScheduleCheckTxEnabled().
+		runtimeProvisioner(worker.runtimeProvisioner).
+		runtimeSGXLoader(worker.net.cfg.RuntimeSGXLoaderBinary).
+		configureDebugCrashPoints(worker.crashPointsProbability).
+		tendermintSupplementarySanity(worker.supplementarySanityInterval).
 		appendNetwork(worker.net).
 		appendSeedNodes(worker.net.seeds).
 		appendEntity(worker.entity)
@@ -111,11 +103,7 @@ func (worker *Compute) startNode() error {
 	for _, idx := range worker.runtimes {
 		v := worker.net.runtimes[idx]
 		// XXX: could support configurable binary idx if ever needed.
-		args = args.appendComputeNodeRuntime(v, 0)
-	}
-
-	if err := worker.net.startOasisNode(&worker.Node, nil, args); err != nil {
-		return fmt.Errorf("oasis/compute: failed to launch node %s: %w", worker.Name, err)
+		worker.addHostedRuntime(v, v.teeHardware, 0, worker.runtimeConfig[idx])
 	}
 
 	return nil
@@ -124,62 +112,33 @@ func (worker *Compute) startNode() error {
 // NewCompute provisions a new compute node and adds it to the network.
 func (net *Network) NewCompute(cfg *ComputeCfg) (*Compute, error) {
 	computeName := fmt.Sprintf("compute-%d", len(net.computeWorkers))
-
-	computeDir, err := net.baseDir.NewSubDir(computeName)
+	host, err := net.GetNamedNode(computeName, &cfg.NodeCfg)
 	if err != nil {
-		net.logger.Error("failed to create compute subdir",
-			"err", err,
-			"compute_name", computeName,
-		)
-		return nil, fmt.Errorf("oasis/compute: failed to create compute subdir: %w", err)
-	}
-
-	// Pre-provision the node identity so that we can update the entity.
-	seed := fmt.Sprintf(computeIdentitySeedTemplate, len(net.computeWorkers))
-	nodeKey, _, _, err := net.provisionNodeIdentity(computeDir, seed, false)
-	if err != nil {
-		return nil, fmt.Errorf("oasis/compute: failed to provision node identity: %w", err)
-	}
-	if err := cfg.Entity.addNode(nodeKey); err != nil {
 		return nil, err
 	}
 
+	// Pre-provision the node identity so that we can update the entity.
+	err = host.setProvisionedIdentity(false, fmt.Sprintf(computeIdentitySeedTemplate, len(net.computeWorkers)))
+	if err != nil {
+		return nil, fmt.Errorf("oasis/compute: failed to provision node identity: %w", err)
+	}
+
 	if cfg.RuntimeProvisioner == "" {
-		cfg.RuntimeProvisioner = commonWorker.RuntimeProvisionerSandboxed
+		cfg.RuntimeProvisioner = runtimeRegistry.RuntimeProvisionerSandboxed
 	}
 
 	worker := &Compute{
-		Node: Node{
-			Name:                                     computeName,
-			net:                                      net,
-			dir:                                      computeDir,
-			termEarlyOk:                              cfg.AllowEarlyTermination,
-			termErrorOk:                              cfg.AllowErrorTermination,
-			disableDefaultLogWatcherHandlerFactories: cfg.DisableDefaultLogWatcherHandlerFactories,
-			logWatcherHandlerFactories:               cfg.LogWatcherHandlerFactories,
-			consensus:                                cfg.Consensus,
-			noAutoStart:                              cfg.NoAutoStart,
-		},
-		entity:             cfg.Entity,
+		Node:               host,
 		runtimeProvisioner: cfg.RuntimeProvisioner,
-		consensusPort:      net.nextNodePort,
-		clientPort:         net.nextNodePort + 1,
-		p2pPort:            net.nextNodePort + 2,
+		consensusPort:      host.getProvisionedPort(nodePortConsensus),
+		clientPort:         host.getProvisionedPort(nodePortClient),
+		p2pPort:            host.getProvisionedPort(nodePortP2P),
 		runtimes:           cfg.Runtimes,
+		runtimeConfig:      cfg.RuntimeConfig,
 	}
-	worker.doStartNode = worker.startNode
-	copy(worker.NodeID[:], nodeKey[:])
 
 	net.computeWorkers = append(net.computeWorkers, worker)
-	net.nextNodePort += 3
-
-	if err := net.AddLogWatcher(&worker.Node); err != nil {
-		net.logger.Error("failed to add log watcher",
-			"err", err,
-			"compute_name", computeName,
-		)
-		return nil, fmt.Errorf("oasis/compute: failed to add log watcher for %s: %w", computeName, err)
-	}
+	host.features = append(host.features, worker)
 
 	return worker, nil
 }

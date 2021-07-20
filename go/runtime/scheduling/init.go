@@ -3,18 +3,18 @@ package scheduling
 import (
 	"fmt"
 
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/scheduling/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/scheduling/simple"
-	"github.com/oasisprotocol/oasis-core/go/runtime/scheduling/simple/txpool/orderedmap"
+	"github.com/oasisprotocol/oasis-core/go/runtime/scheduling/simple/txpool/priorityqueue"
+	"github.com/oasisprotocol/oasis-core/go/runtime/transaction"
 )
 
 // New creates a new scheduler.
-func New(maxTxPoolSize uint64, params registry.TxnSchedulerParameters) (api.Scheduler, error) {
-	switch params.Algorithm {
+func New(maxTxPoolSize uint64, algo string, weightLimits map[transaction.Weight]uint64) (api.Scheduler, error) {
+	switch algo {
 	case simple.Name:
-		return simple.New(orderedmap.Name, maxTxPoolSize, params)
+		return simple.New(priorityqueue.Name, maxTxPoolSize, algo, weightLimits)
 	default:
-		return nil, fmt.Errorf("invalid transaction scheduler algorithm: %s", params.Algorithm)
+		return nil, fmt.Errorf("invalid transaction scheduler algorithm: %s", algo)
 	}
 }

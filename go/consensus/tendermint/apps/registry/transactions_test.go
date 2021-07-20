@@ -26,10 +26,11 @@ func TestRegisterNode(t *testing.T) {
 	now := time.Unix(1580461674, 0)
 	cfg := abciAPI.MockApplicationStateConfig{}
 	appState := abciAPI.NewMockApplicationState(&cfg)
-	ctx := appState.NewContext(abciAPI.ContextDeliverTx, now)
+	ctx := appState.NewContext(abciAPI.ContextEndBlock, now)
 	defer ctx.Close()
 
-	app := registryApplication{appState}
+	var md abciAPI.NoopMessageDispatcher
+	app := registryApplication{appState, &md}
 	state := registryState.NewMutableState(ctx.State())
 	stakeState := stakingState.NewMutableState(ctx.State())
 
@@ -120,14 +121,13 @@ func TestRegisterNode(t *testing.T) {
 			"ComputeNode",
 			func(tcd *testCaseData) {
 				// Create a new runtime.
-				rtSigner := memorySigner.NewTestSigner("consensus/tendermint/apps/registry: runtime signer: ComputeNode")
 				rt := registry.Runtime{
-					Versioned: cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-					ID:        common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNode"), 0),
-					Kind:      registry.KindCompute,
+					Versioned:       cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
+					ID:              common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNode"), 0),
+					Kind:            registry.KindCompute,
+					GovernanceModel: registry.GovernanceEntity,
 				}
-				sigRt, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt)
-				_ = state.SetRuntime(ctx, &rt, sigRt, false)
+				_ = state.SetRuntime(ctx, &rt, false)
 
 				tcd.node.AddRoles(node.RoleComputeWorker)
 				tcd.node.Runtimes = []*node.Runtime{
@@ -143,7 +143,6 @@ func TestRegisterNode(t *testing.T) {
 			"ComputeNodeWithoutPerRuntimeStake",
 			func(tcd *testCaseData) {
 				// Create a new runtime.
-				rtSigner := memorySigner.NewTestSigner("consensus/tendermint/apps/registry: runtime signer: ComputeNodeWithoutPerRuntimeStake")
 				rt := registry.Runtime{
 					Versioned: cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
 					ID:        common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithoutPerRuntimeStake"), 0),
@@ -153,9 +152,9 @@ func TestRegisterNode(t *testing.T) {
 							staking.KindNodeCompute: *quantity.NewFromUint64(1000),
 						},
 					},
+					GovernanceModel: registry.GovernanceEntity,
 				}
-				sigRt, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt)
-				_ = state.SetRuntime(ctx, &rt, sigRt, false)
+				_ = state.SetRuntime(ctx, &rt, false)
 
 				tcd.node.AddRoles(node.RoleComputeWorker)
 				tcd.node.Runtimes = []*node.Runtime{
@@ -166,12 +165,11 @@ func TestRegisterNode(t *testing.T) {
 			false,
 			false,
 		},
-		// Compute node with ehough per-runtime stake.
+		// Compute node with enough per-runtime stake.
 		{
 			"ComputeNodeWithPerRuntimeStake",
 			func(tcd *testCaseData) {
 				// Create a new runtime.
-				rtSigner := memorySigner.NewTestSigner("consensus/tendermint/apps/registry: runtime signer: ComputeNodeWithPerRuntimeStake")
 				rt := registry.Runtime{
 					Versioned: cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
 					ID:        common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithPerRuntimeStake"), 0),
@@ -181,9 +179,9 @@ func TestRegisterNode(t *testing.T) {
 							staking.KindNodeCompute: *quantity.NewFromUint64(1000),
 						},
 					},
+					GovernanceModel: registry.GovernanceEntity,
 				}
-				sigRt, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt)
-				_ = state.SetRuntime(ctx, &rt, sigRt, false)
+				_ = state.SetRuntime(ctx, &rt, false)
 
 				// Add bonded stake (hacky, without a self-delegation).
 				_ = stakeState.SetAccount(ctx, staking.NewAddress(tcd.node.EntityID), &staking.Account{
@@ -207,8 +205,6 @@ func TestRegisterNode(t *testing.T) {
 		{
 			"ComputeNodeWithoutPerRuntimeStakeMulti",
 			func(tcd *testCaseData) {
-				rtSigner := memorySigner.NewTestSigner("consensus/tendermint/apps/registry: runtime signer: ComputeNodeWithoutPerRuntimeStakeMulti")
-
 				// Create a new runtime.
 				rt1 := registry.Runtime{
 					Versioned: cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
@@ -219,15 +215,14 @@ func TestRegisterNode(t *testing.T) {
 							staking.KindNodeCompute: *quantity.NewFromUint64(1000),
 						},
 					},
+					GovernanceModel: registry.GovernanceEntity,
 				}
-				sigRt1, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt1)
-				_ = state.SetRuntime(ctx, &rt1, sigRt1, false)
+				_ = state.SetRuntime(ctx, &rt1, false)
 
 				// Create another runtime with a different identifier.
 				rt2 := rt1
 				rt2.ID = common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithoutPerRuntimeStakeMulti 2"), 0)
-				sigRt2, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt2)
-				_ = state.SetRuntime(ctx, &rt2, sigRt2, false)
+				_ = state.SetRuntime(ctx, &rt2, false)
 
 				// Add bonded stake (hacky, without a self-delegation).
 				_ = stakeState.SetAccount(ctx, staking.NewAddress(tcd.node.EntityID), &staking.Account{
@@ -252,22 +247,19 @@ func TestRegisterNode(t *testing.T) {
 		{
 			"ComputeNodeWithoutGlobalStakeMulti",
 			func(tcd *testCaseData) {
-				rtSigner := memorySigner.NewTestSigner("consensus/tendermint/apps/registry: runtime signer: ComputeNodeWithoutGlobalStakeMulti")
-
 				// Create a new runtime.
 				rt1 := registry.Runtime{
-					Versioned: cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-					ID:        common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithoutGlobalStakeMulti 1"), 0),
-					Kind:      registry.KindCompute,
+					Versioned:       cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
+					ID:              common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithoutGlobalStakeMulti 1"), 0),
+					Kind:            registry.KindCompute,
+					GovernanceModel: registry.GovernanceEntity,
 				}
-				sigRt1, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt1)
-				_ = state.SetRuntime(ctx, &rt1, sigRt1, false)
+				_ = state.SetRuntime(ctx, &rt1, false)
 
 				// Create another runtime with a different identifier.
 				rt2 := rt1
 				rt2.ID = common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: ComputeNodeWithoutGlobalStakeMulti 2"), 0)
-				sigRt2, _ := registry.SignRuntime(rtSigner, registry.RegisterRuntimeSignatureContext, &rt2)
-				_ = state.SetRuntime(ctx, &rt2, sigRt2, false)
+				_ = state.SetRuntime(ctx, &rt2, false)
 
 				// Add bonded stake (hacky, without a self-delegation).
 				_ = stakeState.SetAccount(ctx, staking.NewAddress(tcd.node.EntityID), &staking.Account{
@@ -344,6 +336,52 @@ func TestRegisterNode(t *testing.T) {
 			false,
 			true, // We tried to update an existing node, so it should keep existing.
 		},
+		// Changing the roles of an active node should be allowed.
+		{
+			"UpdateValidatorRolesNotAllowed",
+			func(tcd *testCaseData) {
+				// Create a new runtime.
+				rt := registry.Runtime{
+					Versioned:       cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
+					ID:              common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: UpdateValidatorNotAllowed"), 0),
+					Kind:            registry.KindCompute,
+					GovernanceModel: registry.GovernanceEntity,
+				}
+
+				_ = state.SetRuntime(ctx, &rt, false)
+				*tcd = *tcData["Validator"]
+				tcd.node.Expiration++
+				tcd.node.Roles = node.RoleComputeWorker
+				tcd.node.Runtimes = []*node.Runtime{{ID: rt.ID}}
+			},
+			nil,
+			false,
+			true,
+		},
+		// Changing the roles of an expired node should be allowed.
+		{
+			"UpdateValidatorExpiredRolesAllowed",
+			func(tcd *testCaseData) {
+				// Create a new runtime.
+				rt := registry.Runtime{
+					Versioned:       cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
+					ID:              common.NewTestNamespaceFromSeed([]byte("consensus/tendermint/apps/registry: runtime: UpdateValidatorExpiredAllowed"), 0),
+					Kind:            registry.KindCompute,
+					GovernanceModel: registry.GovernanceEntity,
+				}
+				_ = state.SetRuntime(ctx, &rt, false)
+				*tcd = *tcData["Validator"]
+				tcd.node.Roles = node.RoleComputeWorker
+				tcd.node.Runtimes = []*node.Runtime{{ID: rt.ID}}
+				tcd.node.Expiration = 12
+
+				// Make the existing node expired.
+				cfg.CurrentEpoch = 10
+			},
+			nil,
+			true,
+			true,
+		},
 	}
 
 	for _, tc := range tcs {
@@ -369,7 +407,7 @@ func TestRegisterNode(t *testing.T) {
 
 			// Prepare a test entity that owns the nodes.
 			ent := entity.Entity{
-				Versioned: cbor.NewVersioned(entity.LatestEntityDescriptorVersion),
+				Versioned: cbor.NewVersioned(entity.LatestDescriptorVersion),
 				ID:        tcd.entitySigner.Public(),
 				Nodes:     []signature.PublicKey{tcd.nodeSigner.Public()},
 			}
@@ -415,8 +453,10 @@ func TestRegisterNode(t *testing.T) {
 			require.NoError(err, "MultiSignNode")
 
 			// Attempt to register the node.
-			ctx.SetTxSigner(tcd.nodeSigner.Public())
-			err = app.registerNode(ctx, state, sigNode)
+			txCtx := appState.NewContext(abciAPI.ContextDeliverTx, now)
+			defer txCtx.Close()
+			txCtx.SetTxSigner(tcd.nodeSigner.Public())
+			err = app.registerNode(txCtx, state, sigNode)
 			switch tc.valid {
 			case true:
 				require.NoError(err, "node registration should succeed")

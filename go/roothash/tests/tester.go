@@ -3,6 +3,7 @@ package tests
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -11,19 +12,22 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
+	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
 	registryTests "github.com/oasisprotocol/oasis-core/go/registry/tests"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	"github.com/oasisprotocol/oasis-core/go/runtime/transaction"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
+	stakingTests "github.com/oasisprotocol/oasis-core/go/staking/tests"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/worker/storage"
 )
@@ -45,7 +49,7 @@ type runtimeState struct {
 // RootHashImplementationTests exercises the basic functionality of a
 // roothash backend.
 func RootHashImplementationTests(t *testing.T, backend api.Backend, consensus consensusAPI.Backend, identity *identity.Identity) {
-	seedBase := []byte("RootHashImplementationTests")
+	seedBase := []byte(fmt.Sprintf("RootHashImplementationTests: %T", backend))
 
 	require := require.New(t)
 
@@ -110,13 +114,17 @@ func RootHashImplementationTests(t *testing.T, backend api.Backend, consensus co
 	t.Run("RoundTimeoutWithEpochTransition", func(t *testing.T) {
 		testRoundTimeoutWithEpochTransition(t, backend, consensus, identity, rtStates)
 	})
+
+	t.Run("EquivocationEvidence", func(t *testing.T) {
+		testSubmitEquivocationEvidence(t, backend, consensus, identity, rtStates)
+	})
 }
 
 func testGenesisBlock(t *testing.T, backend api.Backend, state *runtimeState) {
 	require := require.New(t)
 
 	id := state.rt.Runtime.ID
-	ch, sub, err := backend.WatchBlocks(id)
+	ch, sub, err := backend.WatchBlocks(context.Background(), id)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -135,7 +143,10 @@ func testGenesisBlock(t *testing.T, backend api.Backend, state *runtimeState) {
 		t.Fatalf("failed to receive block")
 	}
 
-	blk, err := backend.GetLatestBlock(context.Background(), id, consensusAPI.HeightLatest)
+	blk, err := backend.GetLatestBlock(context.Background(), &api.RuntimeRequest{
+		RuntimeID: id,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetLatestBlock")
 	require.EqualValues(genesisBlock, blk, "retreived block is genesis block")
 
@@ -143,7 +154,10 @@ func testGenesisBlock(t *testing.T, backend api.Backend, state *runtimeState) {
 	// to subscribe to these updates and this would not be needed.
 	time.Sleep(1 * time.Second)
 
-	blk, err = backend.GetGenesisBlock(context.Background(), id, consensusAPI.HeightLatest)
+	blk, err = backend.GetGenesisBlock(context.Background(), &api.RuntimeRequest{
+		RuntimeID: id,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetGenesisBlock")
 	require.EqualValues(genesisBlock, blk, "retrieved block is genesis block")
 }
@@ -153,7 +167,10 @@ func testEpochTransitionBlock(t *testing.T, backend api.Backend, consensus conse
 
 	// Before an epoch transition there should just be a genesis block.
 	for _, v := range states {
-		genesisBlock, err := backend.GetLatestBlock(context.Background(), v.rt.Runtime.ID, consensusAPI.HeightLatest)
+		genesisBlock, err := backend.GetLatestBlock(context.Background(), &api.RuntimeRequest{
+			RuntimeID: v.rt.Runtime.ID,
+			Height:    consensusAPI.HeightLatest,
+		})
 		require.NoError(err, "GetLatestBlock")
 		require.EqualValues(0, genesisBlock.Header.Round, "genesis block round")
 
@@ -164,7 +181,7 @@ func testEpochTransitionBlock(t *testing.T, backend api.Backend, consensus conse
 	var blkChannels []<-chan *api.AnnotatedBlock
 	for i := range states {
 		v := states[i]
-		ch, sub, err := backend.WatchBlocks(v.rt.Runtime.ID)
+		ch, sub, err := backend.WatchBlocks(context.Background(), v.rt.Runtime.ID)
 		require.NoError(err, "WatchBlocks")
 		defer sub.Close()
 
@@ -172,8 +189,8 @@ func testEpochTransitionBlock(t *testing.T, backend api.Backend, consensus conse
 	}
 
 	// Advance the epoch.
-	timeSource := consensus.EpochTime().(epochtime.SetableBackend)
-	epochtimeTests.MustAdvanceEpoch(t, timeSource, 1)
+	timeSource := consensus.Beacon().(beacon.SetableBackend)
+	beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 	// Check for the expected post-epoch transition events.
 	for i, state := range states {
@@ -183,7 +200,10 @@ func testEpochTransitionBlock(t *testing.T, backend api.Backend, consensus conse
 
 	// Check if GetGenesisBlock still returns the correct genesis block.
 	for i := range states {
-		blk, err := backend.GetGenesisBlock(context.Background(), states[i].rt.Runtime.ID, consensusAPI.HeightLatest)
+		blk, err := backend.GetGenesisBlock(context.Background(), &api.RuntimeRequest{
+			RuntimeID: states[i].rt.Runtime.ID,
+			Height:    consensusAPI.HeightLatest,
+		})
 		require.NoError(err, "GetGenesisBlock")
 		require.EqualValues(0, blk.Header.Round, "retrieved block is genesis block")
 	}
@@ -195,7 +215,7 @@ func (s *runtimeState) refreshCommittees(t *testing.T, consensus consensusAPI.Ba
 		nodes[node.Node.ID] = node
 	}
 
-	epoch, err := consensus.EpochTime().GetEpoch(context.Background(), consensusAPI.HeightLatest)
+	epoch, err := consensus.Beacon().GetEpoch(context.Background(), consensusAPI.HeightLatest)
 	require.NoError(t, err, "GetEpoch")
 
 	s.executorCommittee, s.storageCommittee = mustGetCommittee(t, s.rt, epoch, consensus.Scheduler(), nodes)
@@ -259,6 +279,7 @@ func (s *runtimeState) generateExecutorCommitments(t *testing.T, consensus conse
 	ioRoot := storageAPI.Root{
 		Namespace: child.Header.Namespace,
 		Version:   child.Header.Round + 1,
+		Type:      storageAPI.RootTypeIO,
 	}
 	ioRoot.Hash.Empty()
 
@@ -294,11 +315,14 @@ func (s *runtimeState) generateExecutorCommitments(t *testing.T, consensus conse
 		child.Header.Namespace,
 		child.Header.Round+1,
 		[]storageAPI.ApplyOp{
-			{SrcRound: child.Header.Round + 1, SrcRoot: emptyRoot, DstRoot: ioRootHash, WriteLog: ioWriteLog},
+			{RootType: storageAPI.RootTypeIO, SrcRound: child.Header.Round + 1, SrcRoot: emptyRoot, DstRoot: ioRootHash, WriteLog: ioWriteLog},
 			// NOTE: Twice to get a receipt over both roots which we set to the same value.
-			{SrcRound: child.Header.Round, SrcRoot: emptyRoot, DstRoot: ioRootHash, WriteLog: ioWriteLog},
+			{RootType: storageAPI.RootTypeState, SrcRound: child.Header.Round, SrcRoot: emptyRoot, DstRoot: ioRootHash, WriteLog: ioWriteLog},
 		},
 	)
+
+	var msgsHash hash.Hash
+	msgsHash.Empty()
 
 	// Generate all the executor commitments.
 	executorNodes = append([]*registryTests.TestNode{}, executorCommittee.workers...)
@@ -309,6 +333,7 @@ func (s *runtimeState) generateExecutorCommitments(t *testing.T, consensus conse
 				PreviousHash: parent.Header.PreviousHash,
 				IORoot:       &parent.Header.IORoot,
 				StateRoot:    &parent.Header.StateRoot,
+				MessagesHash: &msgsHash,
 			},
 			StorageSignatures: parent.Header.StorageSignatures,
 			InputRoot:         hash.Hash{},
@@ -338,12 +363,12 @@ func (s *runtimeState) generateExecutorCommitments(t *testing.T, consensus conse
 		require.NotNil(schedulerNode, "TransactionScheduler missing in test nodes")
 
 		var signedDispatch *commitment.SignedProposedBatch
-		signedDispatch, err = commitment.SignProposedBatch(schedulerNode.Signer, dispatch)
+		signedDispatch, err = commitment.SignProposedBatch(schedulerNode.Signer, s.rt.Runtime.ID, dispatch)
 		require.NoError(err, "SignProposedBatch")
 		commitBody.TxnSchedSig = signedDispatch.Signature
 
 		// `err` shadows outside.
-		commit, err := commitment.SignExecutorCommitment(node.Signer, &commitBody) // nolint: vetshadow
+		commit, err := commitment.SignExecutorCommitment(node.Signer, s.rt.Runtime.ID, &commitBody) // nolint: vetshadow
 		require.NoError(err, "SignExecutorCommitment")
 
 		executorCommits = append(executorCommits, *commit)
@@ -354,10 +379,13 @@ func (s *runtimeState) generateExecutorCommitments(t *testing.T, consensus conse
 func (s *runtimeState) testSuccessfulRound(t *testing.T, backend api.Backend, consensus consensusAPI.Backend, identity *identity.Identity) {
 	require := require.New(t)
 
-	child, err := backend.GetLatestBlock(context.Background(), s.rt.Runtime.ID, consensusAPI.HeightLatest)
+	child, err := backend.GetLatestBlock(context.Background(), &api.RuntimeRequest{
+		RuntimeID: s.rt.Runtime.ID,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetLatestBlock")
 
-	ch, sub, err := backend.WatchBlocks(s.rt.Runtime.ID)
+	ch, sub, err := backend.WatchBlocks(context.Background(), s.rt.Runtime.ID)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -400,7 +428,10 @@ func (s *runtimeState) testSuccessfulRound(t *testing.T, backend api.Backend, co
 			// Executor commit event + Finalized event.
 			require.Len(evts, len(executorCommits)+1, "should have all events")
 			// First event is Finalized.
-			require.EqualValues(&api.FinalizedEvent{Round: header.Round}, evts[0].FinalizedEvent, "finalized event should have the right round")
+			fev := evts[0].Finalized
+			require.EqualValues(header.Round, fev.Round, "finalized event should have the right round")
+			require.Empty(fev.BadComputeNodes, "there should be no bad compute nodes")
+			require.Len(fev.GoodComputeNodes, len(executorNodes), "all nodes should be good (round %d)", fev.Round)
 			for i, ev := range evts[1:] {
 				switch {
 				case ev.ExecutorCommitted != nil:
@@ -429,10 +460,13 @@ func testRoundTimeout(t *testing.T, backend api.Backend, consensus consensusAPI.
 func (s *runtimeState) testRoundTimeout(t *testing.T, backend api.Backend, consensus consensusAPI.Backend, identity *identity.Identity) {
 	require := require.New(t)
 
-	child, err := backend.GetLatestBlock(context.Background(), s.rt.Runtime.ID, consensusAPI.HeightLatest)
+	child, err := backend.GetLatestBlock(context.Background(), &api.RuntimeRequest{
+		RuntimeID: s.rt.Runtime.ID,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetLatestBlock")
 
-	ch, sub, err := backend.WatchBlocks(s.rt.Runtime.ID)
+	ch, sub, err := backend.WatchBlocks(context.Background(), s.rt.Runtime.ID)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -503,10 +537,13 @@ func testRoundTimeoutWithEpochTransition(t *testing.T, backend api.Backend, cons
 func (s *runtimeState) testRoundTimeoutWithEpochTransition(t *testing.T, backend api.Backend, consensus consensusAPI.Backend, identity *identity.Identity) {
 	require := require.New(t)
 
-	child, err := backend.GetLatestBlock(context.Background(), s.rt.Runtime.ID, consensusAPI.HeightLatest)
+	child, err := backend.GetLatestBlock(context.Background(), &api.RuntimeRequest{
+		RuntimeID: s.rt.Runtime.ID,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetLatestBlock")
 
-	ch, sub, err := backend.WatchBlocks(s.rt.Runtime.ID)
+	ch, sub, err := backend.WatchBlocks(context.Background(), s.rt.Runtime.ID)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -543,8 +580,8 @@ WaitForRoundTimeoutBlocks:
 	}
 
 	// Trigger an epoch transition while the timeout is armed.
-	timeSource := consensus.EpochTime().(epochtime.SetableBackend)
-	epochtimeTests.MustAdvanceEpoch(t, timeSource, 1)
+	timeSource := consensus.Beacon().(beacon.SetableBackend)
+	beaconTests.MustAdvanceEpoch(t, timeSource, 1)
 
 	// Ensure that the epoch transition was processed correctly.
 	for {
@@ -579,10 +616,13 @@ func (s *runtimeState) testProposerTimeout(t *testing.T, backend api.Backend, co
 	require := require.New(t)
 	ctx := context.Background()
 
-	child, err := backend.GetLatestBlock(ctx, s.rt.Runtime.ID, consensusAPI.HeightLatest)
+	child, err := backend.GetLatestBlock(ctx, &api.RuntimeRequest{
+		RuntimeID: s.rt.Runtime.ID,
+		Height:    consensusAPI.HeightLatest,
+	})
 	require.NoError(err, "GetLatestBlock")
 
-	ch, sub, err := backend.WatchBlocks(s.rt.Runtime.ID)
+	ch, sub, err := backend.WatchBlocks(context.Background(), s.rt.Runtime.ID)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -671,7 +711,7 @@ type testCommittee struct {
 func mustGetCommittee(
 	t *testing.T,
 	rt *registryTests.TestRuntime,
-	epoch epochtime.EpochTime,
+	epoch beacon.EpochTime,
 	sched scheduler.Backend,
 	nodes map[signature.PublicKey]*registryTests.TestNode,
 ) (
@@ -765,7 +805,7 @@ func mustStore(
 	var signatures []signature.Signature
 	for _, node := range committee.workers {
 		var receipt *storageAPI.Receipt
-		receipt, err = storageAPI.SignReceipt(node.Signer, ns, round, body.Roots)
+		receipt, err = storageAPI.SignReceipt(node.Signer, ns, round, body.RootTypes, body.Roots)
 		require.NoError(err, "SignReceipt")
 
 		signatures = append(signatures, receipt.Signed.Signature)
@@ -779,15 +819,15 @@ func MustTransitionEpoch(
 	t *testing.T,
 	runtimeID common.Namespace,
 	roothash api.Backend,
-	epochtime epochtime.Backend,
-	epoch epochtime.EpochTime,
+	backend beacon.Backend,
+	epoch beacon.EpochTime,
 ) {
 	require := require.New(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), recvTimeout)
 	defer cancel()
 
-	blocksCh, sub, err := roothash.WatchBlocks(runtimeID)
+	blocksCh, sub, err := roothash.WatchBlocks(context.Background(), runtimeID)
 	require.NoError(err, "WatchBlocks")
 	defer sub.Close()
 
@@ -798,7 +838,7 @@ func MustTransitionEpoch(
 	for {
 		select {
 		case annBlk := <-blocksCh:
-			blkEpoch, err := epochtime.GetEpoch(ctx, annBlk.Height)
+			blkEpoch, err := backend.GetEpoch(ctx, annBlk.Height)
 			require.NoError(err, "GetEpoch")
 			if blkEpoch < epoch {
 				continue
@@ -809,4 +849,94 @@ func MustTransitionEpoch(
 			t.Fatalf("failed to receive epoch transition block")
 		}
 	}
+}
+
+func testSubmitEquivocationEvidence(t *testing.T, backend api.Backend, consensus consensusAPI.Backend, identity *identity.Identity, states []*runtimeState) {
+	require := require.New(t)
+
+	ctx := context.Background()
+
+	s := states[0]
+	child, err := backend.GetLatestBlock(ctx, &api.RuntimeRequest{
+		RuntimeID: s.rt.Runtime.ID,
+		Height:    consensusAPI.HeightLatest,
+	})
+	require.NoError(err, "GetLatestBlock")
+
+	// Generate and submit evidence of executor equivocation.
+	if len(s.executorCommittee.workers) < 2 {
+		t.Fatal("not enough executor nodes for running runtime misbehaviour evidence test")
+	}
+
+	// Generate evidence of executor equivocation.
+	node := s.executorCommittee.workers[0]
+	batch1 := &commitment.ProposedBatch{
+		IORoot:            child.Header.IORoot,
+		StorageSignatures: []signature.Signature{},
+		Header:            child.Header,
+	}
+	signedBatch1, err := commitment.SignProposedBatch(node.Signer, s.rt.Runtime.ID, batch1)
+	require.NoError(err, "SignProposedBatch")
+
+	batch2 := &commitment.ProposedBatch{
+		IORoot:            hash.NewFromBytes([]byte("different root")),
+		StorageSignatures: []signature.Signature{},
+		Header:            child.Header,
+	}
+	signedBatch2, err := commitment.SignProposedBatch(node.Signer, s.rt.Runtime.ID, batch2)
+	require.NoError(err, "SignProposedBatch")
+
+	ch, sub, err := consensus.Staking().WatchEvents(ctx)
+	require.NoError(err, "staking.WatchEvents")
+	defer sub.Close()
+
+	// Ensure misbehaving node entity has some stake.
+	entityAddress := staking.NewAddress(node.Node.EntityID)
+	escrow := &staking.Escrow{
+		Account: entityAddress,
+		Amount:  *quantity.NewFromUint64(100),
+	}
+	tx := staking.NewAddEscrowTx(0, nil, escrow)
+	err = consensusAPI.SignAndSubmitTx(ctx, consensus, stakingTests.Accounts.GetSigner(1), tx)
+	require.NoError(err, "AddEscrow")
+
+	// Submit evidence of executor equivocation.
+	tx = api.NewEvidenceTx(0, nil, &api.Evidence{
+		ID: s.rt.Runtime.ID,
+		EquivocationBatch: &api.EquivocationBatchEvidence{
+			BatchA: *signedBatch1,
+			BatchB: *signedBatch2,
+		},
+	})
+	submitter := s.executorCommittee.workers[1]
+	err = consensusAPI.SignAndSubmitTx(ctx, consensus, submitter.Signer, tx)
+	require.NoError(err, "SignAndSubmitTx(EvidenceTx)")
+
+	// Wait for the node to get slashed.
+WaitLoop:
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Escrow == nil {
+				continue
+			}
+
+			if e := ev.Escrow.Take; e != nil {
+				require.EqualValues(entityAddress, e.Owner, "TakeEscrowEvent - owner must be entity's address")
+				// All stake must be slashed as defined in debugGenesisState.
+				require.EqualValues(escrow.Amount, e.Amount, "TakeEscrowEvent - all stake slashed")
+				break WaitLoop
+			}
+		case <-time.After(recvTimeout):
+			t.Fatalf("failed to receive slash event")
+		}
+	}
+
+	// Ensure runtime acc got the slashed funds.
+	runtimeAcc, err := consensus.Staking().Account(ctx, &staking.OwnerQuery{
+		Height: consensusAPI.HeightLatest,
+		Owner:  staking.NewRuntimeAddress(s.rt.Runtime.ID),
+	})
+	require.NoError(err, "staking.Account(runtimeAddr)")
+	require.EqualValues(escrow.Amount, runtimeAcc.General.Balance, "Runtime account expected salshed balance")
 }

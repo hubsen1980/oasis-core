@@ -12,33 +12,38 @@ import (
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
-	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-const (
-	// NameRegistration is the name of the registration workload.
-	NameRegistration = "registration"
+// NameRegistration is the name of the registration workload.
+const NameRegistration = "registration"
 
+// Registration is the registration workload.
+var Registration = &registration{
+	BaseWorkload: NewBaseWorkload(NameRegistration),
+}
+
+const (
 	registryNumEntities        = 10
 	registryNumNodesPerEntity  = 5
 	registryNodeMaxEpochUpdate = 5
 )
 
-var registrationLogger = logging.GetLogger("cmd/txsource/workload/registration")
-
 type registration struct {
+	BaseWorkload
+
 	ns common.Namespace
 }
 
@@ -51,6 +56,7 @@ func getRuntime(entityID signature.PublicKey, id common.Namespace) *registry.Run
 		Executor: registry.ExecutorParameters{
 			GroupSize:    1,
 			RoundTimeout: 5,
+			MaxMessages:  32,
 		},
 		TxnScheduler: registry.TxnSchedulerParameters{
 			Algorithm:         "simple",
@@ -68,6 +74,23 @@ func getRuntime(entityID signature.PublicKey, id common.Namespace) *registry.Run
 		AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 			AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 		},
+		Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+			scheduler.KindComputeExecutor: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+				},
+			},
+			scheduler.KindStorage: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+				},
+			},
+		},
+		GovernanceModel: registry.GovernanceEntity,
 	}
 	rt.Genesis.StateRoot.Empty()
 	return rt
@@ -131,22 +154,16 @@ func getNodeDesc(rng *rand.Rand, nodeIdentity *identity.Identity, entityID signa
 }
 
 func signNode(identity *identity.Identity, nodeDesc *node.Node) (*node.MultiSignedNode, error) {
-	nodeSigners := []signature.Signer{
-		identity.NodeSigner,
-		identity.P2PSigner,
-		identity.ConsensusSigner,
-		identity.GetTLSSigner(),
-	}
-
-	sigNode, err := node.MultiSignNode(nodeSigners, registry.RegisterNodeSignatureContext, nodeDesc)
-	if err != nil {
-		registrationLogger.Error("failed to sign node descriptor",
-			"err", err,
-		)
-		return nil, err
-	}
-
-	return sigNode, nil
+	return node.MultiSignNode(
+		[]signature.Signer{
+			identity.NodeSigner,
+			identity.P2PSigner,
+			identity.ConsensusSigner,
+			identity.GetTLSSigner(),
+		},
+		registry.RegisterNodeSignatureContext,
+		nodeDesc,
+	)
 }
 
 // Implements Workload.
@@ -160,8 +177,14 @@ func (r *registration) Run( // nolint: gocyclo
 	rng *rand.Rand,
 	conn *grpc.ClientConn,
 	cnsc consensus.ClientBackend,
+	sm consensus.SubmissionManager,
 	fundingAccount signature.Signer,
+	validatorEntities []signature.Signer,
 ) error {
+	// Initialize base workload.
+	r.BaseWorkload.Init(cnsc, sm, fundingAccount)
+
+	beacon := beacon.NewBeaconClient(conn)
 	ctx := context.Background()
 	var err error
 
@@ -212,7 +235,7 @@ func (r *registration) Run( // nolint: gocyclo
 		}
 
 		ent := &entity.Entity{
-			Versioned: cbor.NewVersioned(entity.LatestEntityDescriptorVersion),
+			Versioned: cbor.NewVersioned(entity.LatestDescriptorVersion),
 			ID:        entityAccs[i].signer.Public(),
 		}
 
@@ -248,11 +271,11 @@ func (r *registration) Run( // nolint: gocyclo
 			return fmt.Errorf("failed to sign entity: %w", err)
 		}
 
-		// Estimate gas and submit transaction.
-		tx := registry.NewRegisterEntityTx(entityAccs[i].reckonedNonce, &transaction.Fee{}, sigEntity)
+		// Submit register entity transaction.
+		tx := registry.NewRegisterEntityTx(entityAccs[i].reckonedNonce, nil, sigEntity)
 		entityAccs[i].reckonedNonce++
-		if err := fundSignAndSubmitTx(ctx, registrationLogger, cnsc, entityAccs[i].signer, tx, fundingAccount); err != nil {
-			registrationLogger.Error("failed to sign and submit regsiter entity transaction",
+		if err := r.FundSignAndSubmitTx(ctx, entityAccs[i].signer, tx); err != nil {
+			r.Logger.Error("failed to sign and submit regsiter entity transaction",
 				"tx", tx,
 				"signer", entityAccs[i].signer,
 			)
@@ -264,15 +287,10 @@ func (r *registration) Run( // nolint: gocyclo
 		// also periodically register new runtimes.
 		if i == 0 {
 			runtimeDesc := getRuntime(entityAccs[i].signer.Public(), r.ns)
-			sigRuntime, err := registry.SignRuntime(entityAccs[i].signer, registry.RegisterRuntimeSignatureContext, runtimeDesc)
-			if err != nil {
-				return fmt.Errorf("failed to sign entity: %w", err)
-			}
-
-			tx := registry.NewRegisterRuntimeTx(entityAccs[i].reckonedNonce, &transaction.Fee{}, sigRuntime)
+			tx := registry.NewRegisterRuntimeTx(entityAccs[i].reckonedNonce, nil, runtimeDesc)
 			entityAccs[i].reckonedNonce++
-			if err := fundSignAndSubmitTx(ctx, registrationLogger, cnsc, entityAccs[i].signer, tx, fundingAccount); err != nil {
-				registrationLogger.Error("failed to sign and submit register runtime transaction",
+			if err := r.FundSignAndSubmitTx(ctx, entityAccs[i].signer, tx); err != nil {
+				r.Logger.Error("failed to sign and submit register runtime transaction",
 					"tx", tx,
 					"signer", entityAccs[i].signer,
 				)
@@ -287,9 +305,9 @@ func (r *registration) Run( // nolint: gocyclo
 		selectedNode := selectedAcc.nodeIdentities[rng.Intn(registryNumNodesPerEntity)]
 
 		// Current epoch.
-		epoch, err := cnsc.GetEpoch(ctx, consensus.HeightLatest)
+		epoch, err := beacon.GetEpoch(ctx, consensus.HeightLatest)
 		if err != nil {
-			return fmt.Errorf("GetEpoch: %w", err)
+			return fmt.Errorf("failed to get current epoch: %w", err)
 		}
 
 		// Randomized expiration.
@@ -298,28 +316,28 @@ func (r *registration) Run( // nolint: gocyclo
 		selectedNode.nodeDesc.Expiration = uint64(epoch) + 2 + uint64(rng.Intn(registryNodeMaxEpochUpdate-1))
 		sigNode, err := signNode(selectedNode.id, selectedNode.nodeDesc)
 		if err != nil {
-			return fmt.Errorf("signNode: %w", err)
+			return fmt.Errorf("failed to sign node: %w", err)
 		}
 
 		// Register node.
-		tx := registry.NewRegisterNodeTx(selectedNode.reckonedNonce, &transaction.Fee{}, sigNode)
+		tx := registry.NewRegisterNodeTx(selectedNode.reckonedNonce, nil, sigNode)
 		selectedNode.reckonedNonce++
-		if err := fundSignAndSubmitTx(ctx, registrationLogger, cnsc, selectedNode.id.NodeSigner, tx, fundingAccount); err != nil {
-			registrationLogger.Error("failed to sign and submit register node transaction",
+		if err := r.FundSignAndSubmitTx(ctx, selectedNode.id.NodeSigner, tx); err != nil {
+			r.Logger.Error("failed to sign and submit register node transaction",
 				"tx", tx,
 				"signer", selectedNode.id.NodeSigner,
 			)
 			return fmt.Errorf("failed to sign and submit tx: %w", err)
 		}
 
-		registrationLogger.Debug("registered node",
+		r.Logger.Debug("registered node",
 			"node", selectedNode.nodeDesc,
 		)
 
 		select {
 		case <-time.After(1 * time.Second):
 		case <-gracefulExit.Done():
-			registrationLogger.Debug("time's up")
+			r.Logger.Debug("time's up")
 			return nil
 		}
 	}

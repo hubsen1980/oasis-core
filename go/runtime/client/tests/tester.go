@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 )
@@ -37,6 +38,13 @@ func ClientImplementationTests(
 		ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 		defer cancelFunc()
 		testQuery(ctx, t, runtimeID, client, testInput)
+	})
+
+	noWaitInput := "squid at: " + time.Now().String()
+	t.Run("SubmitTxNoWait", func(t *testing.T) {
+		ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
+		defer cancelFunc()
+		testSubmitTransactionNoWait(ctx, t, runtimeID, client, noWaitInput)
 	})
 }
 
@@ -133,7 +141,7 @@ func testQuery(
 	// Check that indexer has indexed txn keys (check the mock worker for key/values).
 	tx, err = c.QueryTx(ctx, &api.QueryTxRequest{RuntimeID: runtimeID, Key: []byte("txn_foo"), Value: []byte("txn_bar")})
 	require.NoError(t, err, "QueryTx")
-	require.EqualValues(t, 2, tx.Block.Header.Round)
+	require.EqualValues(t, 3, tx.Block.Header.Round)
 	require.EqualValues(t, 0, tx.Index)
 	// Check for values from TestNode/ExecutorWorker/QueueTx
 	require.True(t, strings.HasPrefix(string(tx.Input), "hello world"))
@@ -146,10 +154,23 @@ func testQuery(
 	// Check for values from TestNode/Client/SubmitTx
 	require.EqualValues(t, testInput, txns[0])
 
+	txns, err = c.GetTransactions(ctx, &api.GetTransactionsRequest{RuntimeID: runtimeID, Round: blk.Header.Round})
+	require.NoError(t, err, "GetTransactions")
+	require.Len(t, txns, 1)
+	// Check for values from TestNode/Client/SubmitTx
+	require.EqualValues(t, testInput, txns[0])
+
+	// Check events query (see mock worker for emitted events).
+	events, err := c.GetEvents(ctx, &api.GetEventsRequest{RuntimeID: runtimeID, Round: 3})
+	require.NoError(t, err, "GetEvents")
+	require.Len(t, events, 1)
+	require.EqualValues(t, []byte("txn_foo"), events[0].Key)
+	require.EqualValues(t, []byte("txn_bar"), events[0].Value)
+
 	// Test advanced transaction queries.
 	query := api.Query{
 		RoundMin: 0,
-		RoundMax: 3,
+		RoundMax: 4,
 		Conditions: []api.QueryCondition{
 			{Key: []byte("txn_foo"), Values: [][]byte{[]byte("txn_bar")}},
 		},
@@ -161,7 +182,7 @@ func testQuery(
 	sort.Slice(results, func(i, j int) bool {
 		return bytes.Compare(results[i].Input, results[j].Input) < 0
 	})
-	require.EqualValues(t, 2, results[0].Block.Header.Round)
+	require.EqualValues(t, 3, results[0].Block.Header.Round)
 	require.EqualValues(t, 0, results[0].Index)
 	// Check for values from TestNode/ExecutorWorker/QueueTx
 	require.True(t, strings.HasPrefix(string(results[0].Input), "hello world"))
@@ -171,4 +192,57 @@ func testQuery(
 	genBlk2, err := c.GetGenesisBlock(ctx, runtimeID)
 	require.NoError(t, err, "GetGenesisBlock2")
 	require.EqualValues(t, genBlk, genBlk2, "GetGenesisBlock should match previous GetGenesisBlock")
+
+	// Query runtime.
+	// Since we are using the mock runtime host the response should be a CBOR-serialized method name
+	// with the added " world" string.
+	rsp, err := c.Query(ctx, &api.QueryRequest{
+		RuntimeID: runtimeID,
+		Round:     blk.Header.Round,
+		Method:    "hello",
+	})
+	require.NoError(t, err, "Query")
+	var decMethod string
+	err = cbor.Unmarshal(rsp.Data, &decMethod)
+	require.NoError(t, err, "cbor.Unmarshal(<QueryResponse.Data>)")
+	require.EqualValues(t, "hello world", decMethod, "Query response should be correct")
+
+	// Execute CheckTx using the mock runtime host.
+	err = c.CheckTx(ctx, &api.CheckTxRequest{
+		RuntimeID: runtimeID,
+		Data:      []byte("test checktx request"),
+	})
+	require.NoError(t, err, "CheckTx")
+}
+
+func testSubmitTransactionNoWait(
+	ctx context.Context,
+	t *testing.T,
+	runtimeID common.Namespace,
+	c api.RuntimeClient,
+	input string,
+) {
+	// Based on SubmitTx and the mock worker.
+	testInput := []byte(input)
+	testOutput := testInput
+
+	// Query current block.
+	blkLatest, err := c.GetBlock(ctx, &api.GetBlockRequest{RuntimeID: runtimeID, Round: api.RoundLatest})
+	require.NoError(t, err, "GetBlock(RoundLatest)")
+
+	// Submit a test transaction.
+	err = c.SubmitTxNoWait(ctx, &api.SubmitTxRequest{Data: testInput, RuntimeID: runtimeID})
+
+	// Check if everything is in order.
+	require.NoError(t, err, "SubmitTxNoWait")
+
+	// Ensure transaction was executed.
+	err = c.WaitBlockIndexed(ctx, &api.WaitBlockIndexedRequest{RuntimeID: runtimeID, Round: blkLatest.Header.Round + 1})
+	require.NoError(t, err, "WaitBlockIndexed")
+
+	// Get transaction by latest round.
+	tx, err := c.GetTx(ctx, &api.GetTxRequest{RuntimeID: runtimeID, Round: api.RoundLatest, Index: 0})
+	require.NoError(t, err, "GetTx(RoundLatest)")
+	require.EqualValues(t, testInput, tx.Input)
+	require.EqualValues(t, testOutput, tx.Output)
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -59,7 +60,8 @@ func (sc *registryCLIImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	// We will mock epochs for reclaiming the escrow.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
+	f.Network.SetInsecureBeacon()
 
 	return f, nil
 }
@@ -508,6 +510,7 @@ func (sc *registryCLIImpl) initNode(childEnv *env.Env, ent *entity.Entity, entDi
 	testNode.TLS.NextPubKey = n.TLS.NextPubKey
 	testNode.P2P.ID = n.P2P.ID
 	testNode.Consensus.ID = n.Consensus.ID
+	testNode.Beacon = n.Beacon
 	for idx := range testNode.TLS.Addresses {
 		testNode.TLS.Addresses[idx].PubKey = n.TLS.PubKey
 	}
@@ -634,8 +637,33 @@ func (sc *registryCLIImpl) testRuntime(ctx context.Context, childEnv *env.Env, c
 		},
 		AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 			EntityWhitelist: &registry.EntityWhitelistRuntimeAdmissionPolicy{
-				Entities: map[signature.PublicKey]bool{
-					testEntity.ID: true,
+				Entities: map[signature.PublicKey]registry.EntityWhitelistConfig{
+					testEntity.ID: {},
+				},
+			},
+		},
+		Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+			scheduler.KindComputeExecutor: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+					ValidatorSet: &registry.ValidatorSetConstraint{},
+				},
+				scheduler.RoleBackupWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 2,
+					},
+				},
+			},
+			scheduler.KindStorage: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 9,
+					},
+					MaxNodes: &registry.MaxNodesConstraint{
+						Limit: 1,
+					},
 				},
 			},
 		},
@@ -645,6 +673,7 @@ func (sc *registryCLIImpl) testRuntime(ctx context.Context, childEnv *env.Env, c
 				staking.KindNodeStorage: q,
 			},
 		},
+		GovernanceModel: registry.GovernanceEntity,
 	}
 	// Runtime ID 0x0 is for simple-keyvalue, 0xf... is for the keymanager. Let's use 0x1.
 	_ = testRuntime.ID.UnmarshalHex("8000000000000000000000000000000000000000000000000000000000000001")
@@ -653,12 +682,7 @@ func (sc *registryCLIImpl) testRuntime(ctx context.Context, childEnv *env.Env, c
 
 	// Generate register runtime transaction.
 	registerTxPath := filepath.Join(childEnv.Dir(), "registry_runtime_register.json")
-	genesisStatePath := filepath.Join(childEnv.Dir(), "registry_runtime_register_genesis_state.json")
-	genesisStateStr, _ := json.Marshal(testRuntime.Genesis.State)
-	if err = ioutil.WriteFile(genesisStatePath, genesisStateStr, 0o600); err != nil {
-		return err
-	}
-	if err = cli.Registry.GenerateRegisterRuntimeTx(0, testRuntime, registerTxPath, genesisStatePath); err != nil {
+	if err = cli.Registry.GenerateRegisterRuntimeTx(childEnv.Dir(), testRuntime, 0, registerTxPath); err != nil {
 		return fmt.Errorf("failed to generate runtime register tx: %w", err)
 	}
 

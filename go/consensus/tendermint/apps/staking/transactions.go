@@ -3,7 +3,6 @@ package staking
 import (
 	"fmt"
 
-	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
@@ -35,7 +34,12 @@ func (app *stakingApplication) transfer(ctx *api.Context, state *stakingState.Mu
 		return err
 	}
 
-	fromAddr := staking.NewAddress(ctx.TxSigner())
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
+	fromAddr := ctx.CallerAddress()
 	if fromAddr.IsReserved() || !isTransferPermitted(params, fromAddr) {
 		return staking.ErrForbidden
 	}
@@ -90,12 +94,11 @@ func (app *stakingApplication) transfer(ctx *api.Context, state *stakingState.Mu
 		"amount", xfer.Amount,
 	)
 
-	evt := &staking.TransferEvent{
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.TransferEvent{
 		From:   fromAddr,
 		To:     xfer.To,
 		Amount: xfer.Amount,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
+	}))
 
 	return nil
 }
@@ -114,7 +117,12 @@ func (app *stakingApplication) burn(ctx *api.Context, state *stakingState.Mutabl
 		return err
 	}
 
-	fromAddr := staking.NewAddress(ctx.TxSigner())
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
+	fromAddr := ctx.CallerAddress()
 	if fromAddr.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -152,11 +160,10 @@ func (app *stakingApplication) burn(ctx *api.Context, state *stakingState.Mutabl
 		"amount", burn.Amount,
 	)
 
-	evt := &staking.BurnEvent{
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.BurnEvent{
 		Owner:  fromAddr,
 		Amount: burn.Amount,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyBurn, cbor.Marshal(evt)))
+	}))
 
 	return nil
 }
@@ -175,12 +182,22 @@ func (app *stakingApplication) addEscrow(ctx *api.Context, state *stakingState.M
 		return err
 	}
 
-	// Check if sender provided at least a minimum amount of stake.
-	if escrow.Amount.Cmp(&params.MinDelegationAmount) < 0 {
-		return staking.ErrInvalidArgument
+	// Check if escrow messages are allowed.
+	if ctx.IsMessageExecution() && !params.AllowEscrowMessages {
+		return staking.ErrForbidden
 	}
 
-	fromAddr := staking.NewAddress(ctx.TxSigner())
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
+	// Check if sender provided at least a minimum amount of stake.
+	if escrow.Amount.Cmp(&params.MinDelegationAmount) < 0 {
+		return staking.ErrUnderMinDelegationAmount
+	}
+
+	fromAddr := ctx.CallerAddress()
 	if fromAddr.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -213,7 +230,8 @@ func (app *stakingApplication) addEscrow(ctx *api.Context, state *stakingState.M
 		return fmt.Errorf("failed to fetch delegation: %w", err)
 	}
 
-	if err = to.Escrow.Active.Deposit(&delegation.Shares, &from.General.Balance, &escrow.Amount); err != nil {
+	obtainedShares, err := to.Escrow.Active.Deposit(&delegation.Shares, &from.General.Balance, &escrow.Amount)
+	if err != nil {
 		ctx.Logger().Error("AddEscrow: failed to escrow stake",
 			"err", err,
 			"from", fromAddr,
@@ -241,14 +259,15 @@ func (app *stakingApplication) addEscrow(ctx *api.Context, state *stakingState.M
 		"from", fromAddr,
 		"to", escrow.Account,
 		"amount", escrow.Amount,
+		"obtained_shares", obtainedShares,
 	)
 
-	evt := &staking.AddEscrowEvent{
-		Owner:  fromAddr,
-		Escrow: escrow.Account,
-		Amount: escrow.Amount,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyAddEscrow, cbor.Marshal(evt)))
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.AddEscrowEvent{
+		Owner:     fromAddr,
+		Escrow:    escrow.Account,
+		Amount:    escrow.Amount,
+		NewShares: *obtainedShares,
+	}))
 
 	return nil
 }
@@ -272,7 +291,17 @@ func (app *stakingApplication) reclaimEscrow(ctx *api.Context, state *stakingSta
 		return err
 	}
 
-	toAddr := staking.NewAddress(ctx.TxSigner())
+	// Check if escrow messages are allowed.
+	if ctx.IsMessageExecution() && !params.AllowEscrowMessages {
+		return staking.ErrForbidden
+	}
+
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
+	toAddr := ctx.CallerAddress()
 	if toAddr.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -335,7 +364,8 @@ func (app *stakingApplication) reclaimEscrow(ctx *api.Context, state *stakingSta
 	}
 	stakeAmount := baseUnits.Clone()
 
-	if err = from.Escrow.Debonding.Deposit(&deb.Shares, &baseUnits, stakeAmount); err != nil {
+	var debondingShares *quantity.Quantity
+	if debondingShares, err = from.Escrow.Debonding.Deposit(&deb.Shares, &baseUnits, stakeAmount); err != nil {
 		ctx.Logger().Error("ReclaimEscrow: failed to debond shares",
 			"err", err,
 			"to", toAddr,
@@ -353,8 +383,9 @@ func (app *stakingApplication) reclaimEscrow(ctx *api.Context, state *stakingSta
 		return staking.ErrInvalidArgument
 	}
 
-	// Include the nonce as the final disambiguator to prevent overwriting debonding delegations.
-	if err = state.SetDebondingDelegation(ctx, toAddr, reclaim.Account, to.General.Nonce, &deb); err != nil {
+	// Include the end time epoch as the disambiguator. If a debonding delegation for the same account
+	// and end time already exists, the delegations will be merged.
+	if err = state.SetDebondingDelegation(ctx, toAddr, reclaim.Account, deb.DebondEndTime, &deb); err != nil {
 		return fmt.Errorf("failed to set debonding delegation: %w", err)
 	}
 
@@ -369,6 +400,22 @@ func (app *stakingApplication) reclaimEscrow(ctx *api.Context, state *stakingSta
 			return fmt.Errorf("failed to set account: %w", err)
 		}
 	}
+
+	ctx.Logger().Debug("ReclaimEscrow: started debonding stake",
+		"from", reclaim.Account,
+		"to", toAddr,
+		"base_units", stakeAmount,
+		"active_shares", reclaim.Shares,
+		"debonding_shares", debondingShares,
+	)
+
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.DebondingStartEscrowEvent{
+		Owner:           toAddr,
+		Escrow:          reclaim.Account,
+		Amount:          *stakeAmount,
+		ActiveShares:    reclaim.Shares,
+		DebondingShares: *debondingShares,
+	}))
 
 	return nil
 }
@@ -391,12 +438,17 @@ func (app *stakingApplication) amendCommissionSchedule(
 		return err
 	}
 
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
 	epoch, err := app.state.GetEpoch(ctx, ctx.BlockHeight()+1)
 	if err != nil {
 		return err
 	}
 
-	fromAddr := staking.NewAddress(ctx.TxSigner())
+	fromAddr := ctx.CallerAddress()
 	if fromAddr.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -439,13 +491,18 @@ func (app *stakingApplication) allow(
 		return err
 	}
 
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
 	// Allowances are disabled in case either max allowances is zero or if transfers are disabled.
 	if params.DisableTransfers || params.MaxAllowances == 0 {
 		return staking.ErrForbidden
 	}
 
 	// Validate addresses -- if either is reserved or both are equal, the method should fail.
-	addr := staking.NewAddress(ctx.TxSigner())
+	addr := ctx.CallerAddress()
 	if addr.IsReserved() || allow.Beneficiary.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -493,14 +550,13 @@ func (app *stakingApplication) allow(
 		return fmt.Errorf("failed to set account: %w", err)
 	}
 
-	evt := &staking.AllowanceChangeEvent{
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.AllowanceChangeEvent{
 		Owner:        addr,
 		Beneficiary:  allow.Beneficiary,
 		Allowance:    allowance,
 		Negative:     allow.Negative,
 		AmountChange: *amountChange,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyAllowanceChange, cbor.Marshal(evt)))
+	}))
 
 	return nil
 }
@@ -523,13 +579,18 @@ func (app *stakingApplication) withdraw(
 		return err
 	}
 
+	// Return early for simulation as we only need gas accounting.
+	if ctx.IsSimulation() {
+		return nil
+	}
+
 	// Allowances are disabled in case either max allowances is zero or if transfers are disabled.
 	if params.DisableTransfers || params.MaxAllowances == 0 {
 		return staking.ErrForbidden
 	}
 
 	// Validate addresses -- if either is reserved or both are equal, the method should fail.
-	toAddr := staking.NewAddress(ctx.TxSigner())
+	toAddr := ctx.CallerAddress()
 	if toAddr.IsReserved() || withdraw.From.IsReserved() {
 		return staking.ErrForbidden
 	}
@@ -577,21 +638,19 @@ func (app *stakingApplication) withdraw(
 		return fmt.Errorf("failed to set account: %w", err)
 	}
 
-	xferEvt := &staking.TransferEvent{
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.TransferEvent{
 		From:   withdraw.From,
 		To:     toAddr,
 		Amount: withdraw.Amount,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(xferEvt)))
+	}))
 
-	awEvt := &staking.AllowanceChangeEvent{
+	ctx.EmitEvent(api.NewEventBuilder(app.Name()).TypedAttribute(&staking.AllowanceChangeEvent{
 		Owner:        withdraw.From,
 		Beneficiary:  toAddr,
 		Allowance:    allowance,
 		Negative:     true,
 		AmountChange: withdraw.Amount,
-	}
-	ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyAllowanceChange, cbor.Marshal(awEvt)))
+	}))
 
 	return nil
 }

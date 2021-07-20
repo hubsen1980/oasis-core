@@ -23,6 +23,7 @@ import (
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
+	cmdContext "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/context"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
@@ -30,10 +31,9 @@ import (
 )
 
 const (
-	cfgAllowEntitySignedNodes = "entity.debug.allow_entity_signed_nodes"
-	CfgNodeID                 = "entity.node.id"
-	CfgNodeDescriptor         = "entity.node.descriptor"
-	CfgReuseSigner            = "entity.reuse_signer"
+	CfgNodeID         = "entity.node.id"
+	CfgNodeDescriptor = "entity.node.descriptor"
+	CfgReuseSigner    = "entity.reuse_signer"
 
 	entityGenesisFilename = "entity_genesis.json"
 )
@@ -167,8 +167,6 @@ func doUpdate(cmd *cobra.Command, args []string) {
 	}
 
 	// Update the entity.
-	ent.AllowEntitySignedNodes = viper.GetBool(cfgAllowEntitySignedNodes)
-
 	ent.Nodes = nil
 	for _, v := range viper.GetStringSlice(CfgNodeID) {
 		var nodeID signature.PublicKey
@@ -282,20 +280,12 @@ func doGenRegister(cmd *cobra.Command, args []string) {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	cmdConsensus.InitGenesis()
+	genesis := cmdConsensus.InitGenesis()
 	cmdConsensus.AssertTxFileOK()
 
-	entityDir, err := cmdSigner.CLIDirOrPwd()
+	ent, signer, err := cmdCommon.LoadEntitySigner()
 	if err != nil {
-		logger.Error("failed to retrieve entity dir",
-			"err", err,
-		)
-		os.Exit(1)
-	}
-
-	ent, signer, err := cmdCommon.LoadEntity(cmdSigner.Backend(), entityDir)
-	if err != nil {
-		logger.Error("failed to load entity",
+		logger.Error("failed to load entity and its signer",
 			"err", err,
 		)
 		os.Exit(1)
@@ -313,7 +303,7 @@ func doGenRegister(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := registry.NewRegisterEntityTx(nonce, fee, signed)
 
-	cmdConsensus.SignAndSaveTx(context.Background(), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, signer)
 }
 
 func doGenDeregister(cmd *cobra.Command, args []string) {
@@ -321,13 +311,13 @@ func doGenDeregister(cmd *cobra.Command, args []string) {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	cmdConsensus.InitGenesis()
+	genesis := cmdConsensus.InitGenesis()
 	cmdConsensus.AssertTxFileOK()
 
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := registry.NewDeregisterEntityTx(nonce, fee)
 
-	cmdConsensus.SignAndSaveTx(context.Background(), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func doList(cmd *cobra.Command, args []string) {
@@ -365,10 +355,6 @@ func loadOrGenerateEntity(dataDir string, generate bool) (*entity.Entity, signat
 		return entity.TestEntity()
 	}
 
-	if viper.GetBool(cfgAllowEntitySignedNodes) && !cmdFlags.DebugDontBlameOasis() {
-		return nil, nil, fmt.Errorf("loadOrGenerateEntity: sanity check failed: one or more unsafe debug flags set")
-	}
-
 	entityDir, err := cmdSigner.CLIDirOrPwd()
 	if err != nil {
 		logger.Error("failed to retrieve entity dir",
@@ -383,8 +369,7 @@ func loadOrGenerateEntity(dataDir string, generate bool) (*entity.Entity, signat
 
 	if generate {
 		template := &entity.Entity{
-			Versioned:              cbor.NewVersioned(entity.LatestEntityDescriptorVersion),
-			AllowEntitySignedNodes: viper.GetBool(cfgAllowEntitySignedNodes),
+			Versioned: cbor.NewVersioned(entity.LatestDescriptorVersion),
 		}
 
 		if viper.GetBool(CfgReuseSigner) {
@@ -425,10 +410,8 @@ func Register(parentCmd *cobra.Command) {
 }
 
 func init() {
-	entityFlags.Bool(cfgAllowEntitySignedNodes, false, "Entity signing key may be used for node registration (UNSAFE)")
 	entityFlags.AddFlagSet(cmdSigner.Flags)
 	entityFlags.AddFlagSet(cmdSigner.CLIFlags)
-	_ = entityFlags.MarkHidden(cfgAllowEntitySignedNodes)
 	_ = viper.BindPFlags(entityFlags)
 
 	initFlags.Bool(CfgReuseSigner, false, "Reuse entity signer instead of generating a new one")

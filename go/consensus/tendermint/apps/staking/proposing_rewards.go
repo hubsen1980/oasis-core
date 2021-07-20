@@ -6,11 +6,12 @@ import (
 
 	"github.com/tendermint/tendermint/abci/types"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	abciAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -18,18 +19,20 @@ func (app *stakingApplication) resolveEntityIDFromProposer(
 	ctx *abciAPI.Context,
 	regState *registryState.MutableState,
 	request types.RequestBeginBlock,
-) *signature.PublicKey {
-	var proposingEntity *signature.PublicKey
+) (*signature.PublicKey, error) {
 	proposerNode, err := regState.NodeByConsensusAddress(ctx, request.Header.ProposerAddress)
-	if err != nil {
+	switch err {
+	case nil:
+	case registry.ErrNoSuchNode:
 		ctx.Logger().Warn("failed to get proposer node",
 			"err", err,
 			"address", hex.EncodeToString(request.Header.ProposerAddress),
 		)
-	} else {
-		proposingEntity = &proposerNode.EntityID
+		return nil, nil
+	default:
+		return nil, err
 	}
-	return proposingEntity
+	return &proposerNode.EntityID, nil
 }
 
 func (app *stakingApplication) rewardBlockProposing(
@@ -52,7 +55,7 @@ func (app *stakingApplication) rewardBlockProposing(
 	if err != nil {
 		return fmt.Errorf("app state getting current epoch: %w", err)
 	}
-	invalidEpoch := epochtime.EpochInvalid // Workaround for incorrect go-fuzz instrumentation.
+	invalidEpoch := beacon.EpochInvalid // Workaround for incorrect go-fuzz instrumentation.
 	if epoch == invalidEpoch {
 		ctx.Logger().Info("rewardBlockProposing: this block does not belong to an epoch. no block proposing reward")
 		return nil

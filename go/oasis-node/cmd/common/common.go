@@ -31,7 +31,7 @@ const (
 	// CfgDebugRlimit is the command flag to set RLIMIT_NOFILE on launch.
 	CfgDebugRlimit = "debug.rlimit"
 
-	cfgConfigFile = "config"
+	CfgConfigFile = "config"
 	CfgDataDir    = "datadir"
 
 	badDefaultRlimit = 1024
@@ -123,7 +123,7 @@ func init() {
 	_ = debugRlimitFlag.MarkHidden(CfgDebugRlimit)
 	_ = viper.BindPFlags(debugRlimitFlag)
 
-	RootFlags.StringVar(&cfgFile, cfgConfigFile, "", "config file")
+	RootFlags.StringVar(&cfgFile, CfgConfigFile, "", "config file")
 	RootFlags.String(CfgDataDir, "", "data directory")
 	_ = viper.BindPFlags(RootFlags)
 
@@ -249,15 +249,19 @@ func GetInputReader(cmd *cobra.Command, cfg string) (io.ReadCloser, bool, error)
 	return r, true, err
 }
 
-// LoadEntity loads the entity and it's signer.
-func LoadEntity(signerBackend, entityDir string) (*entity.Entity, signature.Signer, error) {
+// LoadEntitySigner loads the entity and its signer.
+func LoadEntitySigner() (*entity.Entity, signature.Signer, error) {
 	if flags.DebugTestEntity() {
 		return entity.TestEntity()
 	}
-
-	factory, err := cmdSigner.NewFactory(signerBackend, entityDir, signature.SignerEntity)
+	entityDir, err := cmdSigner.CLIDirOrPwd()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to retrieve entity dir: %w", err)
+	}
+
+	factory, err := cmdSigner.NewFactory(cmdSigner.Backend(), entityDir, signature.SignerEntity)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create signer factory for %s: %w", cmdSigner.Backend(), err)
 	}
 
 	return entity.Load(entityDir, factory)
@@ -314,11 +318,9 @@ func GetUserConfirmation(prompt string) bool {
 // SetBasicVersionTemplate sets a basic custom version template for the given
 // cobra command that shows the version of Oasis Core and the Go toolchain.
 func SetBasicVersionTemplate(cmd *cobra.Command) {
-	cobra.AddTemplateFunc("additionalVersions", func() interface{} { return version.Versions })
+	cobra.AddTemplateFunc("toolchain", func() interface{} { return version.Toolchain })
 
 	cmd.SetVersionTemplate(`Software version: {{.Version}}
-{{- with additionalVersions }}
-Go toolchain version: {{ .Toolchain }}
-{{ end -}}
+Go toolchain version: {{ toolchain }}
 `)
 }

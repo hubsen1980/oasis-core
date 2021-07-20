@@ -30,9 +30,6 @@ updates:
       # Tendermint is manualy kept up to date.
       - dependency-name: github.com/tendermint/tendermint
       - dependency-name: github.com/tendermint/tm-db
-      # libp2p/go-libp2p-core@0.7.0 has build errors.
-      - dependency-name: github.com/libp2p/go-libp2p-core
-        versions: ["0.7.0"]
 
   # Manage Rust pacakge versions.
   - package-ecosystem: cargo
@@ -52,11 +49,6 @@ updates:
       - dependency-name: ring
       # Webpki update forces ring update.
       - dependency-name: webpki
-      # XXX: Following dependencies are outdated and require some manual work to
-      # be updated. Once any of the below dependencies is updated to the latest
-      # version, remove it from the ignore list.
-      - dependency-name: futures
-      - dependency-name: grpcio
       # Wait with update until https://github.com/Amanieu/intrusive-rs/pull/51
       # is merged and released, so we can continue using `intrusive_adapter!`
       # macro in`lru_cache.rs`.

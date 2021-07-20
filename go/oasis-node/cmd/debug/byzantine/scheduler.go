@@ -4,16 +4,16 @@ import (
 	"context"
 	"fmt"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
-func schedulerNextElectionHeight(svc consensus.Backend, epoch epochtime.EpochTime) (int64, error) {
+func schedulerNextElectionHeight(svc consensus.Backend, epoch beacon.EpochTime) (int64, error) {
 	ch, sub, err := svc.Scheduler().WatchCommittees(context.Background())
 	if err != nil {
 		return -1, fmt.Errorf("failed to watch committees: %w", err)
@@ -22,7 +22,7 @@ func schedulerNextElectionHeight(svc consensus.Backend, epoch epochtime.EpochTim
 
 	for {
 		if committee := <-ch; committee.ValidFor >= epoch {
-			height, err := svc.EpochTime().GetEpochBlock(context.Background(), committee.ValidFor)
+			height, err := svc.Beacon().GetEpochBlock(context.Background(), committee.ValidFor)
 			if err != nil {
 				return -1, fmt.Errorf("failed to get epoch block: %w", err)
 			}
@@ -55,17 +55,20 @@ func schedulerGetCommittee(ht *honestTendermint, height int64, kind scheduler.Co
 }
 
 func schedulerCheckScheduled(committee *scheduler.Committee, nodeID signature.PublicKey, role scheduler.Role) error {
+	var roles []scheduler.Role
 	for _, member := range committee.Members {
 		if !member.PublicKey.Equal(nodeID) {
 			continue
 		}
 
-		if member.Role != role {
-			return fmt.Errorf("we're scheduled as %s, expected %s", member.Role, role)
+		if member.Role == role {
+			// All good.
+			return nil
 		}
-
-		// All good.
-		return nil
+		roles = append(roles, role)
+	}
+	if len(roles) > 0 {
+		return fmt.Errorf("we're scheduled as %s, expected %s", fmt.Sprintf("%+v", roles), role)
 	}
 	if role == scheduler.RoleInvalid {
 		// It's expected that we're not scheduled.

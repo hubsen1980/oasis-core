@@ -7,6 +7,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 
+	cmnBackoff "github.com/oasisprotocol/oasis-core/go/common/backoff"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
@@ -46,6 +47,12 @@ func (pd *staticPriceDiscovery) GasPrice(ctx context.Context) (*quantity.Quantit
 
 // SubmissionManager is a transaction submission manager interface.
 type SubmissionManager interface {
+	// PriceDiscovery returns the configured price discovery mechanism instance.
+	PriceDiscovery() PriceDiscovery
+
+	// EstimateGasAndSetFee populates the fee field in the transaction if not already set.
+	EstimateGasAndSetFee(ctx context.Context, signer signature.Signer, tx *transaction.Transaction) error
+
 	// SignAndSubmitTx populates the nonce and fee fields in the transaction, signs the transaction
 	// with the passed signer and submits it to consensus backend.
 	//
@@ -59,6 +66,56 @@ type submissionManager struct {
 	maxFee         quantity.Quantity
 
 	logger *logging.Logger
+}
+
+// Implements SubmissionManager.
+func (m *submissionManager) PriceDiscovery() PriceDiscovery {
+	return m.priceDiscovery
+}
+
+// Implements SubmissionManager.
+func (m *submissionManager) EstimateGasAndSetFee(ctx context.Context, signer signature.Signer, tx *transaction.Transaction) error {
+	if tx.Fee != nil {
+		return nil
+	}
+
+	// Estimate amount of gas needed to perform the update.
+	var (
+		gas transaction.Gas
+		err error
+	)
+	gas, err = m.backend.EstimateGas(ctx, &EstimateGasRequest{Signer: signer.Public(), Transaction: tx})
+	if err != nil {
+		return fmt.Errorf("failed to estimate gas: %w", err)
+	}
+
+	// Fetch current consensus gas price and compute the fee.
+	var amount *quantity.Quantity
+	amount, err = m.priceDiscovery.GasPrice(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to determine gas price: %w", err)
+	}
+	var gasQuantity quantity.Quantity
+	if err = gasQuantity.FromUint64(uint64(gas)); err != nil {
+		return fmt.Errorf("failed to compute fee amount: %w", err)
+	}
+	if err = amount.Mul(&gasQuantity); err != nil {
+		return fmt.Errorf("failed to compute fee amount: %w", err)
+	}
+
+	// Verify that the fee doesn't exceed a configured ceiling.
+	if !m.maxFee.IsZero() && amount.Cmp(&m.maxFee) == 1 {
+		return fmt.Errorf("computed fee exceeds configured maximum: %s (max: %s)",
+			amount,
+			m.maxFee,
+		)
+	}
+
+	tx.Fee = &transaction.Fee{
+		Gas:    gas,
+		Amount: *amount,
+	}
+	return nil
 }
 
 func (m *submissionManager) signAndSubmitTx(ctx context.Context, signer signature.Signer, tx *transaction.Transaction) error {
@@ -76,41 +133,9 @@ func (m *submissionManager) signAndSubmitTx(ctx context.Context, signer signatur
 		return backoff.Permanent(err)
 	}
 
-	// In case the fee is not specified, perform fee estimation.
-	if tx.Fee == nil {
-		// Estimate amount of gas needed to perform the update.
-		var gas transaction.Gas
-		gas, err = m.backend.EstimateGas(ctx, &EstimateGasRequest{Signer: signer.Public(), Transaction: tx})
-		if err != nil {
-			return fmt.Errorf("failed to estimate gas: %w", err)
-		}
-
-		// Fetch current consensus gas price and compute the fee.
-		var amount *quantity.Quantity
-		amount, err = m.priceDiscovery.GasPrice(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to determine gas price: %w", err)
-		}
-		var gasQuantity quantity.Quantity
-		if err = gasQuantity.FromUint64(uint64(gas)); err != nil {
-			return fmt.Errorf("failed to compute fee amount: %w", err)
-		}
-		if err = amount.Mul(&gasQuantity); err != nil {
-			return fmt.Errorf("failed to compute fee amount: %w", err)
-		}
-
-		// Verify that the fee doesn't exceed a configured ceiling.
-		if !m.maxFee.IsZero() && amount.Cmp(&m.maxFee) == 1 {
-			return fmt.Errorf("computed fee exceeds configured maximum: %s (max: %s)",
-				amount,
-				m.maxFee,
-			)
-		}
-
-		tx.Fee = &transaction.Fee{
-			Gas:    gas,
-			Amount: *amount,
-		}
+	// Estimate the fee.
+	if err = m.EstimateGasAndSetFee(ctx, signer, tx); err != nil {
+		return fmt.Errorf("failed to estimate fee: %w", err)
 	}
 
 	// Sign the transaction.
@@ -123,22 +148,29 @@ func (m *submissionManager) signAndSubmitTx(ctx context.Context, signer signatur
 	}
 
 	if err = m.backend.SubmitTx(ctx, sigTx); err != nil {
-		if errors.Is(err, transaction.ErrInvalidNonce) {
+		switch {
+		case errors.Is(err, transaction.ErrUpgradePending):
+			// Pending upgrade, retry submission.
+			m.logger.Debug("retrying transaction submission due to pending upgrade")
+			return err
+		case errors.Is(err, transaction.ErrInvalidNonce):
 			// Invalid nonce, retry submission.
 			m.logger.Debug("retrying transaction submission due to invalid nonce",
 				"account_address", signerAddr,
 				"nonce", tx.Nonce,
 			)
 			return err
+		default:
+			return backoff.Permanent(err)
 		}
-		return backoff.Permanent(err)
 	}
 
 	return nil
 }
 
+// Implements SubmissionManager.
 func (m *submissionManager) SignAndSubmitTx(ctx context.Context, signer signature.Signer, tx *transaction.Transaction) error {
-	sched := backoff.NewExponentialBackOff()
+	sched := cmnBackoff.NewExponentialBackOff()
 	sched.MaxInterval = maxSubmissionRetryInterval
 	sched.MaxElapsedTime = maxSubmissionRetryElapsedTime
 

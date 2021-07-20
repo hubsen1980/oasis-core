@@ -1,23 +1,16 @@
 [package]
 name = "oasis-core-client"
-version = "0.3.0-alpha"
-authors = ["Oasis Labs Inc. <info@oasislabs.com>"]
+version = "0.0.0"
+authors = ["Oasis Protocol Foundation <info@oasisprotocol.org>"]
 edition = "2018"
 
 [dependencies]
 oasis-core-runtime = { path = "../runtime" }
-serde = { version = "1.0.117", features = ["derive"] }
-serde_bytes = "0.11.5"
-serde_cbor = "0.11.1"
+cbor = { version = "0.1.0", package = "oasis-cbor" }
+
+# Third party.
 anyhow = "1.0"
 thiserror = "1.0"
-futures = "0.1.25"
-tokio-executor = "0.1.6"
-tokio-current-thread = "0.1.5"
+futures = "0.3.15"
+tokio = { version = "1", features = ["rt", "sync"] }
 io-context = "0.2.0"
-
-[target.'cfg(not(target_env = "sgx"))'.dependencies]
-grpcio = "0.4.6"
-rustracing = "0.5.0"
-rustracing_jaeger = "0.6.0"
-tokio = "0.1.18"

@@ -8,11 +8,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	abciAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -73,15 +74,18 @@ func TestDelegationQueries(t *testing.T) {
 
 		// Init delegation.
 		var del staking.Delegation
-		err = escrowAccount.Escrow.Active.Deposit(&del.Shares, &account.General.Balance, mustInitQuantityP(t, i*100))
+		var newShares *quantity.Quantity
+		newShares, err = escrowAccount.Escrow.Active.Deposit(&del.Shares, &account.General.Balance, mustInitQuantityP(t, i*100))
 		require.NoError(err, "active escrow deposit")
+		require.Equal(newShares, &del.Shares, "new shares should equal initial delegation")
 		expectedDelegations[escrowAddr][addr] = &del
 
 		// Init debonding delegation.
 		var deb staking.DebondingDelegation
-		deb.DebondEndTime = epochtime.EpochTime(i)
-		err = escrowAccount.Escrow.Debonding.Deposit(&deb.Shares, &account.General.Balance, mustInitQuantityP(t, i*100))
+		deb.DebondEndTime = beacon.EpochTime(i)
+		newShares, err = escrowAccount.Escrow.Debonding.Deposit(&deb.Shares, &account.General.Balance, mustInitQuantityP(t, i*100))
 		require.NoError(err, "debonding escrow deposit")
+		require.Equal(newShares, &del.Shares, "new shares should equal initial debonding delegation")
 		expectedDebDelegations[escrowAddr][addr] = []*staking.DebondingDelegation{&deb}
 
 		// Update state.
@@ -89,7 +93,7 @@ func TestDelegationQueries(t *testing.T) {
 		require.NoError(err, "SetAccount")
 		err = s.SetDelegation(ctx, addr, escrowAddr, &del)
 		require.NoError(err, "SetDelegation")
-		err = s.SetDebondingDelegation(ctx, addr, escrowAddr, uint64(i), &deb)
+		err = s.SetDebondingDelegation(ctx, addr, escrowAddr, deb.DebondEndTime, &deb)
 		require.NoError(err, "SetDebondingDelegation")
 	}
 
@@ -118,6 +122,68 @@ func TestDelegationQueries(t *testing.T) {
 	debDelegations, err := s.DebondingDelegations(ctx)
 	require.NoError(err, "state.DebondingDelegations")
 	require.EqualValues(expectedDebDelegations, debDelegations, "DebondingDelegations should match expected")
+}
+
+func TestDebondingDelegation(t *testing.T) {
+	require := require.New(t)
+
+	now := time.Unix(1580461674, 0)
+	appState := abciAPI.NewMockApplicationState(&abciAPI.MockApplicationStateConfig{})
+	ctx := appState.NewContext(abciAPI.ContextBeginBlock, now)
+	defer ctx.Close()
+	s := NewMutableState(ctx.State())
+
+	fac := memorySigner.NewFactory()
+	// Generate accounts.
+	acc1Signer, err := fac.Generate(signature.SignerEntity, rand.Reader)
+	require.NoError(err, "generating account signer")
+	acc1Addr := staking.NewAddress(acc1Signer.Public())
+	acc2Signer, err := fac.Generate(signature.SignerEntity, rand.Reader)
+	require.NoError(err, "generating account signer")
+	acc2Addr := staking.NewAddress(acc2Signer.Public())
+	acc3Signer, err := fac.Generate(signature.SignerEntity, rand.Reader)
+	require.NoError(err, "generating account signer")
+	acc3Addr := staking.NewAddress(acc3Signer.Public())
+
+	// Initial debonding delegation.
+	deb := staking.DebondingDelegation{
+		Shares:        mustInitQuantity(t, 100),
+		DebondEndTime: beacon.EpochTime(10),
+	}
+	deb2 := staking.DebondingDelegation{
+		Shares:        mustInitQuantity(t, 100),
+		DebondEndTime: beacon.EpochTime(20),
+	}
+	deb3 := staking.DebondingDelegation{
+		Shares:        mustInitQuantity(t, 10),
+		DebondEndTime: beacon.EpochTime(10),
+	}
+	require.NoError(s.SetDebondingDelegation(ctx, acc1Addr, acc2Addr, deb.DebondEndTime, &deb), "SetDebondingDelegation")
+
+	// Add debonding delegation for same epoch, but different account.
+	require.NoError(s.SetDebondingDelegation(ctx, acc1Addr, acc3Addr, deb.DebondEndTime, &deb), "SetDebondingDelegation")
+
+	// Add debonding delegation for different epoch.
+	require.NoError(s.SetDebondingDelegation(ctx, acc1Addr, acc2Addr, deb2.DebondEndTime, &deb2), "SetDebondingDelegation")
+
+	// Add debonding delegation for same epoch and account.
+	// Delegation should merge with the existing debonding delegation.
+	require.NoError(s.SetDebondingDelegation(ctx, acc1Addr, acc2Addr, deb.DebondEndTime, &deb3), "SetDebondingDelegation")
+
+	// Query final state.
+	dds, err := s.DebondingDelegationsFor(ctx, acc1Addr)
+	require.NoError(err, "DebondingDelegations")
+	expectedDds := map[staking.Address][]*staking.DebondingDelegation{
+		acc2Addr: {
+			// Merged deb & deb3.
+			{Shares: mustInitQuantity(t, 110), DebondEndTime: beacon.EpochTime(10)},
+			&deb2,
+		},
+		acc3Addr: {
+			&deb,
+		},
+	}
+	require.EqualValues(expectedDds, dds, "expected debonding delegations should exist")
 }
 
 func TestRewardAndSlash(t *testing.T) {
@@ -161,17 +227,17 @@ func TestRewardAndSlash(t *testing.T) {
 	require.NoError(err, "commission schedule")
 
 	del := &staking.Delegation{}
-	err = escrowAccount.Escrow.Active.Deposit(&del.Shares, &delegatorAccount.General.Balance, mustInitQuantityP(t, 100))
+	_, err = escrowAccount.Escrow.Active.Deposit(&del.Shares, &delegatorAccount.General.Balance, mustInitQuantityP(t, 100))
 	require.NoError(err, "active escrow deposit")
 
 	var deb staking.DebondingDelegation
 	deb.DebondEndTime = 21
-	err = escrowAccount.Escrow.Debonding.Deposit(&deb.Shares, &delegatorAccount.General.Balance, mustInitQuantityP(t, 100))
+	_, err = escrowAccount.Escrow.Debonding.Deposit(&deb.Shares, &delegatorAccount.General.Balance, mustInitQuantityP(t, 100))
 	require.NoError(err, "debonding escrow deposit")
 
 	now := time.Unix(1580461674, 0)
 	appState := abciAPI.NewMockApplicationState(&abciAPI.MockApplicationStateConfig{})
-	ctx := appState.NewContext(abciAPI.ContextBeginBlock, now)
+	ctx := appState.NewContext(abciAPI.ContextEndBlock, now)
 	defer ctx.Close()
 
 	s := NewMutableState(ctx.State())
@@ -210,6 +276,30 @@ func TestRewardAndSlash(t *testing.T) {
 
 	// Epoch 10 is during the first step.
 	require.NoError(s.AddRewards(ctx, 10, mustInitQuantityP(t, 100_000), escrowAddrAsList), "add rewards epoch 10")
+
+	// Adding rewards should emit the correct events.
+	evs := ctx.GetEvents()
+	require.Len(evs, 3, "adding rewards should emit 3 events")
+	for _, ev := range evs {
+		require.Equal(abciAPI.EventTypeForApp(AppName), ev.Type, "all emitted events should be staking events")
+		require.Len(ev.Attributes, 1, "each event should have a single attribute")
+
+		switch string(ev.Attributes[0].Key) {
+		case "add_escrow":
+			var v staking.AddEscrowEvent
+			err = cbor.Unmarshal(ev.Attributes[0].Value, &v)
+			require.NoError(err, "malformed add escrow event")
+		case "transfer":
+			var v staking.TransferEvent
+			err = cbor.Unmarshal(ev.Attributes[0].Value, &v)
+			require.NoError(err, "malformed add escrow event")
+		default:
+			t.Fatalf("unexpected event key: %+v", ev.Attributes[0].Key)
+		}
+	}
+	require.Equal("add_escrow", string(evs[0].Attributes[0].Key), "first event should be an add escrow event")
+	require.Equal("transfer", string(evs[1].Attributes[0].Key), "second event should be a transfer event")
+	require.Equal("add_escrow", string(evs[2].Attributes[0].Key), "second event should be an add escrow event")
 
 	// 100% gain.
 	delegatorAccount, err = s.Account(ctx, delegatorAddr)
@@ -251,9 +341,9 @@ func TestRewardAndSlash(t *testing.T) {
 	require.NoError(err, "Account")
 	require.Equal(mustInitQuantity(t, 300), escrowAccount.Escrow.Active.Balance, "reward late epoch - escrow active escrow")
 
-	slashedNonzero, err := s.SlashEscrow(ctx, escrowAddr, mustInitQuantityP(t, 40))
+	slashed, err := s.SlashEscrow(ctx, escrowAddr, mustInitQuantityP(t, 40))
 	require.NoError(err, "slash escrow")
-	require.True(slashedNonzero, "slashed nonzero")
+	require.False(slashed.IsZero(), "slashed nonzero")
 
 	// Loss of 40 base units.
 	delegatorAccount, err = s.Account(ctx, delegatorAddr)
@@ -267,8 +357,35 @@ func TestRewardAndSlash(t *testing.T) {
 	require.NoError(err, "load common pool")
 	require.Equal(mustInitQuantityP(t, 9840), commonPool, "slash - common pool")
 
+	ctx = appState.NewContext(abciAPI.ContextEndBlock, now)
+	defer ctx.Close()
+
 	// Epoch 10 is during the first step.
 	require.NoError(s.AddRewardSingleAttenuated(ctx, 10, mustInitQuantityP(t, 10_000), 5, 10, escrowAddr), "add attenuated rewards epoch 30")
+
+	// Adding rewards should emit the correct events.
+	evs = ctx.GetEvents()
+	require.Len(evs, 3, "adding rewards should emit 3 events")
+	for _, ev := range evs {
+		require.Equal(abciAPI.EventTypeForApp(AppName), ev.Type, "all emitted events should be staking events")
+		require.Len(ev.Attributes, 1, "each event should have a single attribute")
+
+		switch string(ev.Attributes[0].Key) {
+		case "add_escrow":
+			var v staking.AddEscrowEvent
+			err = cbor.Unmarshal(ev.Attributes[0].Value, &v)
+			require.NoError(err, "malformed add escrow event")
+		case "transfer":
+			var v staking.TransferEvent
+			err = cbor.Unmarshal(ev.Attributes[0].Value, &v)
+			require.NoError(err, "malformed add escrow event")
+		default:
+			t.Fatalf("unexpected event key: %+v", ev.Attributes[0].Key)
+		}
+	}
+	require.Equal("add_escrow", string(evs[0].Attributes[0].Key), "first event should be an add escrow event")
+	require.Equal("transfer", string(evs[1].Attributes[0].Key), "second event should be a transfer event")
+	require.Equal("add_escrow", string(evs[2].Attributes[0].Key), "second event should be an add escrow event")
 
 	// 5% gain.
 	escrowAccount, err = s.Account(ctx, escrowAddr)
@@ -332,4 +449,202 @@ func TestEpochSigning(t *testing.T) {
 	require.NoError(err, "load cleared epoch signing info")
 	require.Zero(esClear.Total, "cleared epoch signing info total")
 	require.Empty(esClear.ByEntity, "cleared epoch signing info by entity")
+}
+
+func TestProposalDeposits(t *testing.T) {
+	now := time.Unix(1580461674, 0)
+	appState := abciAPI.NewMockApplicationState(&abciAPI.MockApplicationStateConfig{})
+	ctx := appState.NewContext(abciAPI.ContextDeliverTx, now)
+	defer ctx.Close()
+
+	// Prepare state.
+	s := NewMutableState(ctx.State())
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := staking.NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := staking.NewAddress(pk2)
+
+	err := s.SetAccount(ctx, addr1, &staking.Account{
+		General: staking.GeneralAccount{
+			Balance: *quantity.NewFromUint64(200),
+		},
+	})
+	require.NoError(t, err, "SetAccount")
+	err = s.SetAccount(ctx, addr2, &staking.Account{
+		General: staking.GeneralAccount{
+			Balance: *quantity.NewFromUint64(200),
+		},
+	})
+	require.NoError(t, err, "SetAccount")
+	err = s.SetGovernanceDeposits(ctx, quantity.NewFromUint64(0))
+	require.NoError(t, err, "SetGovernanceDeposits")
+
+	// Do governance deposits.
+	err = s.TransferToGovernanceDeposits(ctx, addr1, quantity.NewFromUint64(10))
+	require.NoError(t, err, "TransferToGovernanceDeposits")
+	err = s.TransferToGovernanceDeposits(ctx, addr2, quantity.NewFromUint64(20))
+	require.NoError(t, err, "TransferToGovernanceDeposits")
+
+	var deposits *quantity.Quantity
+	deposits, err = s.GovernanceDeposits(ctx)
+	require.NoError(t, err, "GovernanceDeposits")
+	require.EqualValues(t, quantity.NewFromUint64(30), deposits, "expected governance deposit should be made")
+
+	var acc1 *staking.Account
+	acc1, err = s.Account(ctx, addr1)
+	require.NoError(t, err, "Account")
+	require.EqualValues(t, *quantity.NewFromUint64(190), acc1.General.Balance, "expected governance deposit should be made")
+
+	var acc2 *staking.Account
+	acc2, err = s.Account(ctx, addr2)
+	require.NoError(t, err, "Account")
+	require.EqualValues(t, *quantity.NewFromUint64(180), acc2.General.Balance, "expected governance deposit should be made")
+
+	// Discard pk1 deposit.
+	err = s.DiscardGovernanceDeposit(ctx, quantity.NewFromUint64(10))
+	require.NoError(t, err, "DiscardGovernanceDeposit")
+
+	// Reclaim pk2 deposit.
+	err = s.TransferFromGovernanceDeposits(ctx, addr2, quantity.NewFromUint64(20))
+	require.NoError(t, err, "TransferFromGovernanceDeposits")
+
+	// Ensure final ballances are correct.
+	deposits, err = s.CommonPool(ctx)
+	require.NoError(t, err, "CommonPool")
+	require.EqualValues(t, quantity.NewFromUint64(10), deposits, "governance funds should be discarded into the common pool")
+
+	deposits, err = s.GovernanceDeposits(ctx)
+	require.NoError(t, err, "GovernanceDeposits")
+	require.EqualValues(t, quantity.NewFromUint64(0), deposits, "governance deposits should be empty")
+
+	acc1, err = s.Account(ctx, addr1)
+	require.NoError(t, err, "Account")
+	require.EqualValues(t, *quantity.NewFromUint64(190), acc1.General.Balance, "governance deposit should be discarded")
+
+	acc2, err = s.Account(ctx, addr2)
+	require.NoError(t, err, "Account")
+	require.EqualValues(t, *quantity.NewFromUint64(200), acc2.General.Balance, "governance deposit should be reclaimed")
+}
+
+func TestTransferFromCommon(t *testing.T) {
+	require := require.New(t)
+
+	now := time.Unix(1580461674, 0)
+	appState := abciAPI.NewMockApplicationState(&abciAPI.MockApplicationStateConfig{})
+	ctx := appState.NewContext(abciAPI.ContextDeliverTx, now)
+	defer ctx.Close()
+
+	// Prepare state.
+	s := NewMutableState(ctx.State())
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := staking.NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := staking.NewAddress(pk2)
+
+	err := s.SetCommonPool(ctx, quantity.NewFromUint64(1000))
+	require.NoError(err, "SetCommonPool")
+
+	// Transfer without escrow.
+	ok, err := s.TransferFromCommon(ctx, addr1, quantity.NewFromUint64(100), false)
+	require.NoError(err, "TransferFromCommon without escrow")
+	require.True(ok, "TransferFromCommon should succeed")
+
+	acc1, err := s.Account(ctx, addr1)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(100), acc1.General.Balance, "amount should be transferred to general balance")
+	require.EqualValues(*quantity.NewFromUint64(0), acc1.Escrow.Active.Balance, "nothing should be escrowed")
+
+	// Transfer with escrow (no delegations).
+	ok, err = s.TransferFromCommon(ctx, addr2, quantity.NewFromUint64(100), true)
+	require.NoError(err, "TransferFromCommon with escrow (no delegations)")
+	require.True(ok, "TransferFromCommon should succeed")
+
+	acc2, err := s.Account(ctx, addr2)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(0), acc2.General.Balance, "nothing should be in general balance")
+	require.EqualValues(*quantity.NewFromUint64(100), acc2.Escrow.Active.Balance, "amount should be escrowed")
+	dg, err := s.Delegation(ctx, addr2, addr2)
+	require.NoError(err, "Delegation")
+	require.EqualValues(*quantity.NewFromUint64(100), dg.Shares, "amount should be self-delegated")
+
+	// Transfer with escrow (existing self-delegation).
+	ok, err = s.TransferFromCommon(ctx, addr2, quantity.NewFromUint64(100), true)
+	require.NoError(err, "TransferFromCommon with escrow (existing self-delegation)")
+	require.True(ok, "TransferFromCommon should succeed")
+
+	acc2, err = s.Account(ctx, addr2)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(0), acc2.General.Balance, "nothing should be in general balance")
+	require.EqualValues(*quantity.NewFromUint64(200), acc2.Escrow.Active.Balance, "amount should be escrowed")
+	dg, err = s.Delegation(ctx, addr2, addr2)
+	require.NoError(err, "Delegation")
+	require.EqualValues(*quantity.NewFromUint64(100), dg.Shares, "shares should stay the same")
+
+	// Transfer with escrow (existing self-delegation and commission).
+	acc2.Escrow.CommissionSchedule = staking.CommissionSchedule{
+		Rates: []staking.CommissionRateStep{{
+			Start: 0,
+			Rate:  *quantity.NewFromUint64(20_000), // 20%
+		}},
+		Bounds: []staking.CommissionRateBoundStep{{
+			Start:   0,
+			RateMin: *quantity.NewFromUint64(0),
+			RateMax: *quantity.NewFromUint64(100_000), // 100%
+		}},
+	}
+	err = s.SetAccount(ctx, addr2, acc2)
+	require.NoError(err, "SetAccount")
+
+	ok, err = s.TransferFromCommon(ctx, addr2, quantity.NewFromUint64(100), true)
+	require.NoError(err, "TransferFromCommon with escrow (existing self-delegation and commission)")
+	require.True(ok, "TransferFromCommon should succeed")
+
+	acc2, err = s.Account(ctx, addr2)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(0), acc2.General.Balance, "nothing should be in general balance")
+	require.EqualValues(*quantity.NewFromUint64(300), acc2.Escrow.Active.Balance, "amount should be escrowed")
+	dg, err = s.Delegation(ctx, addr2, addr2)
+	require.NoError(err, "Delegation")
+	require.EqualValues(*quantity.NewFromUint64(107), dg.Shares, "20%% of amount should go towards increasing self-delegation")
+
+	// Transfer with escrow (other delegations and commission).
+	var dg2 staking.Delegation
+	_, err = acc2.Escrow.Active.Deposit(&dg2.Shares, quantity.NewFromUint64(100), quantity.NewFromUint64(100))
+	require.NoError(err, "Deposit")
+	err = s.SetDelegation(ctx, addr1, addr2, &dg2)
+	require.NoError(err, "SetDelegation")
+
+	ok, err = s.TransferFromCommon(ctx, addr2, quantity.NewFromUint64(1000), true)
+	require.NoError(err, "TransferFromCommon with escrow (existing delegations and commission)")
+	require.True(ok, "TransferFromCommon should succeed")
+
+	acc2, err = s.Account(ctx, addr2)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(0), acc2.General.Balance, "nothing should be in general balance")
+	require.EqualValues(*quantity.NewFromUint64(900), acc2.Escrow.Active.Balance, "remaining amount should be escrowed")
+	dg, err = s.Delegation(ctx, addr2, addr2)
+	require.NoError(err, "Delegation")
+	require.EqualValues(*quantity.NewFromUint64(123), dg.Shares, "20%% of amount should go towards increasing self-delegation")
+
+	acc1, err = s.Account(ctx, addr1)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(100), acc1.General.Balance, "general balance should be unchanged")
+	dg, err = s.Delegation(ctx, addr1, addr2)
+	require.NoError(err, "Delegation")
+	require.EqualValues(dg2.Shares, dg.Shares, "delegated amount should be unchanged")
+
+	// There should be nothing left in the common pool.
+	cp, err := s.CommonPool(ctx)
+	require.NoError(err, "CommonPool")
+	require.True(cp.IsZero(), "common pool should be depleted after all the transfers")
+
+	// Transfer from empty common pool should have no effect.
+	ok, err = s.TransferFromCommon(ctx, addr1, quantity.NewFromUint64(100), false)
+	require.NoError(err, "TransferFromCommon from depleted common pool")
+	require.False(ok, "TransferFromCommon should indicate that nothing was transferred")
+
+	acc1, err = s.Account(ctx, addr1)
+	require.NoError(err, "Account")
+	require.EqualValues(*quantity.NewFromUint64(100), acc1.General.Balance, "amount should be unchanged")
+	require.EqualValues(*quantity.NewFromUint64(0), acc1.Escrow.Active.Balance, "escrow amount should be unchanged")
 }

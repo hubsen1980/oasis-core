@@ -52,7 +52,7 @@ var (
 	}
 
 	controlCancelUpgradeCmd = &cobra.Command{
-		Use:   "cancel-upgrade",
+		Use:   "cancel-upgrade <upgrade-name>",
 		Short: "cancel a pending upgrade unless it is already in progress",
 		Run:   doCancelUpgrade,
 	}
@@ -157,8 +157,10 @@ func doUpgradeBinary(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if !desc.IsValid() {
-		logger.Error("submitted upgrade descriptor is not valid")
+	if err = desc.ValidateBasic(); err != nil {
+		logger.Error("submitted upgrade descriptor is not valid",
+			"err", err,
+		)
 		os.Exit(1)
 	}
 
@@ -174,7 +176,28 @@ func doCancelUpgrade(cmd *cobra.Command, args []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
-	err := client.CancelUpgrade(context.Background())
+	if len(args) == 0 {
+		logger.Error("expected descriptor path")
+		os.Exit(1)
+	}
+
+	descriptorBytes, err := ioutil.ReadFile(args[0])
+	if err != nil {
+		logger.Error("failed to read upgrade descriptor",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	var desc upgrade.Descriptor
+	if err = json.Unmarshal(descriptorBytes, &desc); err != nil {
+		logger.Error("can't parse upgrade descriptor",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	err = client.CancelUpgrade(context.Background(), &desc)
 	if err != nil {
 		logger.Error("failed to send upgrade cancellation request",
 			"err", err,

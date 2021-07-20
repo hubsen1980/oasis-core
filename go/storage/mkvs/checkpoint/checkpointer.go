@@ -9,8 +9,8 @@ import (
 	"github.com/eapache/channels"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	db "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 )
@@ -39,7 +39,7 @@ type CheckpointerConfig struct {
 	// specified, all finalized roots will be checkpointed.
 	//
 	// This must return exactly RootsPerVersion roots.
-	GetRoots func(context.Context, uint64) ([]hash.Hash, error)
+	GetRoots func(context.Context, uint64) ([]node.Root, error)
 }
 
 // CreationParameters are the checkpoint creation parameters used by the checkpointer.
@@ -52,54 +52,104 @@ type CreationParameters struct {
 
 	// ChunkSize is the chunk size parameter for checkpoint creation.
 	ChunkSize uint64
+
+	// InitialVersion is the initial version.
+	InitialVersion uint64
 }
 
 // Checkpointer is a checkpointer.
 type Checkpointer interface {
 	// NotifyNewVersion notifies the checkpointer that a new version has been finalized.
 	NotifyNewVersion(version uint64)
+
+	// ForceCheckpoint makes the checkpointer create a checkpoint of the given version even if it is
+	// outside the regular checkpoint schedule. In case the checkpoint at that version already
+	// exists, this will be a no-op.
+	//
+	// The checkpoint will be created asynchronously.
+	ForceCheckpoint(version uint64)
+
+	// WatchCheckpoints returns a channel that produces a stream of checkpointed versions. The
+	// versions are emitted before the checkpointing process starts.
+	WatchCheckpoints() (<-chan uint64, pubsub.ClosableSubscription, error)
+
+	// Flush makes the checkpointer immediately process any notifications.
+	Flush()
+
+	// Pause pauses or unpauses the checkpointer. Pausing doesn't influence the checkpointing
+	// intervals; after unpausing, a checkpoint won't be created immediately, but the checkpointer
+	// will wait for the next regular event.
+	Pause(pause bool)
 }
 
 type checkpointer struct {
 	cfg CheckpointerConfig
 
-	ndb      db.NodeDB
-	creator  Creator
-	notifyCh *channels.RingChannel
-	statusCh chan struct{}
+	ndb        db.NodeDB
+	creator    Creator
+	notifyCh   *channels.RingChannel
+	flushCh    *channels.RingChannel
+	statusCh   chan struct{}
+	pausedCh   chan bool
+	cpNotifier *pubsub.Broker
 
 	logger *logging.Logger
 }
 
+type notifyNewVersion struct {
+	version uint64
+}
+
+type notifyForceCheckpoint struct {
+	version uint64
+}
+
 // Implements Checkpointer.
 func (c *checkpointer) NotifyNewVersion(version uint64) {
-	c.notifyCh.In() <- version
+	c.notifyCh.In() <- notifyNewVersion{version}
+}
+
+// Implements Checkpointer.
+func (c *checkpointer) ForceCheckpoint(version uint64) {
+	c.notifyCh.In() <- notifyForceCheckpoint{version}
+}
+
+// Implements Checkpointer.
+func (c *checkpointer) WatchCheckpoints() (<-chan uint64, pubsub.ClosableSubscription, error) {
+	typedCh := make(chan uint64)
+	sub := c.cpNotifier.Subscribe()
+	sub.Unwrap(typedCh)
+
+	return typedCh, sub, nil
+}
+
+// Implements Checkpointer.
+func (c *checkpointer) Flush() {
+	c.flushCh.In() <- struct{}{}
+}
+
+func (c *checkpointer) Pause(pause bool) {
+	c.pausedCh <- pause
 }
 
 func (c *checkpointer) checkpoint(ctx context.Context, version uint64, params *CreationParameters) (err error) {
-	var rootHashes []hash.Hash
+	// Notify watchers about the checkpoint we are about to make.
+	c.cpNotifier.Broadcast(version)
+
+	var roots []node.Root
 	if c.cfg.GetRoots == nil {
-		rootHashes, err = c.ndb.GetRootsForVersion(ctx, version)
+		roots, err = c.ndb.GetRootsForVersion(ctx, version)
 	} else {
-		rootHashes, err = c.cfg.GetRoots(ctx, version)
+		roots, err = c.cfg.GetRoots(ctx, version)
 	}
 	if err != nil {
 		return fmt.Errorf("checkpointer: failed to get storage roots: %w", err)
 	}
-	if len(rootHashes) != c.cfg.RootsPerVersion {
+	if len(roots) != c.cfg.RootsPerVersion {
 		return fmt.Errorf("checkpointer: unexpected number of roots for version (expected: %d got: %d)",
 			c.cfg.RootsPerVersion,
-			len(rootHashes),
+			len(roots),
 		)
-	}
-
-	var roots []node.Root
-	for _, h := range rootHashes {
-		roots = append(roots, node.Root{
-			Namespace: c.cfg.Namespace,
-			Version:   version,
-			Hash:      h,
-		})
 	}
 
 	defer func() {
@@ -156,9 +206,23 @@ func (c *checkpointer) maybeCheckpoint(ctx context.Context, version uint64, para
 	}
 	sort.Slice(cpVersions, func(i, j int) bool { return cpVersions[i] < cpVersions[j] })
 
-	// Checkpoint any missing versions.
-	cpInterval := params.Interval
-	for cpVersion := lastCheckpointVersion + cpInterval; cpVersion < version; cpVersion = cpVersion + cpInterval {
+	// Make sure to not start earlier than the earliest version.
+	earlyVersion, err := c.ndb.GetEarliestVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("checkpointer: failed to get earliest version: %w", err)
+	}
+	firstCheckpointVersion := lastCheckpointVersion + 1 // We can checkpoint the next version.
+	if firstCheckpointVersion < earlyVersion {
+		firstCheckpointVersion = earlyVersion
+	}
+	if firstCheckpointVersion < params.InitialVersion {
+		firstCheckpointVersion = params.InitialVersion
+	}
+
+	// Checkpoint any missing versions in descending order, stopping at NumKept checkpoints.
+	newCheckpointVersion := ((version-params.InitialVersion)/params.Interval)*params.Interval + params.InitialVersion
+	var numAddedCheckpoints uint64
+	for cpVersion := newCheckpointVersion; cpVersion >= firstCheckpointVersion; {
 		c.logger.Info("checkpointing version",
 			"version", cpVersion,
 		)
@@ -168,7 +232,20 @@ func (c *checkpointer) maybeCheckpoint(ctx context.Context, version uint64, para
 				"version", cpVersion,
 				"err", err,
 			)
-			return fmt.Errorf("checkpointer: failed to checkpoint version: %w", err)
+			break
+		}
+
+		// Move to the next version, avoiding possible underflow.
+		if cpVersion < params.Interval {
+			break
+		}
+		cpVersion = cpVersion - params.Interval
+
+		// Stop when we have enough checkpoints as otherwise we will be creating checkpoints which
+		// will be garbage collected anyway.
+		numAddedCheckpoints++
+		if numAddedCheckpoints >= params.NumKept {
+			break
 		}
 	}
 
@@ -207,55 +284,83 @@ func (c *checkpointer) worker(ctx context.Context) {
 	ticker := time.NewTicker(c.cfg.CheckInterval)
 	defer ticker.Stop()
 
+	paused := false
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var version uint64
-			select {
-			case <-ctx.Done():
-				return
-			case v := <-c.notifyCh.Out():
-				version = v.(uint64)
-			}
+		case <-c.flushCh.Out():
+		case paused = <-c.pausedCh:
+			continue
+		}
 
-			// Fetch current checkpoint parameters.
-			params := c.cfg.Parameters
-			if params == nil && c.cfg.GetParameters != nil {
-				var err error
-				params, err = c.cfg.GetParameters(ctx)
-				if err != nil {
-					c.logger.Error("failed to get checkpoint parameters",
-						"err", err,
-						"version", version,
-					)
-					continue
-				}
+		var (
+			version uint64
+			force   bool
+		)
+		select {
+		case <-ctx.Done():
+			return
+		case n := <-c.notifyCh.Out():
+			switch nf := n.(type) {
+			case notifyNewVersion:
+				version = nf.version
+			case notifyForceCheckpoint:
+				version = nf.version
+				force = true
+			default:
+				panic(fmt.Errorf("unsupported checkpointer notification type: %T", nf))
 			}
-			if params == nil {
-				c.logger.Error("no checkpoint parameters")
-				continue
-			}
+		}
 
-			// Don't checkpoint if checkpoints are disabled.
-			if params.Interval == 0 {
-				continue
-			}
+		if paused && !force {
+			continue
+		}
 
-			if err := c.maybeCheckpoint(ctx, version, params); err != nil {
-				c.logger.Error("failed to checkpoint",
-					"version", version,
+		// Fetch current checkpoint parameters.
+		params := c.cfg.Parameters
+		if params == nil && c.cfg.GetParameters != nil {
+			var err error
+			params, err = c.cfg.GetParameters(ctx)
+			if err != nil {
+				c.logger.Error("failed to get checkpoint parameters",
 					"err", err,
+					"version", version,
 				)
 				continue
 			}
+		}
+		if params == nil {
+			c.logger.Error("no checkpoint parameters")
+			continue
+		}
 
-			// Emit status update if someone is listening. This is only used in tests.
-			select {
-			case c.statusCh <- struct{}{}:
-			default:
-			}
+		// Don't checkpoint if checkpoints are disabled.
+		if params.Interval == 0 && !force {
+			continue
+		}
+
+		var err error
+		switch force {
+		case false:
+			err = c.maybeCheckpoint(ctx, version, params)
+		case true:
+			err = c.checkpoint(ctx, version, params)
+		}
+		if err != nil {
+			c.logger.Error("failed to checkpoint",
+				"version", version,
+				"err", err,
+			)
+			continue
+		}
+
+		// Emit status update if someone is listening. This is only used in tests.
+		select {
+		case c.statusCh <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -269,12 +374,15 @@ func NewCheckpointer(
 	cfg CheckpointerConfig,
 ) (Checkpointer, error) {
 	c := &checkpointer{
-		cfg:      cfg,
-		ndb:      ndb,
-		creator:  creator,
-		notifyCh: channels.NewRingChannel(1),
-		statusCh: make(chan struct{}),
-		logger:   logging.GetLogger("storage/mkvs/checkpoint/"+cfg.Name).With("namespace", cfg.Namespace),
+		cfg:        cfg,
+		ndb:        ndb,
+		creator:    creator,
+		notifyCh:   channels.NewRingChannel(1),
+		flushCh:    channels.NewRingChannel(1),
+		statusCh:   make(chan struct{}),
+		pausedCh:   make(chan bool),
+		cpNotifier: pubsub.NewBroker(false),
+		logger:     logging.GetLogger("storage/mkvs/checkpoint/"+cfg.Name).With("namespace", cfg.Namespace),
 	}
 	go c.worker(ctx)
 	return c, nil

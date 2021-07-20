@@ -3,7 +3,6 @@ package api
 
 import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/transaction"
 )
 
@@ -12,32 +11,14 @@ type Scheduler interface {
 	// Name is the scheduler algorithm name.
 	Name() string
 
-	// Initialize initializes the internal scheduler state.
-	// Scheduler should use the provided transaction dispatcher to dispatch
-	// transactions.
-	Initialize(td TransactionDispatcher) error
-
-	// IsInitialized returns true, if the scheduler has been initialized.
-	IsInitialized() bool
-
-	// ScheduleTx attempts to schedule a transaction.
-	//
-	// The scheduling algorithm may peek into the transaction to extract
-	// metadata needed for scheduling. In this case, the transaction bytes
-	// must correspond to a transaction.TxnCall structure.
-	ScheduleTx(tx []byte) error
-
-	// AppendTxBatch appends a transaction batch for scheduling.
-	//
-	// Note: the AppendTxBatch is not required to be atomic. Semantics depend
-	// on the specific scheduler implementation.
-	AppendTxBatch(batch [][]byte) error
+	// QueueTx queues a transaction for scheduling.
+	QueueTx(tx *transaction.CheckedTransaction) error
 
 	// RemoveTxBatch removes a transaction batch.
-	RemoveTxBatch(tx [][]byte) error
+	RemoveTxBatch(tx []hash.Hash) error
 
-	// Flush flushes queued transactions.
-	Flush(force bool) error
+	// GetBatch returns a batch of scheduled transactions (if any is available).
+	GetBatch(force bool) []*transaction.CheckedTransaction
 
 	// UnscheduledSize returns number of unscheduled items.
 	UnscheduledSize() uint64
@@ -46,14 +27,8 @@ type Scheduler interface {
 	IsQueued(hash.Hash) bool
 
 	// UpdateParameters updates the scheduling parameters.
-	UpdateParameters(registry.TxnSchedulerParameters) error
+	UpdateParameters(algo string, weightLimits map[transaction.Weight]uint64) error
 
 	// Clear clears the transaction queue.
 	Clear()
-}
-
-// TransactionDispatcher dispatches transactions to a scheduled executor committee.
-type TransactionDispatcher interface {
-	// Dispatch attempts to dispatch a batch to a executor committee.
-	Dispatch(batch transaction.RawBatch) error
 }

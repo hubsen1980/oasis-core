@@ -105,6 +105,74 @@ func getAccount(ctx context.Context, cmd *cobra.Command, addr api.Address, clien
 	return acct
 }
 
+func getDelegationInfosFor(
+	ctx context.Context,
+	cmd *cobra.Command,
+	addr api.Address,
+	client api.Backend,
+) map[api.Address]*api.DelegationInfo {
+	delInfos, err := client.DelegationInfosFor(ctx, &api.OwnerQuery{Owner: addr, Height: consensus.HeightLatest})
+	if err != nil {
+		logger.Error("failed to query (outgoing) delegation infos for account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delInfos
+}
+
+func getDelegationsTo(
+	ctx context.Context,
+	cmd *cobra.Command,
+	addr api.Address,
+	client api.Backend,
+) map[api.Address]*api.Delegation {
+	delegations, err := client.DelegationsTo(ctx, &api.OwnerQuery{Owner: addr, Height: consensus.HeightLatest})
+	if err != nil {
+		logger.Error("failed to query (incoming) delegations to account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delegations
+}
+
+func getDebondingDelegationInfosFor(
+	ctx context.Context,
+	cmd *cobra.Command,
+	addr api.Address,
+	client api.Backend,
+) map[api.Address][]*api.DebondingDelegationInfo {
+	delInfoLists, err := client.DebondingDelegationInfosFor(ctx, &api.OwnerQuery{Owner: addr, Height: consensus.HeightLatest})
+	if err != nil {
+		logger.Error("failed to query (outgoing) debonding delegation infos for account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delInfoLists
+}
+
+func getDebondingDelegationsTo(
+	ctx context.Context,
+	cmd *cobra.Command,
+	addr api.Address,
+	client api.Backend,
+) map[api.Address][]*api.DebondingDelegation {
+	delegations, err := client.DebondingDelegationsTo(ctx, &api.OwnerQuery{Owner: addr, Height: consensus.HeightLatest})
+	if err != nil {
+		logger.Error("failed to query (incoming) debonding delegations to account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delegations
+}
+
 func doInfo(cmd *cobra.Command, args []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
@@ -155,6 +223,17 @@ func doInfo(cmd *cobra.Command, args []string) {
 	}
 	fmt.Print("Last block fees: ")
 	token.PrettyPrintAmount(ctx, *lastBlockFees, os.Stdout)
+	fmt.Println()
+
+	governanceDeposits, err := client.GovernanceDeposits(ctx, consensus.HeightLatest)
+	if err != nil {
+		logger.Error("failed to query governance deposits",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	fmt.Print("Governance deposits: ")
+	token.PrettyPrintAmount(ctx, *governanceDeposits, os.Stdout)
 	fmt.Println()
 
 	thresholdsToQuery := []api.ThresholdKind{

@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -83,6 +84,18 @@ func NodeToP2PAddr(n *node.Node) (*tmp2p.NetAddress, error) {
 	return tmAddr, nil
 }
 
+// TypedAttribute is an interface implemented by types which can be transparently used as event
+// attributes.
+type TypedAttribute interface {
+	// EventKind returns a string representation of this event's kind.
+	EventKind() string
+}
+
+// IsAttributeKind checks whether the given attribute key corresponds to the passed typed attribute.
+func IsAttributeKind(key []byte, kind TypedAttribute) bool {
+	return bytes.Equal(key, []byte(kind.EventKind()))
+}
+
 // EventBuilder is a helper for constructing ABCI events.
 type EventBuilder struct {
 	app []byte
@@ -97,6 +110,14 @@ func (bld *EventBuilder) Attribute(key, value []byte) *EventBuilder {
 	})
 
 	return bld
+}
+
+// TypedAttribute appends a typed attribute to the event.
+//
+// The typed attribute is automatically converted to a key/value pair where its EventKind is used
+// as the key and a CBOR-marshalled value is used as value.
+func (bld *EventBuilder) TypedAttribute(value TypedAttribute) *EventBuilder {
+	return bld.Attribute([]byte(value.EventKind()), cbor.Marshal(value))
 }
 
 // Dirty returns true iff the EventBuilder has attributes.
@@ -171,6 +192,7 @@ func NewBlock(blk *tmtypes.Block) *consensus.Block {
 		Time:   blk.Header.Time,
 		StateRoot: mkvsNode.Root{
 			Version: uint64(blk.Header.Height) - 1,
+			Type:    mkvsNode.RootTypeState,
 			Hash:    stateRoot,
 		},
 		Meta: rawMeta,
@@ -220,6 +242,10 @@ type TransactionAuthHandler interface {
 	//
 	// The context may be modified to configure a gas accountant.
 	AuthenticateTx(ctx *Context, tx *transaction.Transaction) error
+
+	// PostExecuteTx is called after the transaction has been executed. It is
+	// only called in case the execution did not produce an error.
+	PostExecuteTx(ctx *Context, tx *transaction.Transaction) error
 }
 
 // ServiceEvent is a Tendermint-specific consensus.ServiceEvent.
@@ -325,3 +351,19 @@ func (bsc *BaseServiceClient) DeliverEvent(ctx context.Context, height int64, tx
 func (bsc *BaseServiceClient) DeliverCommand(ctx context.Context, height int64, cmd interface{}) error {
 	return nil
 }
+
+// BlockProposerKey is the block context key for storing the block proposer address.
+type BlockProposerKey struct{}
+
+// NewDefault returns a new default value for the given key.
+func (bpk BlockProposerKey) NewDefault() interface{} {
+	// This should never be called as a block proposer must always be created by the application
+	// multiplexer.
+	panic("no proposer address in block context")
+}
+
+type messageKind uint8
+
+// MessageStateSyncCompleted is the message kind for when the node successfully performs a state
+// sync. The message itself is nil.
+var MessageStateSyncCompleted = messageKind(0)

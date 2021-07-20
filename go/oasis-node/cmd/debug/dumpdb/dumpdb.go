@@ -20,15 +20,16 @@ import (
 	abciState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci/state"
 	tendermintAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
 	beaconApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/beacon"
+	governanceApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/governance"
 	keymanagerApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/keymanager"
 	registryApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry"
 	roothashApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash"
 	schedulerApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/scheduler"
 	stakingApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking"
 	tendermintCommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
@@ -38,6 +39,7 @@ import (
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	storageDB "github.com/oasisprotocol/oasis-core/go/storage/database"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
 
 const (
@@ -147,7 +149,6 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 		Height:    qs.BlockHeight(),
 		Time:      time.Now(), // XXX: Make this deterministic?
 		ChainID:   oldDoc.ChainID,
-		EpochTime: oldDoc.EpochTime,
 		HaltEpoch: oldDoc.HaltEpoch,
 		ExtraData: oldDoc.ExtraData,
 	}
@@ -207,6 +208,16 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 		return
 	}
 	doc.Scheduler = *schedulerSt
+
+	// Governance
+	governanceSt, err := dumpGovernance(ctx, qs)
+	if err != nil {
+		logger.Error("failed to dump governance state",
+			"err", err,
+		)
+		return
+	}
+	doc.Governance = *governanceSt
 
 	// Beacon
 	beaconSt, err := dumpBeacon(ctx, qs)
@@ -325,6 +336,19 @@ func dumpScheduler(ctx context.Context, qs *dumpQueryState) (*scheduler.Genesis,
 	return st, nil
 }
 
+func dumpGovernance(ctx context.Context, qs *dumpQueryState) (*governance.Genesis, error) {
+	qf := governanceApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to create governance query: %w", err)
+	}
+	st, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to dump governance state: %w", err)
+	}
+	return st, nil
+}
+
 func dumpBeacon(ctx context.Context, qs *dumpQueryState) (*beacon.Genesis, error) {
 	qf := beaconApp.NewQueryFactory(qs)
 	q, err := qf.QueryAt(ctx, qs.BlockHeight())
@@ -347,7 +371,6 @@ func dumpConsensus(ctx context.Context, qs *dumpQueryState) (*consensus.Genesis,
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to get consensus params: %w", err)
 	}
-	_ = params
 	return &consensus.Genesis{
 		Backend:    tendermintAPI.BackendName,
 		Parameters: *params,
@@ -363,16 +386,20 @@ func (qs *dumpQueryState) Storage() storage.LocalBackend {
 	return qs.ldb
 }
 
+func (qs *dumpQueryState) Checkpointer() checkpoint.Checkpointer {
+	return nil
+}
+
 func (qs *dumpQueryState) BlockHeight() int64 {
 	return qs.height
 }
 
-func (qs *dumpQueryState) GetEpoch(ctx context.Context, blockHeight int64) (epochtime.EpochTime, error) {
+func (qs *dumpQueryState) GetEpoch(ctx context.Context, blockHeight int64) (beacon.EpochTime, error) {
 	// This is only required because certain registry backend queries
 	// need the epoch to filter out expired nodes.  It is not
 	// implemented because acquiring a full state dump does not
 	// involve any of the relevant queries.
-	return epochtime.EpochTime(0), fmt.Errorf("dumpdb/dumpQueryState: GetEpoch not supported")
+	return beacon.EpochTime(0), fmt.Errorf("dumpdb/dumpQueryState: GetEpoch not supported")
 }
 
 func (qs *dumpQueryState) LastRetainedVersion() (int64, error) {

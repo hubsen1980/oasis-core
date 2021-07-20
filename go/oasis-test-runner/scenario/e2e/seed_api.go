@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
@@ -30,6 +30,8 @@ func (sc *seedAPI) Fixture() (*oasis.NetworkFixture, error) {
 
 	// Add a client which will connect to the seed.
 	f.Clients = append(f.Clients, oasis.ClientFixture{})
+
+	f.Network.SetInsecureBeacon()
 
 	return f, nil
 }
@@ -99,9 +101,12 @@ func (sc *seedAPI) Run(childEnv *env.Env) error { // nolint: gocyclo
 	if len(status.Consensus.NodePeers) == 0 {
 		return fmt.Errorf("seed should be conencted at least to the client-0")
 	}
+	if p := status.PendingUpgrades; len(p) != 0 {
+		return fmt.Errorf("unexpected pending upgrades: %v", p)
+	}
 
 	sc.Logger.Info("testing SetEpoch")
-	if err = seedCtrl.SetEpoch(ctx, epochtime.EpochTime(0)); err == nil {
+	if err = seedCtrl.SetEpoch(ctx, beacon.EpochTime(0)); err == nil {
 		return fmt.Errorf("seed node SetEpoch should fail")
 	}
 
@@ -142,18 +147,6 @@ func (sc *seedAPI) Run(childEnv *env.Env) error { // nolint: gocyclo
 	_, err = seedCtrl.Consensus.EstimateGas(ctx, &consensusAPI.EstimateGasRequest{})
 	if err != consensusAPI.ErrUnsupported {
 		return fmt.Errorf("seed node EstimateGas should fail with unsupported")
-	}
-
-	sc.Logger.Info("testing WaitEpoch")
-	err = seedCtrl.Consensus.WaitEpoch(ctx, 0)
-	if err != consensusAPI.ErrUnsupported {
-		return fmt.Errorf("seed node WaitEpoch should fail with unsupported")
-	}
-
-	sc.Logger.Info("testing GetEpoch")
-	_, err = seedCtrl.Consensus.GetEpoch(ctx, 0)
-	if err != consensusAPI.ErrUnsupported {
-		return fmt.Errorf("seed node GetEpoch should fail with unsupported")
 	}
 
 	sc.Logger.Info("testing GetBlock")

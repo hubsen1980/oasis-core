@@ -1,9 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{
-    common::{crypto::hash::Hash, roothash::Namespace},
+    common::{crypto::hash::Hash, namespace::Namespace},
     storage::mkvs::{cache::*, marshal::*},
 };
 
@@ -19,14 +17,34 @@ pub trait Node {
     fn extract(&self) -> NodeRef;
 }
 
+/// Storage root type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
+#[repr(u8)]
+pub enum RootType {
+    /// Invalid or uninitialized storage root type.
+    Invalid = 0,
+    /// Storage root for runtime state.
+    State = 1,
+    /// Storage root for transaction IO.
+    IO = 2,
+}
+
+impl Default for RootType {
+    fn default() -> Self {
+        RootType::Invalid
+    }
+}
+
 /// Storage root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, cbor::Encode, cbor::Decode)]
 pub struct Root {
     /// Namespace under which the root is stored.
-    #[serde(rename = "ns")]
+    #[cbor(rename = "ns")]
     pub namespace: Namespace,
     /// Monotonically increasing version number in which the root is stored.
     pub version: u64,
+    /// The storage type that this root has data for.
+    pub root_type: RootType,
     /// Merkle root hash.
     pub hash: Hash,
 }
@@ -218,7 +236,6 @@ impl Eq for NodePointer {}
 #[derive(Debug, Default)]
 pub struct InternalNode {
     pub clean: bool,
-    pub version: u64,
     pub hash: Hash,
     pub label: Key,              // label on the incoming edge
     pub label_bit_length: Depth, // length of the label in bits
@@ -243,7 +260,6 @@ impl Node for InternalNode {
 
         self.hash = Hash::digest_bytes_list(&[
             &[NodeKind::Internal as u8],
-            &self.version.marshal_binary().unwrap(),
             &self.label_bit_length.marshal_binary().unwrap(),
             self.label.as_ref(),
             leaf_node_hash.as_ref(),
@@ -258,7 +274,6 @@ impl Node for InternalNode {
         }
         Rc::new(RefCell::new(NodeBox::Internal(InternalNode {
             clean: true,
-            version: self.version,
             hash: self.hash,
             label: self.label.clone(),
             label_bit_length: self.label_bit_length,
@@ -274,8 +289,7 @@ impl PartialEq for InternalNode {
         if self.clean && other.clean {
             self.hash == other.hash
         } else {
-            self.version == other.version
-                && self.leaf_node == other.leaf_node
+            self.leaf_node == other.leaf_node
                 && self.left == other.left
                 && self.right == other.right
         }
@@ -288,7 +302,6 @@ impl Eq for InternalNode {}
 #[derive(Debug, Default)]
 pub struct LeafNode {
     pub clean: bool,
-    pub version: u64,
     pub hash: Hash,
     pub key: Key,
     pub value: Value,
@@ -298,7 +311,6 @@ impl LeafNode {
     pub fn copy(&self) -> LeafNode {
         let node = LeafNode {
             clean: self.clean,
-            version: self.version,
             hash: self.hash.clone(),
             key: self.key.to_owned(),
             value: self.value.clone(),
@@ -320,8 +332,9 @@ impl Node for LeafNode {
     fn update_hash(&mut self) {
         self.hash = Hash::digest_bytes_list(&[
             &[NodeKind::Leaf as u8],
-            &self.version.marshal_binary().unwrap(),
+            &(self.key.len() as u32).marshal_binary().unwrap(),
             self.key.as_ref(),
+            &(self.value.len() as u32).marshal_binary().unwrap(),
             self.value.as_ref(),
         ]);
     }
@@ -332,7 +345,6 @@ impl Node for LeafNode {
         }
         Rc::new(RefCell::new(NodeBox::Leaf(LeafNode {
             clean: true,
-            version: self.version,
             hash: self.hash,
             key: self.key.clone(),
             value: self.value.clone(),
@@ -345,7 +357,7 @@ impl PartialEq for LeafNode {
         if self.clean && other.clean {
             self.hash == other.hash
         } else {
-            self.version == other.version && self.key == other.key && self.value == other.value
+            self.key == other.key && self.value == other.value
         }
     }
 }

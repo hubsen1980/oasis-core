@@ -13,55 +13,32 @@
 #![feature(test)]
 #![feature(box_into_pin)]
 #![feature(arbitrary_self_types)]
-
-#[macro_use]
-extern crate slog;
-extern crate anyhow;
-extern crate base64;
-extern crate bincode;
-extern crate chrono;
-extern crate crossbeam;
-extern crate lazy_static;
-extern crate serde_bytes;
-extern crate serde_cbor;
-extern crate serde_json;
-extern crate serde_repr;
-extern crate slog_json;
-extern crate slog_scope;
-extern crate slog_stdlog;
-#[macro_use]
-extern crate intrusive_collections;
-extern crate io_context;
-extern crate pem;
-extern crate percent_encoding;
-extern crate rand;
-extern crate rustc_hex;
-extern crate snow;
-#[cfg(test)]
-extern crate tempfile;
-extern crate tokio_current_thread;
-extern crate tokio_executor;
-extern crate webpki;
+#![feature(iter_map_while)]
+#![feature(int_error_matching)]
+// Allow until oasis-core#3572.
+#![allow(deprecated)]
 
 use lazy_static::lazy_static;
 #[cfg(target_env = "sgx")]
 use sgx_isa::{AttributesFlags, Report};
 
+#[cfg_attr(test, macro_use)]
+extern crate base64_serde;
+
 #[macro_use]
 pub mod common;
+pub mod consensus;
 pub mod dispatcher;
 pub mod enclave_rpc;
-pub mod executor;
 pub mod init;
 pub mod macros;
 pub mod protocol;
 pub mod rak;
 pub mod storage;
-pub mod tracing;
 pub mod transaction;
 pub mod types;
 
-use crate::common::version::{Version, PROTOCOL_VERSION};
+use crate::common::version::{Version, CONSENSUS_VERSION, PROTOCOL_VERSION};
 
 #[cfg(target_env = "sgx")]
 use self::common::sgx::avr::{EnclaveIdentity, MrSigner};
@@ -105,6 +82,7 @@ lazy_static! {
 
         BuildInfo {
             protocol_version: PROTOCOL_VERSION,
+            consensus_version: CONSENSUS_VERSION,
             is_secure,
         }
     };
@@ -114,6 +92,8 @@ lazy_static! {
 pub struct BuildInfo {
     /// Supported runtime protocol version.
     pub protocol_version: Version,
+    /// Supported consensus protocol version.
+    pub consensus_version: Version,
     /// True iff the build can provide integrity and confidentiality.
     pub is_secure: bool,
 }
@@ -125,3 +105,6 @@ pub use self::{
     protocol::Protocol,
     transaction::dispatcher::{Dispatcher as TxnDispatcher, MethodDispatcher as TxnMethDispatcher},
 };
+
+// Re-export the cbor crate.
+pub use cbor;

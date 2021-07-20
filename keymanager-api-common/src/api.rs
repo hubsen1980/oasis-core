@@ -3,19 +3,17 @@ use std::{
     default::Default,
 };
 
-use base64;
 use rand::{rngs::OsRng, Rng};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x25519_dalek;
 
 use oasis_core_runtime::{
     common::{
         crypto::signature::{PublicKey as OasisPublicKey, Signature, SignatureBundle},
-        runtime::RuntimeId,
+        namespace::Namespace,
         sgx::avr::EnclaveIdentity,
     },
-    impl_bytes, runtime_api,
+    impl_bytes,
 };
 
 impl_bytes!(KeyPairId, 32, "A 256-bit key pair identifier.");
@@ -25,28 +23,24 @@ impl_bytes!(StateKey, 32, "A state key.");
 impl_bytes!(MasterSecret, 32, "A 256 bit master secret.");
 
 /// Key manager initialization request.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct InitRequest {
     /// Checksum for validating replication.
-    #[serde(with = "serde_bytes")]
     pub checksum: Vec<u8>,
     /// Policy for queries/replication.
-    #[serde(with = "serde_bytes")]
     pub policy: Vec<u8>,
     /// True iff the enclave may generate a new master secret.
     pub may_generate: bool,
 }
 
 /// Key manager initialization response.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct InitResponse {
     /// True iff the key manager thinks it's running in a secure mode.
     pub is_secure: bool,
     /// Checksum for validating replication.
-    #[serde(with = "serde_bytes")]
     pub checksum: Vec<u8>,
     /// Checksum for identifying policy.
-    #[serde(with = "serde_bytes")]
     pub policy_checksum: Vec<u8>,
 }
 
@@ -54,7 +48,7 @@ pub struct InitResponse {
 pub const INIT_RESPONSE_CONTEXT: &'static [u8] = b"oasis-core/keymanager: init response";
 
 /// Signed InitResponse.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct SignedInitResponse {
     /// InitResponse.
     pub init_response: InitResponse,
@@ -63,28 +57,28 @@ pub struct SignedInitResponse {
 }
 
 /// Key manager replication request.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct ReplicateRequest {
     // Empty.
 }
 
 /// Key manager replication response.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct ReplicateResponse {
     pub master_secret: MasterSecret,
 }
 
 /// Request runtime/key pair id tuple.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct RequestIds {
     /// Runtime ID.
-    pub runtime_id: RuntimeId,
+    pub runtime_id: Namespace,
     /// Key pair ID.
     pub key_pair_id: KeyPairId,
 }
 
 impl RequestIds {
-    pub fn new(runtime_id: RuntimeId, key_pair_id: KeyPairId) -> Self {
+    pub fn new(runtime_id: Namespace, key_pair_id: KeyPairId) -> Self {
         Self {
             runtime_id,
             key_pair_id,
@@ -99,14 +93,13 @@ impl RequestIds {
 }
 
 /// A key pair managed by the key manager.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct KeyPair {
     /// Input key pair (pk, sk)
     pub input_keypair: InputKeyPair,
     /// State encryption key
     pub state_key: StateKey,
     /// Checksum of the key manager state.
-    #[serde(with = "serde_bytes")]
     pub checksum: Vec<u8>,
 }
 
@@ -147,7 +140,7 @@ impl KeyPair {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, cbor::Encode, cbor::Decode)]
 pub struct InputKeyPair {
     /// Pk
     pk: PublicKey,
@@ -173,12 +166,11 @@ impl InputKeyPair {
 pub const PUBLIC_KEY_CONTEXT: [u8; 8] = *b"EkKmPubK";
 
 /// Signed public key.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, cbor::Encode, cbor::Decode)]
 pub struct SignedPublicKey {
     /// Public key.
     pub key: PublicKey,
     /// Checksum of the key manager state.
-    #[serde(with = "serde_bytes")]
     pub checksum: Vec<u8>,
     /// Sign(sk, (key || checksum)) from the key manager.
     pub signature: Signature,
@@ -207,37 +199,39 @@ pub enum KeyManagerError {
     PolicyInvalidSignature,
     #[error("policy has insufficient signatures")]
     PolicyInsufficientSignatures,
+    #[error(transparent)]
+    Other(anyhow::Error),
 }
 
 /// Key manager access control policy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, cbor::Encode, cbor::Decode)]
 pub struct PolicySGX {
     pub serial: u32,
-    pub id: RuntimeId,
+    pub id: Namespace,
     pub enclaves: HashMap<EnclaveIdentity, EnclavePolicySGX>,
 }
 
 /// Per enclave key manager access control policy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, cbor::Encode, cbor::Decode)]
 pub struct EnclavePolicySGX {
-    pub may_query: HashMap<RuntimeId, Vec<EnclaveIdentity>>,
+    pub may_query: HashMap<Namespace, Vec<EnclaveIdentity>>,
     pub may_replicate: Vec<EnclaveIdentity>,
 }
 
 /// Signed key manager access control policy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, cbor::Encode, cbor::Decode)]
 pub struct SignedPolicySGX {
     pub policy: PolicySGX,
     pub signatures: Vec<SignatureBundle>,
 }
 
 /// Set of trusted key manager policy signing keys.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, cbor::Encode, cbor::Decode)]
 pub struct TrustedPolicySigners {
     /// Set of trusted signers.
     pub signers: HashSet<OasisPublicKey>,
     /// Threshold for determining if enough valid signatures are present.
-    pub threshold: usize,
+    pub threshold: u64,
 }
 
 impl Default for TrustedPolicySigners {
@@ -249,10 +243,12 @@ impl Default for TrustedPolicySigners {
     }
 }
 
-runtime_api! {
-    pub fn get_or_create_keys(RequestIds) -> KeyPair;
+/// Name of the `get_or_create_keys` method.
+pub const METHOD_GET_OR_CREATE_KEYS: &str = "get_or_create_keys";
+/// Name of the `get_public_key` method.
+pub const METHOD_GET_PUBLIC_KEY: &str = "get_public_key";
+/// Name of the `replicate_master_secret` method.
+pub const METHOD_REPLICATE_MASTER_SECRET: &str = "replicate_master_secret";
 
-    pub fn get_public_key(RequestIds) -> Option<SignedPublicKey>;
-
-    pub fn replicate_master_secret(ReplicateRequest) -> ReplicateResponse;
-}
+/// Name of the `init` local method.
+pub const LOCAL_METHOD_INIT: &str = "init";

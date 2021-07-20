@@ -6,19 +6,17 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/keyformat"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
-	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 )
 
 var (
 	// runtimeKeyFmt is the key format used for per-runtime roothash state.
 	//
-	// Value is CBOR-serialized runtime state.
+	// Value is CBOR-serialized roothash.RuntimeState.
 	runtimeKeyFmt = keyformat.New(0x20, keyformat.H(&common.Namespace{}))
 	// parametersKeyFmt is the key format used for consensus parameters.
 	//
@@ -28,20 +26,25 @@ var (
 	//
 	// The format is (height, runtimeID). Value is runtimeID.
 	roundTimeoutQueueKeyFmt = keyformat.New(0x22, int64(0), keyformat.H(&common.Namespace{}))
+	// rejectTransactionsKeyFmt is the key format used to disable transactions.
+	//
+	// Value is a CBOR-serialized `true`.
+	rejectTransactionsKeyFmt = keyformat.New(0x23)
+	// evidenceKeyFmt is the key format used for storing valid misbehaviour evidence.
+	//
+	// Key format is: 0x24 <H(runtime-id) (hash.Hash)> <round (uint64)> <evidence-hash (hash.Hash)>
+	evidenceKeyFmt = keyformat.New(0x24, keyformat.H(&common.Namespace{}), uint64(0), &hash.Hash{})
+	// stateRootKeyFmt is the key format used for runtime state roots.
+	//
+	// Value is the runtime's latest state root.
+	stateRootKeyFmt = keyformat.New(0x25, keyformat.H(&common.Namespace{}))
+	// ioRootKeyFmt is the key format used for runtime I/O roots.
+	//
+	// Value is the runtime's latest I/O root.
+	ioRootKeyFmt = keyformat.New(0x26, keyformat.H(&common.Namespace{}))
+
+	cborTrue = cbor.Marshal(true)
 )
-
-// RuntimeState is the per-runtime roothash state.
-type RuntimeState struct {
-	Runtime   *registry.Runtime `json:"runtime"`
-	Suspended bool              `json:"suspended,omitempty"`
-
-	GenesisBlock *block.Block `json:"genesis_block"`
-
-	CurrentBlock       *block.Block `json:"current_block"`
-	CurrentBlockHeight int64        `json:"current_block_height"`
-
-	ExecutorPool *commitment.Pool `json:"executor_pool"`
-}
 
 // ImmutableState is the immutable roothash state wrapper.
 type ImmutableState struct {
@@ -103,7 +106,7 @@ func (s *ImmutableState) RuntimesWithRoundTimeoutsAny(ctx context.Context) ([]co
 }
 
 // RuntimeState returns the roothash runtime state for a specific runtime.
-func (s *ImmutableState) RuntimeState(ctx context.Context, id common.Namespace) (*RuntimeState, error) {
+func (s *ImmutableState) RuntimeState(ctx context.Context, id common.Namespace) (*roothash.RuntimeState, error) {
 	raw, err := s.is.Get(ctx, runtimeKeyFmt.Encode(&id))
 	if err != nil {
 		return nil, api.UnavailableStateError(err)
@@ -112,25 +115,51 @@ func (s *ImmutableState) RuntimeState(ctx context.Context, id common.Namespace) 
 		return nil, roothash.ErrInvalidRuntime
 	}
 
-	var state RuntimeState
+	var state roothash.RuntimeState
 	if err = cbor.Unmarshal(raw, &state); err != nil {
 		return nil, api.UnavailableStateError(err)
 	}
 	return &state, nil
 }
 
+func (s *ImmutableState) getRoot(ctx context.Context, id common.Namespace, kf *keyformat.KeyFormat) (hash.Hash, error) {
+	raw, err := s.is.Get(ctx, kf.Encode(&id))
+	if err != nil {
+		return hash.Hash{}, api.UnavailableStateError(err)
+	}
+	if raw == nil {
+		return hash.Hash{}, roothash.ErrInvalidRuntime
+	}
+
+	var h hash.Hash
+	if err = h.UnmarshalBinary(raw); err != nil {
+		return hash.Hash{}, api.UnavailableStateError(err)
+	}
+	return h, nil
+}
+
+// StateRoot returns the state root for a specific runtime.
+func (s *ImmutableState) StateRoot(ctx context.Context, id common.Namespace) (hash.Hash, error) {
+	return s.getRoot(ctx, id, stateRootKeyFmt)
+}
+
+// IORoot returns the state root for a specific runtime.
+func (s *ImmutableState) IORoot(ctx context.Context, id common.Namespace) (hash.Hash, error) {
+	return s.getRoot(ctx, id, ioRootKeyFmt)
+}
+
 // Runtimes returns the list of all roothash runtime states.
-func (s *ImmutableState) Runtimes(ctx context.Context) ([]*RuntimeState, error) {
+func (s *ImmutableState) Runtimes(ctx context.Context) ([]*roothash.RuntimeState, error) {
 	it := s.is.NewIterator(ctx)
 	defer it.Close()
 
-	var runtimes []*RuntimeState
+	var runtimes []*roothash.RuntimeState
 	for it.Seek(runtimeKeyFmt.Encode()); it.Valid(); it.Next() {
 		if !runtimeKeyFmt.Decode(it.Key()) {
 			break
 		}
 
-		var state RuntimeState
+		var state roothash.RuntimeState
 		if err := cbor.Unmarshal(it.Value(), &state); err != nil {
 			return nil, api.UnavailableStateError(err)
 		}
@@ -160,6 +189,26 @@ func (s *ImmutableState) ConsensusParameters(ctx context.Context) (*roothash.Con
 	return &params, nil
 }
 
+// RejectTransactions returns true iff all transactions should be rejected.
+func (s *ImmutableState) RejectTransactions(ctx context.Context) (bool, error) {
+	raw, err := s.is.Get(ctx, rejectTransactionsKeyFmt.Encode())
+	if err != nil {
+		return false, api.UnavailableStateError(err)
+	}
+	if raw == nil {
+		return false, nil
+	}
+
+	// This only ever will be true if present.
+	return true, nil
+}
+
+// EvidenceHashExists returns true if the evidence hash for the runtime exists.
+func (s *ImmutableState) EvidenceHashExists(ctx context.Context, runtimeID common.Namespace, round uint64, hash hash.Hash) (bool, error) {
+	data, err := s.is.Get(ctx, evidenceKeyFmt.Encode(&runtimeID, round, &hash))
+	return data != nil, api.UnavailableStateError(err)
+}
+
 // MutableState is the mutable roothash state wrapper.
 type MutableState struct {
 	*ImmutableState
@@ -177,13 +226,32 @@ func NewMutableState(tree mkvs.KeyValueTree) *MutableState {
 }
 
 // SetRuntimeState sets a runtime's roothash state.
-func (s *MutableState) SetRuntimeState(ctx context.Context, state *RuntimeState) error {
-	err := s.ms.Insert(ctx, runtimeKeyFmt.Encode(&state.Runtime.ID), cbor.Marshal(state))
-	return api.UnavailableStateError(err)
+func (s *MutableState) SetRuntimeState(ctx context.Context, state *roothash.RuntimeState) error {
+	if err := s.ms.Insert(ctx, runtimeKeyFmt.Encode(&state.Runtime.ID), cbor.Marshal(state)); err != nil {
+		return api.UnavailableStateError(err)
+	}
+
+	// Store the current state and I/O roots separately to make them easier to retrieve when
+	// constructing proofs of runtime state.
+	stateRoot, _ := state.CurrentBlock.Header.StateRoot.MarshalBinary()
+	ioRoot, _ := state.CurrentBlock.Header.IORoot.MarshalBinary()
+
+	if err := s.ms.Insert(ctx, stateRootKeyFmt.Encode(&state.Runtime.ID), stateRoot); err != nil {
+		return api.UnavailableStateError(err)
+	}
+	if err := s.ms.Insert(ctx, ioRootKeyFmt.Encode(&state.Runtime.ID), ioRoot); err != nil {
+		return api.UnavailableStateError(err)
+	}
+	return nil
 }
 
 // SetConsensusParameters sets roothash consensus parameters.
+//
+// NOTE: This method must only be called from InitChain/EndBlock contexts.
 func (s *MutableState) SetConsensusParameters(ctx context.Context, params *roothash.ConsensusParameters) error {
+	if err := s.is.CheckContextMode(ctx, []api.ContextMode{api.ContextInitChain, api.ContextEndBlock}); err != nil {
+		return err
+	}
 	err := s.ms.Insert(ctx, parametersKeyFmt.Encode(), cbor.Marshal(params))
 	return api.UnavailableStateError(err)
 }
@@ -199,4 +267,50 @@ func (s *MutableState) ScheduleRoundTimeout(ctx context.Context, runtimeID commo
 func (s *MutableState) ClearRoundTimeout(ctx context.Context, runtimeID common.Namespace, height int64) error {
 	err := s.ms.Remove(ctx, roundTimeoutQueueKeyFmt.Encode(height, &runtimeID))
 	return api.UnavailableStateError(err)
+}
+
+// SetRejectTransactions sets the transaction disable.
+func (s *MutableState) SetRejectTransactions(ctx context.Context) error {
+	err := s.ms.Insert(ctx, rejectTransactionsKeyFmt.Encode(), cborTrue)
+	return api.UnavailableStateError(err)
+}
+
+// ClearRejectTransactions clears the transaction disable.
+func (s *MutableState) ClearRejectTransactions(ctx context.Context) error {
+	err := s.ms.Remove(ctx, rejectTransactionsKeyFmt.Encode())
+	return api.UnavailableStateError(err)
+}
+
+// SetEvidenceHash sets the provided evidence hash.
+func (s *MutableState) SetEvidenceHash(ctx context.Context, runtimeID common.Namespace, round uint64, hash hash.Hash) error {
+	err := s.ms.Insert(ctx, evidenceKeyFmt.Encode(&runtimeID, round, &hash), []byte(""))
+	return api.UnavailableStateError(err)
+}
+
+// RemoveExpiredEvidence removes expired evidence.
+func (s *MutableState) RemoveExpiredEvidence(ctx context.Context, runtimeID common.Namespace, minRound uint64) error {
+	it := s.is.NewIterator(ctx)
+	defer it.Close()
+
+	var toDelete [][]byte
+	for it.Seek(evidenceKeyFmt.Encode(&runtimeID)); it.Valid(); it.Next() {
+		var runtimeID keyformat.PreHashed
+		var round uint64
+		var hash hash.Hash
+		if !evidenceKeyFmt.Decode(it.Key(), &runtimeID, &round, &hash) {
+			break
+		}
+		if round > minRound {
+			break
+		}
+		toDelete = append(toDelete, it.Key())
+	}
+
+	for _, key := range toDelete {
+		if err := s.ms.Remove(ctx, key); err != nil {
+			return api.UnavailableStateError(err)
+		}
+	}
+
+	return nil
 }

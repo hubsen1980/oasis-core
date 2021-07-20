@@ -5,10 +5,9 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/opentracing/opentracing-go"
-
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	keymanagerApi "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	keymanagerClient "github.com/oasisprotocol/oasis-core/go/keymanager/client"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
@@ -16,11 +15,12 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/runtime/localstorage"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
 
 var (
 	errMethodNotSupported   = errors.New("method not supported")
-	errEndpointNotSupported = errors.New("RPC endpoint not supported")
+	errEndpointNotSupported = errors.New("endpoint not supported")
 )
 
 // computeRuntimeHostHandler is a runtime host handler suitable for compute runtimes.
@@ -32,6 +32,7 @@ type computeRuntimeHostHandler struct {
 	keyManager       keymanagerApi.Backend
 	keyManagerClient *keymanagerClient.Client
 	localStorage     localstorage.LocalStorage
+	consensus        consensus.Backend
 }
 
 func (h *computeRuntimeHostHandler) Handle(ctx context.Context, body *protocol.Body) (*protocol.Body, error) {
@@ -57,26 +58,36 @@ func (h *computeRuntimeHostHandler) Handle(ctx context.Context, body *protocol.B
 	// Storage.
 	if body.HostStorageSyncRequest != nil {
 		rq := body.HostStorageSyncRequest
-		span, sctx := opentracing.StartSpanFromContext(ctx, "storage.Sync")
-		defer span.Finish()
 
-		// Prioritize nodes that signed the last storage receipts.
-		h.node.CrossNode.Lock()
-		blk := h.node.CurrentBlock
-		h.node.CrossNode.Unlock()
-		if blk != nil {
-			sctx = storage.WithNodePriorityHintFromSignatures(sctx, blk.Header.StorageSignatures)
+		var rs syncer.ReadSyncer
+		switch rq.Endpoint {
+		case protocol.HostStorageEndpointRuntime:
+			// Runtime storage.
+			rs = h.storage
+
+			// Prioritize nodes that signed the last storage receipts.
+			h.node.CrossNode.Lock()
+			blk := h.node.CurrentBlock
+			h.node.CrossNode.Unlock()
+			if blk != nil {
+				ctx = storage.WithNodePriorityHintFromSignatures(ctx, blk.Header.StorageSignatures)
+			}
+		case protocol.HostStorageEndpointConsensus:
+			// Consensus state storage.
+			rs = h.consensus.State()
+		default:
+			return nil, errEndpointNotSupported
 		}
 
 		var rsp *storage.ProofResponse
 		var err error
 		switch {
 		case rq.SyncGet != nil:
-			rsp, err = h.storage.SyncGet(sctx, rq.SyncGet)
+			rsp, err = rs.SyncGet(ctx, rq.SyncGet)
 		case rq.SyncGetPrefixes != nil:
-			rsp, err = h.storage.SyncGetPrefixes(sctx, rq.SyncGetPrefixes)
+			rsp, err = rs.SyncGetPrefixes(ctx, rq.SyncGetPrefixes)
 		case rq.SyncIterate != nil:
-			rsp, err = h.storage.SyncIterate(sctx, rq.SyncIterate)
+			rsp, err = rs.SyncIterate(ctx, rq.SyncIterate)
 		default:
 			return nil, errMethodNotSupported
 		}
@@ -219,5 +230,6 @@ func (n *Node) NewRuntimeHostHandler() protocol.Handler {
 		keyManager:       n.KeyManager,
 		keyManagerClient: n.KeyManagerClient,
 		localStorage:     n.Runtime.LocalStorage(),
+		consensus:        n.Consensus,
 	}
 }

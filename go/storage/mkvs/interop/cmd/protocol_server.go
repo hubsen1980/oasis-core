@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -11,18 +13,23 @@ import (
 	"github.com/spf13/viper"
 
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
-	"github.com/oasisprotocol/oasis-core/go/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/background"
+	"github.com/oasisprotocol/oasis-core/go/storage/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/database"
+	badgerNodedb "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/badger"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/interop/fixtures"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 )
 
 const (
 	cfgServerSocket  = "socket"
 	cfgServerDataDir = "datadir"
+
+	cfgServerFixture = "fixture"
 )
 
 var (
@@ -71,22 +78,6 @@ func doProtoServer(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Initialize the gRPC server.
-	config := &grpc.ServerConfig{
-		Name:           "protocol_server",
-		Path:           viper.GetString(cfgServerSocket),
-		InstallWrapper: false,
-	}
-
-	grpcSrv, err := grpc.NewServer(config)
-	if err != nil {
-		logger.Error("failed to initialize gRPC server",
-			"err", err,
-		)
-		return
-	}
-	svcMgr.Register(grpcSrv)
-
 	// Initialize a dummy storage backend.
 	storageCfg := storage.Config{
 		Backend:            database.BackendNameBadgerDB,
@@ -96,6 +87,42 @@ func doProtoServer(cmd *cobra.Command, args []string) {
 		InsecureSkipChecks: false,
 		MaxCacheSize:       16 * 1024 * 1024,
 	}
+
+	if fixtureName := viper.GetString(cfgServerFixture); fixtureName != "" {
+		ctx := context.Background()
+		ndbCfg := storageCfg.ToNodeDB()
+		var ndb api.NodeDB
+		ndb, err = badgerNodedb.New(ndbCfg)
+		if err != nil {
+			logger.Error("failed to initialize node db",
+				"err", err,
+			)
+			return
+		}
+		var fixture fixtures.Fixture
+		fixture, err = fixtures.GetFixture(fixtureName)
+		if err != nil {
+			logger.Error("failed getting fixture",
+				"err", err,
+				"fixture", fixture.Name(),
+			)
+			return
+		}
+		var root *node.Root
+		root, err = fixture.Populate(ctx, ndb)
+		if err != nil {
+			logger.Error("failed to populate fixture",
+				"err", err,
+				"fixture", fixture.Name(),
+			)
+			return
+		}
+
+		fmt.Printf("Fixture: %s, populated root hash: %s\n", fixtureName, root.Hash)
+
+		ndb.Close()
+	}
+
 	backend, err := database.New(&storageCfg)
 	if err != nil {
 		logger.Error("failed to initialize storage backend",
@@ -103,11 +130,21 @@ func doProtoServer(cmd *cobra.Command, args []string) {
 		)
 		return
 	}
-	storage.RegisterService(grpcSrv.Server(), backend)
 
-	// Start the gRPC server.
-	if err := grpcSrv.Start(); err != nil {
-		logger.Error("failed to start gRPC server",
+	// Initialize the JSON-RPC listener/service.
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: viper.GetString(cfgServerSocket)})
+	if err != nil {
+		logger.Error("failed to listen on socket",
+			"err", err,
+		)
+		return
+	}
+	rpcSvr := newDbRPCService(ln, backend)
+	svcMgr.Register(rpcSvr)
+
+	// Start the JSON-RPC server.
+	if err := rpcSvr.Start(); err != nil {
+		logger.Error("failed to start JSON-RPC server",
 			"err", err,
 		)
 		return
@@ -130,5 +167,6 @@ func RegisterProtoServer(parentCmd *cobra.Command) {
 func init() {
 	protoServerFlags.String(cfgServerSocket, "storage.sock", "path to storage protocol server socket")
 	protoServerFlags.String(cfgServerDataDir, "", "path to data directory")
+	protoServerFlags.String(cfgServerFixture, "", "fixture for initializing initial state")
 	_ = viper.BindPFlags(protoServerFlags)
 }

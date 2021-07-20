@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v3"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
@@ -115,7 +115,7 @@ type rootsMetadata struct {
 	_ struct{} `cbor:",toarray"`
 
 	// Roots is the map of a root created in a version to any derived roots (in this or later versions).
-	Roots map[hash.Hash][]hash.Hash
+	Roots map[typedHash][]typedHash
 
 	// version is the version this metadata is for.
 	version uint64
@@ -131,7 +131,7 @@ func loadRootsMetadata(tx *badger.Txn, version uint64) (*rootsMetadata, error) {
 			return nil, fmt.Errorf("mkvs/badger: error reading roots metadata: %w", err)
 		}
 	case badger.ErrKeyNotFound:
-		rootsMeta.Roots = make(map[hash.Hash][]hash.Hash)
+		rootsMeta.Roots = make(map[typedHash][]typedHash)
 	default:
 		return nil, fmt.Errorf("mkvs/badger: error reading roots metadata: %w", err)
 	}

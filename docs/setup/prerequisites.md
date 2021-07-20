@@ -35,7 +35,7 @@ Core:
   ```
   <!-- markdownlint-enable line-length -->
 
-* [Go] (at least version 1.15.1).
+* [Go] (at least version 1.16.3).
 
   If your distribution provides a new-enough version of Go, just use that.
 
@@ -44,18 +44,18 @@ Core:
   * [ensure `$GOPATH/bin` is in your `PATH`](
     https://tip.golang.org/doc/code.html#GOPATH),
   * [install the desired version of Go](
-    https://golang.org/doc/install#extra_versions), e.g. 1.15.1, with:
+    https://golang.org/doc/install#extra_versions), e.g. 1.16.3, with:
 
     ```
-    go get golang.org/dl/go1.15.1
-    go1.15.1 download
+    go get golang.org/dl/go1.16.3
+    go1.16.3 download
     ```
 
   * instruct the build system to use this particular version of Go by setting
     the `OASIS_GO` environment variable in your `~/.bashrc`:
 
     ```
-    export OASIS_GO=go1.15.1
+    export OASIS_GO=go1.16.3
     ```
 
 * [Rust].
@@ -124,8 +124,8 @@ Core:
   active toolchain
   ----------------
 
-  nightly-2020-08-29-x86_64-unknown-linux-gnu (overridden by '/code/rust-toolchain')
-  rustc 1.48.0-nightly (d006f5734 2020-08-28)
+  nightly-2021-05-20-x86_64-unknown-linux-gnu (overridden by '/code/rust-toolchain')
+  rustc 1.54.0-nightly (f94942d84 2021-05-19)
   ```
 
   Then add the Fortanix SGX Rust target to this version of the Rust toolchain by
@@ -169,6 +169,41 @@ Core:
   committed for convenience.  Installing protoc-gen-go is only required if you
   are a developer making changes to protobuf definitions used by Go._
 
+* (**OPTIONAL**) [jemalloc] (version 5.2.1, built with `'je_'` jemalloc-prefix)
+
+  Alternatively set `OASIS_BADGER_NO_JEMALLOC="1"` environment variable when
+  building `oasis-node` code, to build [BadgerDB] without `jemalloc` support.
+
+  Download and install `jemalloc` with:
+
+  ```
+  JEMALLOC_VERSION=5.2.1
+  JEMALLOC_CHECKSUM=34330e5ce276099e2e8950d9335db5a875689a4c6a56751ef3b1d8c537f887f6
+  JEMALLOC_GITHUB=https://github.com/jemalloc/jemalloc/releases/download/
+  pushd $(mktemp -d)
+  wget \
+    -O jemalloc.tar.bz2 \
+    "${JEMALLOC_GITHUB}/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2"
+  # Ensure checksum matches.
+  echo "${JEMALLOC_CHECKSUM} jemalloc.tar.bz2" | sha256sum -c
+  tar -xf jemalloc.tar.bz2
+  cd jemalloc-${JEMALLOC_VERSION}
+  # Ensure reproducible jemalloc build.
+  # https://reproducible-builds.org/docs/build-path/
+  EXTRA_CXXFLAGS=-ffile-prefix-map=$(pwd -L)=. \
+    EXTRA_CFLAGS=-ffile-prefix-map=$(pwd -L)=. \
+    ./configure \
+      --with-jemalloc-prefix='je_' \
+      --with-malloc-conf='background_thread:true,metadata_thp:auto'
+  make
+  sudo make install
+  popd
+  ```
+
+  _NOTE: jemalloc needs to be installed to the (default) `/usr/local` prefix
+  (i.e. you can't use `./configure --prefix=$HOME/.local ...`) because upstream
+  authors [hardcode its path][jemalloc-hardcode-path]._
+
 In the following instructions, the top-level directory is the directory
 where the code has been checked out.
 
@@ -192,6 +227,12 @@ where the code has been checked out.
 [Fortanix Rust EDP]: https://edp.fortanix.com
 [gofumpt and gofumports]: https://github.com/mvdan/gofumpt
 [protoc-gen-go]: https://github.com/golang/protobuf
+[jemalloc]: https://github.com/jemalloc/jemalloc
+[BadgerDB]: https://github.com/dgraph-io/badger/
+<!-- markdownlint-disable line-length -->
+[jemalloc-hardcode-path]:
+  https://github.com/dgraph-io/ristretto/blob/221ca9b2091d12e5d24aa5d7d56e49745fc175d8/z/calloc_jemalloc.go#L9-L13
+<!-- markdownlint-enable line-length -->
 
 ## Using the Development Docker Image
 

@@ -1,6 +1,6 @@
 //! MKVS interoperability test helpers.
 use crate::{
-    common::{crypto::hash::Hash, roothash::Namespace},
+    common::{crypto::hash::Hash, namespace::Namespace},
     storage::mkvs::WriteLog,
 };
 
@@ -23,4 +23,4 @@ pub trait Driver {
     );
 }
 
-pub use self::protocol_server::ProtocolServer;
+pub use self::protocol_server::{Fixture, ProtocolServer};

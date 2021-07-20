@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/badger"
 	"github.com/oasisprotocol/oasis-core/go/common/crash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/grpc"
@@ -27,10 +29,10 @@ import (
 	tendermintTestsGenesis "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/tests/genesis"
 	"github.com/oasisprotocol/oasis-core/go/control"
 	controlAPI "github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
 	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
+	governanceAPI "github.com/oasisprotocol/oasis-core/go/governance/api"
 	"github.com/oasisprotocol/oasis-core/go/ias"
 	iasAPI "github.com/oasisprotocol/oasis-core/go/ias/api"
 	keymanagerAPI "github.com/oasisprotocol/oasis-core/go/keymanager/api"
@@ -41,8 +43,8 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/metrics"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/pprof"
 	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/tracing"
 	registryAPI "github.com/oasisprotocol/oasis-core/go/registry/api"
+	roothashAPI "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client"
 	runtimeClientAPI "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
@@ -54,6 +56,7 @@ import (
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/upgrade"
 	upgradeAPI "github.com/oasisprotocol/oasis-core/go/upgrade/api"
+	workerBeacon "github.com/oasisprotocol/oasis-core/go/worker/beacon"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
 	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
 	"github.com/oasisprotocol/oasis-core/go/worker/compute"
@@ -113,7 +116,7 @@ type Node struct {
 	IAS      iasAPI.Endpoint
 
 	RuntimeRegistry runtimeRegistry.Registry
-	RuntimeClient   runtimeClientAPI.RuntimeClient
+	RuntimeClient   runtimeClientAPI.RuntimeClientService
 
 	CommonWorker       *workerCommon.Worker
 	ExecutorWorker     *executor.Worker
@@ -123,6 +126,7 @@ type Node struct {
 	RegistrationWorker *registration.Worker
 	KeymanagerWorker   *workerKeymanager.Worker
 	ConsensusWorker    *workerConsensusRPC.Worker
+	BeaconWorker       *workerBeacon.Worker
 	readyCh            chan struct{}
 
 	logger *logging.Logger
@@ -196,18 +200,21 @@ func (n *Node) startRuntimeServices() error {
 
 	// Initialize and register the internal gRPC services.
 	grpcSrv := n.grpcInternal.Server()
+	beacon.RegisterService(grpcSrv, n.Consensus.Beacon())
 	scheduler.RegisterService(grpcSrv, n.Consensus.Scheduler())
 	registryAPI.RegisterService(grpcSrv, n.Consensus.Registry())
 	stakingAPI.RegisterService(grpcSrv, n.Consensus.Staking())
 	keymanagerAPI.RegisterService(grpcSrv, n.Consensus.KeyManager())
+	roothashAPI.RegisterService(grpcSrv, n.Consensus.RootHash())
+	governanceAPI.RegisterService(grpcSrv, n.Consensus.Governance())
 
 	// Register dump genesis halt hook.
-	n.Consensus.RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime) {
+	n.Consensus.RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch beacon.EpochTime, _ error) {
 		n.logger.Info("Consensus halt hook: dumping genesis",
 			"epoch", epoch,
-			"block_height", blockHeight,
+			"block_height", blockHeight+1,
 		)
-		if err = n.dumpGenesis(ctx, blockHeight, epoch); err != nil {
+		if err = n.dumpGenesis(ctx, blockHeight+1, epoch); err != nil {
 			n.logger.Error("halt hook: failed to dump genesis",
 				"err", err,
 			)
@@ -215,17 +222,9 @@ func (n *Node) startRuntimeServices() error {
 		}
 		n.logger.Info("Consensus halt hook: genesis dumped",
 			"epoch", epoch,
-			"block_height", blockHeight,
+			"block_height", blockHeight+1,
 		)
 	})
-
-	// Initialize the node's runtime registry.
-	n.RuntimeRegistry, err = runtimeRegistry.New(n.svcMgr.Ctx, cmdCommon.DataDir(), n.Consensus, n.Identity)
-	if err != nil {
-		return err
-	}
-	n.svcMgr.RegisterCleanupOnly(n.RuntimeRegistry, "runtime registry")
-	storageAPI.RegisterService(n.grpcInternal.Server(), n.RuntimeRegistry.StorageRouter())
 
 	// Initialize runtime workers.
 	if err = n.initRuntimeWorkers(); err != nil {
@@ -246,7 +245,7 @@ func (n *Node) startRuntimeServices() error {
 	if err != nil {
 		return err
 	}
-	n.svcMgr.RegisterCleanupOnly(n.RuntimeClient, "client service")
+	n.svcMgr.Register(n.RuntimeClient)
 	runtimeClientAPI.RegisterService(n.grpcInternal.Server(), n.RuntimeClient)
 	enclaverpc.RegisterService(n.grpcInternal.Server(), n.RuntimeClient)
 
@@ -300,8 +299,17 @@ func (n *Node) initRuntimeWorkers() error {
 		return err
 	}
 
+	// Initialize the node's runtime registry.
+	n.RuntimeRegistry, err = runtimeRegistry.New(n.svcMgr.Ctx, cmdCommon.DataDir(), n.Consensus, n.Identity, n.IAS)
+	if err != nil {
+		return err
+	}
+	n.svcMgr.RegisterCleanupOnly(n.RuntimeRegistry, "runtime registry")
+	storageAPI.RegisterService(n.grpcInternal.Server(), n.RuntimeRegistry.StorageRouter())
+
 	// Initialize the common worker.
 	n.CommonWorker, err = workerCommon.New(
+		n,
 		dataDir,
 		compute.Enabled() || workerStorage.Enabled() || workerKeymanager.Enabled(),
 		n.Identity,
@@ -326,7 +334,7 @@ func (n *Node) initRuntimeWorkers() error {
 	// Initialize the registration worker.
 	n.RegistrationWorker, err = registration.New(
 		dataDir,
-		n.Consensus.EpochTime(),
+		n.Consensus.Beacon(),
 		n.Consensus.Registry(),
 		n.Identity,
 		n.Consensus,
@@ -339,7 +347,6 @@ func (n *Node) initRuntimeWorkers() error {
 	if genesisDoc.Registry.Parameters.DebugAllowUnroutableAddresses {
 		registration.DebugForceAllowUnroutableAddresses()
 	}
-
 	if err != nil {
 		n.logger.Error("failed to initialize worker registration",
 			"err", err,
@@ -347,6 +354,17 @@ func (n *Node) initRuntimeWorkers() error {
 		return err
 	}
 	n.svcMgr.Register(n.RegistrationWorker)
+
+	// Initialize the beacon worker.
+	n.BeaconWorker, err = workerBeacon.New(
+		n.Identity,
+		n.Consensus,
+		n.commonStore,
+	)
+	if err != nil {
+		return err
+	}
+	n.svcMgr.Register(n.BeaconWorker)
 
 	// Initialize the storage worker.
 	n.StorageWorker, err = workerStorage.New(
@@ -412,6 +430,16 @@ func (n *Node) initRuntimeWorkers() error {
 }
 
 func (n *Node) startRuntimeWorkers() error {
+	// Start the common worker.
+	if err := n.CommonWorker.Start(); err != nil {
+		return err
+	}
+
+	// Start the runtime client service.
+	if err := n.RuntimeClient.Start(); err != nil {
+		return fmt.Errorf("failed to start runtime client service: %w", err)
+	}
+
 	// Start the storage worker.
 	if err := n.StorageWorker.Start(); err != nil {
 		return err
@@ -422,11 +450,6 @@ func (n *Node) startRuntimeWorkers() error {
 		return err
 	}
 
-	// Start the common worker.
-	if err := n.CommonWorker.Start(); err != nil {
-		return err
-	}
-
 	// Start the key manager worker.
 	if err := n.KeymanagerWorker.Start(); err != nil {
 		return err
@@ -434,6 +457,11 @@ func (n *Node) startRuntimeWorkers() error {
 
 	// Start the worker registration service.
 	if err := n.RegistrationWorker.Start(); err != nil {
+		return err
+	}
+
+	// Start the beacon worker.
+	if err := n.BeaconWorker.Start(); err != nil {
 		return err
 	}
 
@@ -494,7 +522,7 @@ func (n *Node) initGenesis(testNode bool) error {
 	return nil
 }
 
-func (n *Node) dumpGenesis(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime) error {
+func (n *Node) dumpGenesis(ctx context.Context, blockHeight int64, epoch beacon.EpochTime) error {
 	doc, err := n.Consensus.StateToGenesis(ctx, blockHeight)
 	if err != nil {
 		return fmt.Errorf("dumpGenesis: failed to get genesis: %w", err)
@@ -507,10 +535,8 @@ func (n *Node) dumpGenesis(ctx context.Context, blockHeight int64, epoch epochti
 	}
 
 	filename := filepath.Join(exportsDir, fmt.Sprintf("genesis-%s-at-%d.json", doc.ChainID, doc.Height))
-	if nerr := doc.WriteFileJSON(filename); nerr != nil {
-		if err := common.Mkdir(exportsDir); err != nil {
-			return fmt.Errorf("dumpGenesis: failed to dump write genesis %w", err)
-		}
+	if err := doc.WriteFileJSON(filename); err != nil {
+		return fmt.Errorf("dumpGenesis: failed to write genesis file: %w", err)
 	}
 
 	return nil
@@ -623,18 +649,7 @@ func newNode(testNode bool) (node *Node, err error) { // nolint: gocyclo
 		"tls_pk", node.Identity.GetTLSSigner().Public(),
 	)
 
-	// Initialize the tracing client.
-	tracingSvc, err := tracing.New("oasis-node")
-	if err != nil {
-		logger.Error("failed to initialize tracing",
-			"err", err,
-		)
-		return nil, err
-	}
-	node.svcMgr.RegisterCleanupOnly(tracingSvc, "tracing")
-
 	// Initialize the internal gRPC server.
-	// Depends on global tracer.
 	node.grpcInternal, err = cmdGrpc.NewServerLocal(false)
 	if err != nil {
 		logger.Error("failed to initialize internal gRPC server",
@@ -761,7 +776,6 @@ func init() {
 	// Backend initialization flags.
 	for _, v := range []*flag.FlagSet{
 		metrics.Flags,
-		tracing.Flags,
 		cmdGrpc.ServerLocalFlags,
 		cmdSigner.Flags,
 		pprof.Flags,
@@ -781,6 +795,7 @@ func init() {
 		workerSentry.Flags,
 		workerConsensusRPC.Flags,
 		crash.InitFlags(),
+		badger.MigrationFlags,
 	} {
 		Flags.AddFlagSet(v)
 	}

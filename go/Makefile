@@ -5,6 +5,11 @@ ifneq ($(GOLDFLAGS),)
 	GO_EXTRA_FLAGS += -ldflags $(GOLDFLAGS)
 endif
 
+# Build code with jemalloc tag unless explicitly disabled (used by badgerdb).
+ifneq ($(OASIS_BADGER_NO_JEMALLOC), 1)
+	GO_EXTRA_FLAGS += -tags jemalloc
+endif
+
 # Set all target as the default target.
 all: build
 
@@ -42,11 +47,18 @@ build-helpers: $(test-helpers)
 
 # List of test vectors to generate.
 test-vectors-targets := staking/gen_vectors \
-	registry/gen_vectors
+	staking/gen_account_vectors \
+	registry/gen_vectors \
+	governance/gen_vectors
 
 $(test-vectors-targets):
 	@$(ECHO) "$(MAGENTA)*** Generating test vectors ($@)...$(OFF)"
 	@$(GO) run ./$@
+
+# Extended set of staking/gen_account_vectors test vectors.
+staking/gen_account_vectors_extended:
+	@$(ECHO) "$(MAGENTA)*** Generating test vectors ($@)...$(OFF)"
+	@$(GO) run ./staking/gen_account_vectors -extended
 
 # Format code.
 fmt:
@@ -58,6 +70,11 @@ fmt:
 lint:
 	@$(ECHO) "$(CYAN)*** Running Go linters...$(OFF)"
 	@env -u GOPATH golangci-lint run --timeout 4m
+
+lint-mod-tidy:
+	@$(ECHO) "$(CYAN)*** Checking go mod tidy...$(OFF)"
+	@$(ENSURE_GIT_CLEAN)
+	@$(CHECK_GO_MOD_TIDY)
 
 # Test.
 test-targets := test-unit test-node
@@ -92,6 +109,7 @@ if [ "$(FUZZ_NO_BUILD)" != "1" ]; then \
 	mkdir -p "$$WORKDIR"; \
 	pushd $$TARGETDIR >/dev/null; \
 		$(ECHO) "$(CYAN)*** Building fuzzer for $@...$(OFF)"; \
+		go get github.com/dvyukov/go-fuzz; \
 		go-fuzz-build -o $$WORKDIR/fuzz.zip || exit 1; \
 	popd >/dev/null; \
 fi; \

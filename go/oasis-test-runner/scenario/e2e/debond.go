@@ -34,7 +34,8 @@ func (s *debondImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	// We will mock epochs for reclaiming the escrow.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
+	f.Network.SetInsecureBeacon()
 
 	// Enable some features in the staking system that we'll test.
 	f.Network.StakingGenesis = &staking.Genesis{
@@ -48,7 +49,7 @@ func (s *debondImpl) Fixture() (*oasis.NetworkFixture, error) {
 		},
 		TotalSupply: *quantity.NewFromUint64(1000),
 		Ledger: map[staking.Address]*staking.Account{
-			EntityAccount: {
+			TestEntityAccount: {
 				Escrow: staking.EscrowAccount{
 					Debonding: staking.SharePool{
 						Balance:     *quantity.NewFromUint64(1000),
@@ -58,7 +59,7 @@ func (s *debondImpl) Fixture() (*oasis.NetworkFixture, error) {
 			},
 		},
 		DebondingDelegations: map[staking.Address]map[staking.Address][]*staking.DebondingDelegation{
-			EntityAccount: {
+			TestEntityAccount: {
 				DeterministicValidator0: {
 					{
 						Shares:        *quantity.NewFromUint64(500),

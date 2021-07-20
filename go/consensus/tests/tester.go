@@ -36,6 +36,10 @@ func ConsensusImplementationTests(t *testing.T, backend consensus.ClientBackend)
 	require.NoError(err, "GetGenesisDocument")
 	require.NotNil(genDoc, "returned genesis document should not be nil")
 
+	chainCtx, err := backend.GetChainContext(ctx)
+	require.NoError(err, "GetChainContext")
+	require.EqualValues(genDoc.ChainContext(), chainCtx, "returned chain context should be correct")
+
 	blk, err := backend.GetBlock(ctx, consensus.HeightLatest)
 	require.NoError(err, "GetBlock")
 	require.NotNil(blk, "returned block should not be nil")
@@ -63,12 +67,12 @@ func ConsensusImplementationTests(t *testing.T, backend consensus.ClientBackend)
 	require.Len(
 		txsWithResults.Transactions,
 		len(txs),
-		"GetTransactionsWithResults.Transactions length missmatch",
+		"GetTransactionsWithResults.Transactions length mismatch",
 	)
 	require.Len(
 		txsWithResults.Results,
 		len(txsWithResults.Transactions),
-		"GetTransactionsWithResults.Results length missmatch",
+		"GetTransactionsWithResults.Results length mismatch",
 	)
 
 	_, err = backend.GetUnconfirmedTransactions(ctx)
@@ -90,9 +94,8 @@ func ConsensusImplementationTests(t *testing.T, backend consensus.ClientBackend)
 		}
 	}
 
-	epoch, err := backend.GetEpoch(ctx, consensus.HeightLatest)
-	require.NoError(err, "GetEpoch")
-	require.True(epoch > 0, "epoch height should be greater than zero")
+	_, err = backend.EstimateGas(ctx, &consensus.EstimateGasRequest{})
+	require.ErrorIs(err, consensus.ErrInvalidArgument, "EstimateGas with nil transaction should fail")
 
 	_, err = backend.EstimateGas(ctx, &consensus.EstimateGasRequest{
 		Signer:      memorySigner.NewTestSigner("estimate gas signer").Public(),
@@ -115,10 +118,21 @@ func ConsensusImplementationTests(t *testing.T, backend consensus.ClientBackend)
 	require.Equal(shdr.Height, blk.Height, "returned light block height should be correct")
 	require.NotNil(shdr.Meta, "returned light block should contain metadata")
 
+	// Late block queries.
+	lshdr, err := backend.GetLightBlock(ctx, consensus.HeightLatest)
+	require.NoError(err, "GetLightBlock(HeightLatest)")
+	require.True(lshdr.Height >= shdr.Height, "returned latest light block height should be greater or equal")
+	require.NotNil(shdr.Meta, "returned latest light block should contain metadata")
+
 	params, err := backend.GetParameters(ctx, blk.Height)
 	require.NoError(err, "GetParameters")
 	require.Equal(params.Height, blk.Height, "returned parameters height should be correct")
 	require.NotNil(params.Meta, "returned parameters should contain metadata")
+	require.NotEqual(0, params.Parameters.StateCheckpointInterval, "returned parameters should contain parameters")
+
+	lparams, err := backend.GetParameters(ctx, blk.Height)
+	require.NoError(err, "GetParameters(HeightLatest)")
+	require.NotEqual(0, lparams.Parameters.StateCheckpointInterval, "returned parameters should contain parameters")
 
 	err = backend.SubmitTxNoWait(ctx, &transaction.SignedTransaction{})
 	require.Error(err, "SubmitTxNoWait should fail with invalid transaction")

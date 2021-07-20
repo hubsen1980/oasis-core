@@ -3,10 +3,12 @@ package registry
 import (
 	"fmt"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
+	registryApi "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/api"
 	registryState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry/state"
 	stakingState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking/state"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
@@ -215,37 +217,95 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 		return err
 	}
 
-	// Charge gas for node registration if signed by entity. For node-signed
-	// registrations, the gas charges are pre-paid by the entity.
-	isEntitySigned := sigNode.MultiSigned.IsSignedBy(newNode.EntityID)
-	if isEntitySigned {
-		if err = ctx.Gas().UseGas(1, registry.GasOpRegisterNode, params.GasCosts); err != nil {
-			return err
-		}
-	}
-
-	// Make sure the signer of the transaction is the node identity key
-	// or the entity (iff the registration is entity signed).
+	// Make sure the signer of the transaction is the node identity key.
 	// NOTE: If this is invoked during InitChain then there is no actual transaction
 	//       and thus no transaction signer so we must skip this check.
 	if !ctx.IsInitChain() {
-		expectedTxSigner := newNode.ID
-		if isEntitySigned {
-			expectedTxSigner = newNode.EntityID
-		}
-		if !ctx.TxSigner().Equal(expectedTxSigner) {
+		if !ctx.TxSigner().Equal(newNode.ID) {
 			return registry.ErrIncorrectTxSigner
 		}
 	}
 
 	// Check runtime's whitelist.
 	for _, rt := range paidRuntimes {
-		if rt.AdmissionPolicy.EntityWhitelist != nil && !rt.AdmissionPolicy.EntityWhitelist.Entities[newNode.EntityID] {
+		if rt.AdmissionPolicy.EntityWhitelist == nil {
+			continue
+		}
+		wcfg, entIsWhitelisted := rt.AdmissionPolicy.EntityWhitelist.Entities[newNode.EntityID]
+		if !entIsWhitelisted {
 			ctx.Logger().Error("RegisterNode: node's entity not in a runtime's whitelist",
 				"entity", newNode.EntityID,
 				"runtime", rt.ID,
 			)
 			return registry.ErrForbidden
+		}
+		if len(wcfg.MaxNodes) == 0 {
+			continue
+		}
+
+		// Map is present and non-empty, check per-role restrictions
+		// on the maximum number of nodes per entity.
+
+		// Iterate over all valid roles (each entry in the map can
+		// only have a single role).
+		for _, role := range node.Roles() {
+			if !newNode.HasRoles(role) {
+				// Skip unset roles.
+				continue
+			}
+
+			maxNodes, exists := wcfg.MaxNodes[role]
+			if !exists {
+				// No such role found in whitelist.
+				ctx.Logger().Error("RegisterNode: runtime's whitelist does not allow nodes with given role",
+					"role", role.String(),
+					"runtime", rt.ID,
+				)
+				return registry.ErrForbidden
+			}
+			if maxNodes == 0 {
+				// No nodes of this type are allowed.
+				ctx.Logger().Error("RegisterNode: runtime's whitelist does not allow nodes with given role",
+					"role", role.String(),
+					"runtime", rt.ID,
+				)
+				return registry.ErrForbidden
+			}
+
+			// Count existing nodes owned by entity.
+			nodes, grr := state.GetEntityNodes(ctx, newNode.EntityID)
+			if grr != nil {
+				ctx.Logger().Error("RegisterNode: failed to query entity nodes",
+					"err", grr,
+					"entity", newNode.EntityID,
+				)
+				return grr
+			}
+			var curNodes uint16
+			for _, n := range nodes {
+				if n.ID.Equal(newNode.ID) || n.IsExpired(uint64(epoch)) || n.GetRuntime(rt.ID) == nil {
+					// Skip existing node when re-registering.  Also skip
+					// expired nodes and nodes that haven't registered
+					// for the same runtime.
+					continue
+				}
+
+				if n.HasRoles(role) {
+					curNodes++
+				}
+
+				// The check is inside the for loop, so we can stop as
+				// soon as possible once we're over the limit.
+				if curNodes+1 > maxNodes {
+					// Too many nodes with given role already registered.
+					ctx.Logger().Error("RegisterNode: too many nodes with given role already registered for runtime",
+						"role", role.String(),
+						"runtime", rt.ID,
+						"num_registered_nodes", curNodes,
+					)
+					return registry.ErrForbidden
+				}
+			}
 		}
 	}
 
@@ -332,7 +392,7 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 
 	// If the node already exists make sure to verify the node update.
 	if existingNode != nil {
-		if err = registry.VerifyNodeUpdate(ctx.Logger(), existingNode, newNode); err != nil {
+		if err = registry.VerifyNodeUpdate(ctx.Logger(), existingNode, newNode, epoch); err != nil {
 			ctx.Logger().Error("RegisterNode: failed to verify node update",
 				"err", err,
 				"new_node", newNode,
@@ -371,6 +431,10 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 			status = &registry.NodeStatus{}
 		}
 
+		// In either case, the node isn't immediately eligible to serve
+		// on a non-validator committee.
+		status.ElectionEligibleAfter = beacon.EpochInvalid
+
 		if err = state.SetNodeStatus(ctx, newNode.ID, status); err != nil {
 			ctx.Logger().Error("RegisterNode: failed to set node status",
 				"err", err,
@@ -384,9 +448,18 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 	for _, rt := range paidRuntimes {
 		// Only resume a runtime if the entity has enough stake to avoid having the runtime be
 		// suspended again on the next epoch transition.
-		if !params.DebugBypassStake {
-			acctAddr := staking.NewAddress(rt.EntityID)
-			if err = stakeAcc.CheckStakeClaims(acctAddr); err != nil {
+		if !params.DebugBypassStake && rt.GovernanceModel != registry.GovernanceConsensus {
+			acctAddr := rt.StakingAddress()
+			if acctAddr == nil {
+				// This should never happen.
+				ctx.Logger().Error("unknown runtime governance model",
+					"rt_id", rt.ID,
+					"gov_model", rt.GovernanceModel,
+				)
+				return fmt.Errorf("unknown runtime governance model on runtime %s: %s", rt.ID, rt.GovernanceModel)
+			}
+
+			if err = stakeAcc.CheckStakeClaims(*acctAddr); err != nil {
 				continue
 			}
 		}
@@ -397,6 +470,14 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 			ctx.Logger().Debug("RegisterNode: resumed runtime",
 				"runtime_id", rt.ID,
 			)
+
+			// Notify other interested applications about the resumed runtime.
+			if err = app.md.Publish(ctx, registryApi.MessageRuntimeResumed, rt); err != nil {
+				ctx.Logger().Error("RegisterNode: failed to dispatch runtime resumption message",
+					"err", err,
+				)
+				return err
+			}
 
 			ctx.EmitEvent(api.NewEventBuilder(app.Name()).Attribute(KeyRuntimeRegistered, cbor.Marshal(rt)))
 		case registry.ErrNoSuchRuntime:
@@ -495,7 +576,7 @@ func (app *registryApplication) unfreezeNode(
 func (app *registryApplication) registerRuntime( // nolint: gocyclo
 	ctx *api.Context,
 	state *registryState.MutableState,
-	sigRt *registry.SignedRuntime,
+	rt *registry.Runtime,
 ) error {
 	params, err := state.ConsensusParameters(ctx)
 	if err != nil {
@@ -509,8 +590,7 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		return registry.ErrForbidden
 	}
 
-	rt, err := registry.VerifyRegisterRuntimeArgs(params, ctx.Logger(), sigRt, ctx.IsInitChain(), false)
-	if err != nil {
+	if err = registry.VerifyRuntime(params, ctx.Logger(), rt, ctx.IsInitChain(), false); err != nil {
 		return err
 	}
 
@@ -531,13 +611,6 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 	// Charge gas for this transaction.
 	if err = ctx.Gas().UseGas(1, registry.GasOpRegisterRuntime, params.GasCosts); err != nil {
 		return err
-	}
-
-	// Make sure the signer of the transaction matches the signer of the runtime.
-	// NOTE: If this is invoked during InitChain then there is no actual transaction
-	//       and thus no transaction signer so we must skip this check.
-	if !ctx.IsInitChain() && !sigRt.Signature.PublicKey.Equal(ctx.TxSigner()) {
-		return registry.ErrIncorrectTxSigner
 	}
 
 	// Make sure the runtime doesn't exist yet.
@@ -566,23 +639,91 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		}
 	}
 
-	// Make sure that the entity has enough stake.
-	if !params.DebugBypassStake {
+	if !ctx.IsInitChain() {
+		// Make sure the signer of the transaction matches the signer of the
+		// entity or runtime that is controlling the runtime.
+		// NOTE: If this is invoked during InitChain then there is no actual transaction
+		//       and thus no transaction signer so we must skip this check.
+
+		// If we're updating the governance model, we should check the signer
+		// based on the existing governance model and not the new one,
+		// otherwise it would be impossible to transition from entity to
+		// runtime governance, for example.
+		var rtToCheck *registry.Runtime
+		if existingRt != nil {
+			rtToCheck = existingRt
+		} else {
+			rtToCheck = rt
+		}
+
+		expectedAddr := rtToCheck.StakingAddress()
+		if expectedAddr == nil {
+			ctx.Logger().Error("RegisterRuntime: runtimes with consensus-layer governance can only be registered at genesis")
+			return registry.ErrForbidden
+		}
+
+		if !ctx.CallerAddress().Equal(*expectedAddr) {
+			switch rtToCheck.GovernanceModel {
+			case registry.GovernanceEntity:
+				ctx.Logger().Error("RegisterRuntime: transaction must be signed by controlling entity")
+				return registry.ErrIncorrectTxSigner
+			case registry.GovernanceRuntime:
+				ctx.Logger().Error("RegisterRuntime: caller must be the runtime itself")
+				return registry.ErrForbidden
+			default:
+				// Basic validation should have caught this, but just in case...
+				ctx.Logger().Error("RegisterRuntime: invalid governance model")
+				return registry.ErrInvalidArgument
+			}
+		}
+	}
+
+	// Make sure that the entity or runtime has enough stake.
+	// Runtimes using the consensus layer governance model do not require stake.
+	if !params.DebugBypassStake && rt.GovernanceModel != registry.GovernanceConsensus {
 		claim := registry.StakeClaimForRuntime(rt.ID)
 		thresholds := registry.StakeThresholdsForRuntime(rt)
-		acctAddr := staking.NewAddress(rt.EntityID)
+		var acctAddr staking.Address
+		switch rt.GovernanceModel {
+		case registry.GovernanceEntity:
+			acctAddr = staking.NewAddress(rt.EntityID)
+		case registry.GovernanceRuntime:
+			acctAddr = ctx.CallerAddress()
+		default:
+			// Basic validation should have caught this, but just in case...
+			ctx.Logger().Error("RegisterRuntime: invalid governance model")
+			return registry.ErrInvalidArgument
+		}
 
 		if err = stakingState.AddStakeClaim(ctx, acctAddr, claim, thresholds); err != nil {
-			ctx.Logger().Error("RegisterRuntime: Insufficient stake",
+			ctx.Logger().Error("RegisterRuntime: insufficient stake",
 				"err", err,
 				"entity", rt.EntityID,
+				"runtime", rt.ID,
 				"account", acctAddr,
 			)
 			return err
 		}
 	}
 
-	if err = state.SetRuntime(ctx, rt, sigRt, suspended); err != nil {
+	// Notify other interested applications about the new runtime.
+	if existingRt == nil {
+		if err = app.md.Publish(ctx, registryApi.MessageNewRuntimeRegistered, rt); err != nil {
+			ctx.Logger().Error("RegisterRuntime: failed to dispatch message",
+				"err", err,
+			)
+			return err
+		}
+	}
+
+	if err = app.md.Publish(ctx, registryApi.MessageRuntimeUpdated, rt); err != nil {
+		ctx.Logger().Error("RegisterRuntime: failed to dispatch message",
+			"err", err,
+		)
+		return err
+	}
+
+	if err = state.SetRuntime(ctx, rt, suspended); err != nil {
 		ctx.Logger().Error("RegisterRuntime: failed to create runtime",
 			"err", err,
 			"runtime", rt,

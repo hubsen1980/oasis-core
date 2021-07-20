@@ -2,10 +2,12 @@ package runtime
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 
+	control "github.com/oasisprotocol/oasis-core/go/control/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
@@ -25,7 +27,7 @@ type storageSyncImpl struct {
 
 func newStorageSyncImpl() scenario.Scenario {
 	return &storageSyncImpl{
-		runtimeImpl: *newRuntimeImpl("storage-sync", "simple-keyvalue-client", nil),
+		runtimeImpl: *newRuntimeImpl("storage-sync", BasicKVTestClient),
 	}
 }
 
@@ -43,7 +45,12 @@ func (sc *storageSyncImpl) Fixture() (*oasis.NetworkFixture, error) {
 
 	// Use mock epochtime to ensure syncing starts in the same epoch in which
 	// new node registers.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
+
+	// Enable consensus layer checkpoints.
+	f.Network.Consensus.Parameters.StateCheckpointInterval = 10
+	f.Network.Consensus.Parameters.StateCheckpointNumKept = 2
+	f.Network.Consensus.Parameters.StateCheckpointChunkSize = 1024 * 1024
 
 	// Make the first storage worker check for checkpoints more often.
 	f.StorageWorkers[0].CheckpointCheckInterval = 1 * time.Second
@@ -69,13 +76,24 @@ func (sc *storageSyncImpl) Fixture() (*oasis.NetworkFixture, error) {
 		CheckpointSyncEnabled:      true,
 		LogWatcherHandlerFactories: []log.WatcherHandlerFactory{oasis.LogAssertCheckpointSync()},
 	})
+	// And one more storage worker that will sync the consensus layer via state sync.
+	f.StorageWorkers = append(f.StorageWorkers, oasis.StorageWorkerFixture{
+		Backend:               database.BackendNameBadgerDB,
+		Entity:                1,
+		NoAutoStart:           true,
+		CheckpointSyncEnabled: true,
+		LogWatcherHandlerFactories: []log.WatcherHandlerFactory{
+			oasis.LogAssertCheckpointSync(),
+			oasis.LogEventABCIStateSyncComplete(),
+		},
+	})
 
 	return f, nil
 }
 
-func (sc *storageSyncImpl) Run(childEnv *env.Env) error {
-	clientErrCh, cmd, err := sc.runtimeImpl.start(childEnv)
-	if err != nil {
+func (sc *storageSyncImpl) Run(childEnv *env.Env) error { //nolint: gocyclo
+	ctx := context.Background()
+	if err := sc.startNetworkAndTestClient(ctx, childEnv); err != nil {
 		return err
 	}
 
@@ -89,9 +107,11 @@ func (sc *storageSyncImpl) Run(childEnv *env.Env) error {
 	}
 
 	// Wait for the client to exit.
-	if err = sc.waitClient(childEnv, cmd, clientErrCh); err != nil {
+	if err = sc.waitTestClientOnly(); err != nil {
 		return err
 	}
+
+	drbg, _ := drbgFromSeed([]byte("storage-sync/seq"), []byte("plant_your_seeds"))
 
 	// Check if the storage node that ignored applies has synced.
 	sc.Logger.Info("checking if roots have been synced")
@@ -110,12 +130,11 @@ func (sc *storageSyncImpl) Run(childEnv *env.Env) error {
 	// Generate some more rounds to trigger checkpointing. Up to this point there have been ~9
 	// rounds, we create 15 more rounds to bring this up to ~24. Checkpoints are every 10 rounds so
 	// this leaves some space for any unintended epoch transitions.
-	ctx := context.Background()
 	for i := 0; i < 15; i++ {
 		sc.Logger.Info("submitting transaction to runtime",
 			"seq", i,
 		)
-		if err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "checkpoint", fmt.Sprintf("my cp %d", i)); err != nil {
+		if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "checkpoint", fmt.Sprintf("my cp %d", i), drbg.Uint64()); err != nil {
 			return err
 		}
 	}
@@ -146,10 +165,11 @@ func (sc *storageSyncImpl) Run(childEnv *env.Env) error {
 		"round", lastCheckpoint,
 	)
 
-	// There should be at least two checkpoints. There may be more depending on the state of garbage
-	// collection process (which may be one checkpoint behind.)
-	if len(cps) < 2 {
-		return fmt.Errorf("incorrect number of checkpoints (expected: >=2 got: %d)", len(cps))
+	// There should be at least two checkpoints. There may be more
+	// depending on the state of garbage collection process (which
+	// may be one checkpoint behind.)
+	if numCps := len(cps); numCps < 2 {
+		return fmt.Errorf("incorrect number of checkpoints (expected: >=2 got: %d)", numCps)
 	}
 
 	var validCps int
@@ -191,20 +211,77 @@ func (sc *storageSyncImpl) Run(childEnv *env.Env) error {
 		sc.Logger.Info("submitting large transaction to runtime",
 			"seq", i,
 		)
-		if err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, fmt.Sprintf("%d key %d", i, i), fmt.Sprintf("my cp %d: ", i)+largeVal); err != nil {
+		if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, fmt.Sprintf("%d key %d", i, i), fmt.Sprintf("my cp %d: ", i)+largeVal, drbg.Uint64()); err != nil {
 			return err
 		}
 	}
 
-	// Now spin up the last storage worker and check if it syncs with a checkpoint.
+	sc.Logger.Info("running first late storage worker")
+
+	// Now spin up the first late storage worker and check if it syncs with a checkpoint.
 	lateWorker := sc.Net.StorageWorkers()[3]
-	err = lateWorker.Start()
-	if err != nil {
-		return fmt.Errorf("can't start last storage worker: %w", err)
+	if err = lateWorker.Start(); err != nil {
+		return fmt.Errorf("can't start first late storage worker: %w", err)
 	}
-	if err := lateWorker.WaitReady(ctx); err != nil {
-		return fmt.Errorf("error waiting for late storage worker to become ready: %w", err)
+	if err = lateWorker.WaitReady(ctx); err != nil {
+		return fmt.Errorf("error waiting for first late storage worker to become ready: %w", err)
 	}
+
+	sc.Logger.Info("running second late storage worker")
+
+	// Get the TLS public key from the validators.
+	var (
+		consensusNodes []string
+		trustHeight    uint64
+		trustHash      string
+	)
+	for _, v := range sc.Net.Validators() {
+		var ctrl *oasis.Controller
+		ctrl, err = oasis.NewController(v.SocketPath())
+		if err != nil {
+			return fmt.Errorf("failed to create controller for validator %s: %w", v.Name, err)
+		}
+
+		var status *control.Status
+		status, err = ctrl.GetStatus(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get status for validator %s: %w", v.Name, err)
+		}
+
+		if status.Registration.Descriptor == nil {
+			return fmt.Errorf("validator %s has not registered", v.Name)
+		}
+		if len(status.Registration.Descriptor.TLS.Addresses) == 0 {
+			return fmt.Errorf("validator %s has no TLS addresses", v.Name)
+		}
+
+		var rawAddress []byte
+		tlsAddress := status.Registration.Descriptor.TLS.Addresses[0]
+		rawAddress, err = tlsAddress.MarshalText()
+		if err != nil {
+			return fmt.Errorf("failed to marshal TLS address: %w", err)
+		}
+		consensusNodes = append(consensusNodes, string(rawAddress))
+
+		trustHeight = uint64(status.Consensus.LatestHeight)
+		trustHash = hex.EncodeToString(status.Consensus.LatestHash)
+	}
+
+	// Configure state sync for the last storage node.
+	lateWorker = sc.Net.StorageWorkers()[4]
+	lateWorker.SetConsensusStateSync(&oasis.ConsensusStateSyncCfg{
+		ConsensusNodes: consensusNodes,
+		TrustHeight:    trustHeight,
+		TrustHash:      trustHash,
+	})
+
+	if err = lateWorker.Start(); err != nil {
+		return fmt.Errorf("can't start second late storage worker: %w", err)
+	}
+	if err = lateWorker.WaitReady(ctx); err != nil {
+		return fmt.Errorf("error waiting for second late storage worker to become ready: %w", err)
+	}
+
 	// Wait a bit to give the logger in the node time to sync; the message has already been
 	// logged by this point, it just might not be on disk yet.
 	<-time.After(1 * time.Second)
